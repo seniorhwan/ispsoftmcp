@@ -17,7 +17,8 @@ that an MCP operation works on it.
   is retained and a byte-identical backup is
   written beside the candidate. A project `.ini` companion is copied to both
   new filenames when present. The result is `GENERATED_UNCOMPILED`; this
-  server does not claim native ISPSoft compilation or IDE readback.
+  candidate-generation tool does not compile or claim IDE readback. Use the
+  separate native compile/check tool for qualified ES2 projects.
 - Project overview, POU-section reads, device-comment reads, and comment
   candidate generation for DVP ES2. LD network blocks are returned as raw
   native project text and can be read one at a time or summarized as ordered
@@ -29,13 +30,15 @@ that an MCP operation works on it.
   are deliberately limited by the serializer; unsupported or lossy logic is
   rejected.
 - Textual cross-reference analysis and DVP-style comment-map validation.
-- Status and explicit “not qualified” responses for native build/check and PLC
-  operations. PLC connection, upload, download, monitor mode, and live device
-  I/O remain disabled until a vendor adapter is implemented and qualified.
+- Native ISPSoft 3.24 Check/Compile for ES2 projects uses a private desktop,
+  disposable project copy, and Windows OCR of the Compile Message pane. Other
+  project models remain unqualified. PLC connection, upload, download, monitor
+  mode, and live device I/O remain disabled until a vendor adapter is implemented
+  and qualified.
 - ISPSoft process/window diagnostics and verified application startup are
   available through `ispsoft_get_ide_session` and `ispsoft_start_ide`. These
   report visible windows and startup failures; they do not inspect the active
-  project or automate compile/check.
+  project. Compile/check runs through the isolated worker tool described below.
 - Silent background sessions start a separate ISPSoft process on a uniquely
   named Windows desktop, with a private settings profile and a disposable
   project copy. This keeps the user's visible ISPSoft session open and prevents
@@ -116,7 +119,7 @@ the detected Delta installation path.
 | `ispsoft_read_mpu` | Inspect a supported MPU package as IL. |
 | `ispsoft_analyze_source` | Build a best-effort text cross-reference. |
 | `ispsoft_validate_device_comments` | Validate DVP-style addresses and optionally emit a JSON map. |
-| `ispsoft_compile_and_check` | Explicitly report native IDE compile/check as unavailable. |
+| `ispsoft_compile_and_check` | Run ISPSoft 3.24 Compile or Check on an ES2 project copy in a private desktop; OCR the Compile Message pane and save compiler sidecars plus screenshot evidence. Set `action` to `"check"` to run Check, or `timeout_seconds` to wait up to five minutes. |
 | `ispsoft_online_status`, `ispsoft_connect`, `ispsoft_upload_from_plc`, `ispsoft_start_monitor`, `ispsoft_runtime_read` | Explicitly report that no PLC transport is qualified; no device is contacted. |
 | `ispsoft_runtime_write` / `ispsoft_download` | Require a call-level confirmation and `ISPSOFT_WRITES_ENABLED=1`; even then they remain disabled until transport qualification is implemented. |
 | `ispsoft_stop_monitor` | Report that this server has no active monitor session. |
@@ -126,8 +129,11 @@ the detected Delta installation path.
 1. Inspect the exact project and model.
 2. Validate the full candidate.
 3. Generate a new candidate and preserve the original.
-4. Open the candidate in ISPSoft and manually run native Compile All / Check
-   Program. Review the resulting ladder and model-specific warnings.
+4. Run `ispsoft_compile_and_check` on the candidate. Native menu automation is
+   qualified only for ISPSoft 3.24 ES2 projects; it opens a disposable copy on a
+   private desktop, leaves the user's foreground session alone, and reports a
+   pass only when Windows OCR reads the Compile Message pane's error and warning
+   counts. Inspect the retained screenshot and compiler sidecars when OCR fails.
 5. Transfer to hardware only through ISPSoft after engineering approval. MCP
    downloads and runtime writes are not yet available. Never treat the
    installed model catalog or COMMGR process presence as proof of connectivity.
@@ -142,5 +148,9 @@ python -m unittest discover -s tests -v
 
 Tests use synthetic files and never open ISPSoft or contact a PLC. The installed
 ISPSoft sample smoke test is read-only. Real project and hardware qualification
-remains model- and version-specific. In particular, DVP32ES2 COM1 transfer and
+remains model- and version-specific. Native compile/check writes fixed-name
+compiler sidecars beneath the Windows roaming profile despite the worker's
+private `APPDATA`. MCP instances serialize their builds within the current
+Windows logon session; the visible ISPSoft GUI does not use that lock, so avoid
+starting a manual compile at the same time. In particular, DVP32ES2 COM1 transfer and
 monitor behavior still require a controlled physical PLC qualification.

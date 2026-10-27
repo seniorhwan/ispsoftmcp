@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -58,6 +59,7 @@ WRITE_OPS = {"OUT", "SET", "RST", "MOV", "DMOV", "DADD", "DSUB", "DMUL", "INC", 
 
 mcp = FastMCP(SERVER_NAME)
 _BACKGROUND_IDE_SESSIONS: dict[str, dict[str, Any]] = {}
+_NATIVE_COMPILE_LOCK = threading.Lock()
 
 
 class _PrivateDesktopProcess:
@@ -570,6 +572,320 @@ def _window_child_texts(window_handle: int, limit: int = 24) -> list[dict[str, s
     return result
 
 
+def _parse_native_compile_diagnostics(text: str) -> dict[str, Any]:
+    """Parse Windows OCR output without treating missing/ambiguous text as success."""
+    errors = re.search(r"\b([0-9Oo]+)\s+Errors?\b", text, re.I)
+    warnings = re.search(r"\b([0-9Oo]+)\s+Warnings?\b", text, re.I)
+
+    def count(match: re.Match[str] | None) -> int | None:
+        if match is None:
+            return None
+        normalized = match.group(1).translate(str.maketrans({"O": "0", "o": "0"}))
+        try:
+            return int(normalized)
+        except ValueError:
+            return None
+
+    return {"errors": count(errors), "warnings": count(warnings),
+            "compile_pane_detected": bool(re.search(r"Compile\s+Message", text, re.I))}
+
+
+def _last_user_input_tick() -> int | None:
+    """Read the desktop's last physical-input tick to avoid blaming user activity on the worker."""
+    if sys.platform != "win32":
+        return None
+    class LastInputInfo(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetLastInputInfo.argtypes = [ctypes.POINTER(LastInputInfo)]
+    user32.GetLastInputInfo.restype = wintypes.BOOL
+    info = LastInputInfo(ctypes.sizeof(LastInputInfo), 0)
+    return int(info.dwTime) if user32.GetLastInputInfo(ctypes.byref(info)) else None
+
+
+def _try_acquire_native_compile_mutex() -> int | None:
+    """Serialize fixed-name ISPSoft compiler sidecars across MCP processes in this logon session."""
+    if sys.platform != "win32":
+        return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    handle = kernel32.CreateMutexW(None, False, "Local\\ISPSoftMCP.NativeCompile.v1")
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    state = kernel32.WaitForSingleObject(handle, 0)
+    if state == 0x00000000:  # WAIT_OBJECT_0
+        return int(handle)
+    if state == 0x00000080:  # WAIT_ABANDONED
+        kernel32.ReleaseMutex(handle)
+        kernel32.CloseHandle(handle)
+        raise RuntimeError("An earlier MCP compile worker ended unexpectedly; compiler state needs review.")
+    kernel32.CloseHandle(handle)
+    if state == 0x00000102:  # WAIT_TIMEOUT
+        return None
+    raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _release_native_compile_mutex(handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    mutex_handle = wintypes.HANDLE(handle)
+    if not kernel32.ReleaseMutex(mutex_handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+    kernel32.CloseHandle(mutex_handle)
+
+
+def _run_windows_ocr(image_path: Path, timeout: float = 30.0) -> str:
+    """Read a Windows image through the built-in OCR API without a console window."""
+    ocr_script = Path(__file__).with_name("ispsoft_native_ocr.ps1")
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if powershell is None or not ocr_script.is_file():
+        raise OSError("Windows PowerShell or the bundled OCR helper is unavailable.")
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(ocr_script), "-ImagePath", str(image_path)],
+        capture_output=True, text=True, timeout=timeout,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "Windows OCR failed.")
+    return result.stdout.strip()
+
+
+def _private_ide_menu_command(process: _PrivateDesktopProcess, command: str,
+                              timeout: float = 20.0,
+                              evidence_dir: Path | None = None) -> dict[str, Any]:
+    """Invoke ISPSoft Compile > Check/Compile without switching the user's desktop.
+
+    ISPSoft 3.24 uses custom DevExpress menu controls, so normal keyboard
+    shortcuts sent from the MCP process are ignored. A short-lived helper
+    thread joins only the worker GUI input queue while attached to the worker's
+    private desktop. It never calls SwitchDesktop or injects input on the
+    user's desktop.
+    """
+    if sys.platform != "win32":
+        return {"success": False, "status": "WINDOWS_REQUIRED"}
+    if not isinstance(command, str) or command not in {"check", "compile"}:
+        return {"success": False, "status": "UNSUPPORTED_COMMAND"}
+    windows = process.windows()
+    main = next((item for item in windows if item.get("class_name") == "TMainFrm"), None)
+    if main is None:
+        return {"success": False, "status": "WORKER_WINDOW_NOT_FOUND",
+                "windows": windows}
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.EnumChildWindows.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.LPARAM]
+    user32.EnumChildWindows.restype = wintypes.BOOL
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.AttachThreadInput.restype = wintypes.BOOL
+    user32.SetThreadDesktop.argtypes = [wintypes.HANDLE]
+    user32.SetThreadDesktop.restype = wintypes.BOOL
+    user32.SetFocus.argtypes = [wintypes.HWND]
+    user32.SetActiveWindow.argtypes = [wintypes.HWND]
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+    bars: list[int] = []
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def find_compile_bar(hwnd: int, _lparam: int) -> bool:
+        class_name = ctypes.create_unicode_buffer(128)
+        title = ctypes.create_unicode_buffer(128)
+        user32.GetClassNameW(hwnd, class_name, len(class_name))
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length:
+            user32.GetWindowTextW(hwnd, title, min(length + 1, len(title)))
+        if class_name.value == "TdxBarControl" and title.value == "Custom 1":
+            bars.append(int(hwnd))
+        return True
+
+    user32.EnumChildWindows(main["handle"], callback(find_compile_bar), 0)
+    if not bars:
+        return {"success": False, "status": "COMPILE_MENU_NOT_FOUND",
+                "main_window": main}
+    thread_id = wintypes.DWORD()
+    worker_gui_thread = user32.GetWindowThreadProcessId(main["handle"], ctypes.byref(thread_id))
+    outcome: dict[str, Any] = {"command": command}
+    completed = threading.Event()
+
+    class Point(ctypes.Structure):
+        _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+    class Message(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("message", wintypes.UINT),
+                    ("wParam", wintypes.WPARAM), ("lParam", wintypes.LPARAM),
+                    ("time", wintypes.DWORD), ("pt", Point)]
+
+    user32.PeekMessageW.argtypes = [ctypes.POINTER(Message), wintypes.HWND,
+                                    wintypes.UINT, wintypes.UINT, wintypes.UINT]
+    user32.PeekMessageW.restype = wintypes.BOOL
+
+    def click(hwnd: int, x: int, y: int) -> None:
+        packed = (y << 16) | (x & 0xFFFF)
+        for message, wparam in ((0x0200, 0), (0x0201, 1), (0x0202, 0)):
+            user32.SendMessageW(hwnd, message, wparam, packed)
+
+    def interact() -> None:
+        helper_thread = kernel32.GetCurrentThreadId()
+        attached = False
+        try:
+            if not user32.SetThreadDesktop(process.desktop_handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+            message = Message()
+            user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 0)
+            attached = bool(user32.AttachThreadInput(helper_thread, worker_gui_thread, True))
+            if not attached:
+                raise ctypes.WinError(ctypes.get_last_error())
+            user32.SetActiveWindow(main["handle"])
+            user32.SetFocus(bars[0])
+            # ISPSoft 3.24's custom Compile menu occupies this verified point
+            # in the menu bar on the worker's own desktop.
+            click(bars[0], 155, 20)
+            deadline = time.monotonic() + 2.0
+            popup = None
+            while time.monotonic() < deadline:
+                popup = next((item for item in process.windows()
+                              if item.get("class_name") == "TdxBarSubMenuControl"
+                              and item.get("visible")), None)
+                if popup:
+                    break
+                time.sleep(0.05)
+            if popup is None:
+                raise RuntimeError("Compile menu did not open on the worker desktop.")
+            # The menu has Check at y=10 and Compile at y=34 in the verified
+            # ISPSoft 3.24 popup. Refuse the operation if the popup geometry
+            # differs so a display/DPI change cannot select another command.
+            rect = wintypes.RECT()
+            user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            user32.GetWindowRect.restype = wintypes.BOOL
+            if not user32.GetWindowRect(popup["handle"], ctypes.byref(rect)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            width, height = rect.right - rect.left, rect.bottom - rect.top
+            outcome["menu_geometry"] = {"width": width, "height": height}
+            if width < 40 or height < 44 or height > 100:
+                raise RuntimeError(f"Unqualified Compile menu geometry: {width}x{height}.")
+            if evidence_dir is None:
+                raise RuntimeError("A session evidence directory is required to verify menu labels.")
+            menu_image = evidence_dir / "compile-menu.bmp"
+            menu_capture = _capture_private_window_bmp(process, popup["handle"], menu_image)
+            menu_text = _run_windows_ocr(menu_image, timeout=15.0)
+            if not re.search(r"\bCheck\b", menu_text, re.I) or not re.search(r"\bCompile\b", menu_text, re.I):
+                raise RuntimeError("OCR did not confirm both Check and Compile in the opened menu; command was not selected.")
+            outcome["menu_evidence"] = menu_capture
+            outcome["menu_ocr_text"] = menu_text
+            click(popup["handle"], min(40, width - 2),
+                  max(1, round(height * (0.20 if command == "check" else 0.65))))
+            outcome.update(success=True, status="COMMAND_INVOKED",
+                           command_window=popup, input_attached_to_worker=True,
+                           user_desktop_switched=False)
+        except Exception as exc:
+            outcome.update(success=False, status="COMMAND_FAILED", error=str(exc))
+        finally:
+            if attached:
+                user32.AttachThreadInput(helper_thread, worker_gui_thread, False)
+            completed.set()
+
+    thread = threading.Thread(target=interact, name="ISPSoftPrivateDesktopInput", daemon=True)
+    thread.start()
+    if not completed.wait(timeout):
+        return {"success": False, "status": "COMMAND_TIMEOUT",
+                "error": "Private desktop interaction did not complete before timeout."}
+    thread.join(timeout=0.2)
+    return outcome
+
+
+def _capture_private_window_bmp(process: _PrivateDesktopProcess, window_handle: int,
+                                target: Path) -> dict[str, Any]:
+    """Capture a worker window with PrintWindow without switching desktops."""
+    if sys.platform != "win32":
+        raise OSError("Windows is required for private desktop capture.")
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    class Rect(ctypes.Structure):
+        _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                    ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+    class BitmapInfoHeader(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("width", wintypes.LONG),
+                    ("height", wintypes.LONG), ("planes", wintypes.WORD),
+                    ("bits", wintypes.WORD), ("compression", wintypes.DWORD),
+                    ("size_image", wintypes.DWORD), ("x_pixels_per_meter", wintypes.LONG),
+                    ("y_pixels_per_meter", wintypes.LONG), ("colors_used", wintypes.DWORD),
+                    ("colors_important", wintypes.DWORD)]
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(Rect)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+    user32.PrintWindow.restype = wintypes.BOOL
+    user32.GetDC.argtypes = [wintypes.HWND]
+    user32.GetDC.restype = wintypes.HDC
+    user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+    gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+    gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+    gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    gdi32.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT,
+                                wintypes.UINT, wintypes.LPVOID, wintypes.LPVOID,
+                                wintypes.UINT]
+    gdi32.GetDIBits.restype = ctypes.c_int
+    gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    gdi32.DeleteDC.argtypes = [wintypes.HDC]
+    rect = Rect()
+    if not user32.GetWindowRect(window_handle, ctypes.byref(rect)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    width, height = rect.right - rect.left, rect.bottom - rect.top
+    if width <= 0 or height <= 0 or width * height > 80_000_000:
+        raise OSError(f"Invalid private window dimensions: {width}x{height}.")
+    screen_dc = user32.GetDC(None)
+    memory_dc = gdi32.CreateCompatibleDC(screen_dc)
+    bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+    if not screen_dc or not memory_dc or not bitmap:
+        raise ctypes.WinError(ctypes.get_last_error())
+    previous = gdi32.SelectObject(memory_dc, bitmap)
+    try:
+        if not user32.PrintWindow(window_handle, memory_dc, 2):
+            raise OSError("PrintWindow could not capture the private ISPSoft window.")
+        header = BitmapInfoHeader(ctypes.sizeof(BitmapInfoHeader), width, -height,
+                                  1, 32, 0, width * height * 4, 0, 0, 0, 0)
+        pixels = ctypes.create_string_buffer(width * height * 4)
+        rows = gdi32.GetDIBits(memory_dc, bitmap, 0, height, pixels,
+                               ctypes.byref(header), 0)
+        if rows != height:
+            raise OSError(f"Private desktop capture returned {rows} of {height} rows.")
+        # BITMAPFILEHEADER (14 bytes) followed by the top-down 32-bit DIB.
+        dib_header = struct.pack("<IiiHHIIiiII", ctypes.sizeof(BitmapInfoHeader),
+                                 width, -height, 1, 32, 0, width * height * 4,
+                                 0, 0, 0, 0)
+        file_header = struct.pack("<2sIHHI", b"BM", 14 + len(dib_header) + len(pixels),
+                                  0, 0, 14 + len(dib_header))
+        target.write_bytes(file_header + dib_header + pixels.raw)
+        return {"path": str(target), "width": width, "height": height,
+                "sha256": _sha(read_bytes(target)), "private_desktop": process.desktop_name}
+    finally:
+        gdi32.SelectObject(memory_dc, previous)
+        gdi32.DeleteObject(bitmap)
+        gdi32.DeleteDC(memory_dc)
+        user32.ReleaseDC(None, screen_dc)
+
+
 def _artifact_path(prefix: str, suffix: str) -> Path:
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -1025,7 +1341,7 @@ def ispsoft_list_supported_plc_types() -> str:
         "limitations": [
             "The installed model catalog is informational and does not qualify model-specific MCP operations.",
             "Candidate transformation support remains limited to the profiles below.",
-            "Native compile/check, PLC transfer, online monitoring, and live device I/O are not qualified.",
+            "Native compile/check is qualified only for ISPSoft 3.24 ES2 with OCR-backed results; PLC transfer, online monitoring, and live device I/O are not qualified.",
         ],
     })
 
@@ -1040,7 +1356,7 @@ def _capability_matrix() -> dict[str, Any]:
             "st_candidate_generation": "QUALIFIED_LIMITED" if "ST" in profile.get("languages", []) else "NOT_QUALIFIED",
             "ld_network_candidate_generation": "QUALIFIED_LIMITED" if name == "ES2" else "NOT_QUALIFIED",
             "il_mpu_generation": "QUALIFIED_LIMITED" if profile.get("pou_exchange") == "MPU" else "NOT_QUALIFIED",
-            "native_compile_check": "NOT_QUALIFIED",
+            "native_compile_check": "QUALIFIED_LIMITED_ISPSOFT_3_24_ES2" if name == "ES2" else "NOT_QUALIFIED",
             "plc_connection_upload_download": "NOT_QUALIFIED",
             "online_monitor_and_device_io": "NOT_QUALIFIED",
         }
@@ -1052,7 +1368,10 @@ def _capability_matrix() -> dict[str, Any]:
         "ld_network_candidate_generation": {"status": "QUALIFIED_LIMITED", "models": ["ES2"], "raw_network_replacement_only": True, "native_compile": "NOT_QUALIFIED"},
         "project_template_clone": {"status": "QUALIFIED_LIMITED", "same_model_only": True, "native_compile": "NOT_QUALIFIED"},
         "native_blank_project_creation": {"status": "NOT_QUALIFIED"},
-        "native_compile_check": {"status": "NOT_QUALIFIED"},
+        "native_compile_check": {"status": "QUALIFIED_LIMITED", "ispsoft_versions": ["3.24"],
+                                 "models": ["ES2"], "actions": ["check", "compile"],
+                                 "result_verification": "Windows OCR of Compile Message error and warning counts",
+                                 "known_global_side_effect": "fixed-name compiler sidecars under Windows roaming profile; MCP servers serialize, but the visible ISPSoft GUI does not honor that lock"},
         "plc_connection": {"status": "NOT_QUALIFIED"},
         "upload_from_plc": {"status": "NOT_QUALIFIED"},
         "download_to_plc": {"status": "NOT_QUALIFIED", "write_guard": LIVE_WRITES_ENV},
@@ -1684,11 +2003,199 @@ def ispsoft_write_device_comment_candidate(project_path: str, device_comments: d
 
 
 @mcp.tool()
-def ispsoft_compile_and_check(project_path: str) -> str:
-    """Report native compile/check availability; never infer success from parsing."""
-    return _json({"success": False, "status": "NOT_AVAILABLE",
-                  "error": "ISPSoft 3.24 native Compile/Check has not been executed and verified through MCP yet. Background project loading is available on an isolated Windows desktop; no compile result is claimed.",
-                  "project_path": project_path, "vendor_compile": "NOT_RUN"})
+def ispsoft_compile_and_check(project_path: str, action: str = "compile",
+                              timeout_seconds: int = 120) -> str:
+    """Run ISPSoft 3.24 Check or Compile on a private worker and disposable copy.
+
+    The visible user's ISPSoft session is never activated. Compile output and
+    the untouched-source hash are saved under the background session folder.
+    """
+    if sys.platform != "win32":
+        return _json({"success": False, "status": "WINDOWS_REQUIRED",
+                      "vendor_compile": "NOT_RUN", "project_path": project_path})
+    if not isinstance(project_path, str) or not project_path.strip():
+        return _json({"success": False, "status": "PROJECT_PATH_REQUIRED",
+                      "vendor_compile": "NOT_RUN"})
+    if not isinstance(action, str) or action not in {"check", "compile"}:
+        return _json({"success": False, "status": "REJECTED_BEFORE_OPEN",
+                      "vendor_compile": "NOT_RUN",
+                      "error": "action must be exactly 'check' or 'compile'."})
+    if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 10 <= timeout_seconds <= 300:
+        return _json({"success": False, "status": "REJECTED_BEFORE_OPEN",
+                      "vendor_compile": "NOT_RUN",
+                      "error": "timeout_seconds must be an integer from 10 to 300."})
+    try:
+        source = Path(project_path).expanduser().resolve(strict=True)
+        if source.suffix.lower() not in {".isp", ".bak"}:
+            raise FileTransformError("Project path must refer to an .isp or .bak file.")
+        original = read_bytes(source)
+        container = containers.read_container(source)
+        project_info = containers.inspect(container)
+    except (OSError, FileTransformError, ValueError) as exc:
+        return _json({"success": False, "status": "PROJECT_REJECTED",
+                      "vendor_compile": "NOT_RUN", "project_path": project_path,
+                      "error": str(exc)})
+    if project_info.get("project_model") != "ES2":
+        return _json({"success": False, "status": "MODEL_NOT_QUALIFIED",
+                      "vendor_compile": "NOT_RUN", "project_path": str(source),
+                      "model": project_info.get("project_model"),
+                      "qualified_models": ["ES2"],
+                      "error": "Native menu automation is currently qualified only against ISPSoft 3.24 ES2 projects."})
+    if not _NATIVE_COMPILE_LOCK.acquire(blocking=False):
+        return _json({"success": False, "status": "NATIVE_IDE_BUSY",
+                      "vendor_compile": "NOT_RUN",
+                      "error": "Another native compile/check request is active in this MCP server."})
+
+    session_id: str | None = None
+    native_mutex_handle: int | None = None
+    foreground_before: int | None = None
+    input_tick_before: int | None = None
+    try:
+        native_mutex_handle = _try_acquire_native_compile_mutex()
+        if native_mutex_handle is None:
+            return _json({"success": False, "status": "NATIVE_IDE_BUSY",
+                          "vendor_compile": "NOT_RUN",
+                          "error": "Another ISPSoft MCP server is compiling in this Windows logon session."})
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        before_handle = user32.GetForegroundWindow()
+        foreground_before = int(before_handle) if before_handle else None
+        input_tick_before = _last_user_input_tick()
+        launch = json.loads(ispsoft_start_background_session(str(source), 30))
+        if not launch.get("success"):
+            return _json({"success": False, "status": "BACKGROUND_WORKER_FAILED",
+                    "vendor_compile": "NOT_RUN", "project_path": str(source),
+                    "launch": launch})
+        session_id = launch["session_id"]
+        record = _BACKGROUND_IDE_SESSIONS[session_id]
+        process = record["process"]
+        evidence_root = Path(record["session_root"]) / "native-compile-evidence"
+        evidence_root.mkdir(parents=True, exist_ok=True)
+        command = _private_ide_menu_command(process, action, evidence_dir=evidence_root)
+        if not command.get("success"):
+            return _json({"success": False, "status": command.get("status", "COMMAND_FAILED"),
+                    "vendor_compile": "NOT_RUN", "project_path": str(source),
+                    "session_id": session_id, "worker_project_path": record["worker_project_path"],
+                    "command": command, "original_project_untouched": _sha(read_bytes(source)) == _sha(original)})
+
+        # Poll the exact worker's Compile Message pane. Large projects may take
+        # longer than a small fixed delay; only parse counts from the captured
+        # private window after the current command reports its summary.
+        worker_path = Path(record["worker_project_path"])
+        source_unchanged = _sha(read_bytes(source)) == _sha(original)
+        worker_unchanged = _sha(read_bytes(worker_path)) == _sha(original)
+        # The Compile Message grid is owner-drawn and exposes no row text to
+        # UI Automation. Capture only the private worker window, then use the
+        # Windows OCR API to read the vendor's visible error/warning summary.
+        capture: dict[str, Any] | None = None
+        diagnostics = ""
+        ocr_error: str | None = None
+        counts = _parse_native_compile_diagnostics(diagnostics)
+        compile_deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < compile_deadline:
+            main = next((window for window in process.windows()
+                         if window.get("class_name") == "TMainFrm"), None)
+            if main is None:
+                if process.poll() is not None:
+                    break
+                time.sleep(0.5)
+                continue
+            try:
+                screenshot_path = evidence_root / "ispsoft-result.bmp"
+                capture = _capture_private_window_bmp(process, main["handle"], screenshot_path)
+                diagnostics = _run_windows_ocr(screenshot_path, timeout=20.0)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                ocr_error = str(exc)
+                break
+            counts = _parse_native_compile_diagnostics(diagnostics)
+            if counts["compile_pane_detected"] and counts["errors"] is not None and counts["warnings"] is not None:
+                break
+            if process.poll() is not None:
+                break
+            time.sleep(0.5)
+        command_timed_out = time.monotonic() >= compile_deadline and not (
+            counts["compile_pane_detected"] and counts["errors"] is not None
+            and counts["warnings"] is not None)
+
+        appdata = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+        compiler_root = appdata / "Delta Industrial Automation" / "ISPSoft_New"
+        changed_outputs: list[dict[str, Any]] = []
+        for name in ("CompiledCode.txt", "CompiledProgPos.txt", "CompiledProgStep.txt",
+                     "AccumlatorStep.txt"):
+            path = compiler_root / name
+            if not path.is_file():
+                continue
+            data = read_bytes(path)
+            evidence_path = evidence_root / name
+            atomic_write(evidence_path, data)
+            changed_outputs.append({"name": name, "path": str(evidence_path),
+                                   "size_bytes": len(data), "sha256": _sha(data),
+                                   "source_path": str(path)})
+
+        error_count, warning_count = counts["errors"], counts["warnings"]
+        pane_seen = counts["compile_pane_detected"]
+        after_handle = user32.GetForegroundWindow()
+        foreground_after = int(after_handle) if after_handle else None
+        input_tick_after = _last_user_input_tick()
+        foreground_unchanged = (foreground_before is None or foreground_after == foreground_before)
+        user_input_during_run = (input_tick_before is not None and input_tick_after is not None
+                                 and input_tick_before != input_tick_after)
+        foreground_change_attributable_to_worker = (not foreground_unchanged and not user_input_during_run)
+        if pane_seen and error_count == 0 and warning_count is not None:
+            status = "NATIVE_CHECK_PASSED" if action == "check" else "NATIVE_COMPILE_PASSED"
+            success = True
+        elif error_count is not None and error_count > 0:
+            status = "NATIVE_CHECK_ERRORS" if action == "check" else "NATIVE_COMPILE_ERRORS"
+            success = False
+        else:
+            status = "NATIVE_COMMAND_TIMEOUT" if command_timed_out else "NATIVE_COMMAND_EXECUTED_RESULT_UNREADABLE"
+            success = False
+        if foreground_change_attributable_to_worker:
+            status = "USER_FOREGROUND_CHANGED"
+            success = False
+        return _json({"success": success, "status": status,
+                "vendor_compile": "PASSED" if success else "EXECUTED_RESULT_UNVERIFIED",
+                "action": action, "project_path": str(source),
+                "model": project_info.get("project_model"), "session_id": session_id,
+                "worker_project_path": str(worker_path),
+                "worker_project_title_match": launch.get("title_match"),
+                "private_desktop": launch.get("desktop_name"),
+                "default_desktop_window_count": launch.get("default_desktop_window_count"),
+                "source_sha256_before": _sha(original),
+                "source_sha256_after": _sha(read_bytes(source)),
+                "worker_sha256_after": _sha(read_bytes(worker_path)),
+                "original_project_untouched": source_unchanged,
+                "worker_project_readback_matches_source": worker_unchanged,
+                "user_foreground_unchanged": foreground_unchanged,
+                "foreground_handle_before": foreground_before,
+                "foreground_handle_after": foreground_after,
+                "user_input_during_run": user_input_during_run,
+                "foreground_change_attributable_to_worker": foreground_change_attributable_to_worker,
+                "diagnostic_counts": counts, "diagnostic_text": diagnostics,
+                "compile_pane_detected": pane_seen, "diagnostic_capture": capture,
+                "diagnostic_capture_error": ocr_error,
+                "menu_evidence": command.get("menu_evidence"),
+                "menu_ocr_text": command.get("menu_ocr_text"),
+                "compiler_outputs": changed_outputs,
+                "compiler_outputs_use_shared_windows_profile": True,
+                "verification": "Native ISPSoft menu command was invoked on a private desktop; a pass requires OCR of the worker's Compile Message pane with readable error and warning counts.",
+                "warning": "ISPSoft 3.24 writes fixed-name compiler sidecars beneath the Windows roaming profile even when the worker receives a private APPDATA. MCP compile calls serialize within this Windows logon session; avoid compiling manually in the visible ISPSoft at the same time."})
+    except (OSError, FileTransformError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        return _json({"success": False, "status": "NATIVE_COMPILE_FAILED",
+                      "vendor_compile": "FAILED_OR_UNVERIFIED",
+                      "project_path": str(source), "session_id": session_id,
+                      "original_project_untouched": _sha(read_bytes(source)) == _sha(original),
+                      "error": str(exc)})
+    finally:
+        try:
+            if session_id is not None:
+                ispsoft_stop_background_session(session_id)
+        finally:
+            try:
+                if native_mutex_handle is not None:
+                    _release_native_compile_mutex(native_mutex_handle)
+            finally:
+                _NATIVE_COMPILE_LOCK.release()
 
 
 @mcp.tool()

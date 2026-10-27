@@ -392,8 +392,58 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             "ispsoft_get_ide_session", "ispsoft_start_ide", "ispsoft_read_ld_network",
             "ispsoft_get_ld_program_structure", "ispsoft_write_ld_network_candidate",
             "ispsoft_start_background_session", "ispsoft_get_background_sessions",
-            "ispsoft_stop_background_session",
+            "ispsoft_stop_background_session", "ispsoft_compile_and_check",
         }.issubset(names))
+
+    def test_native_compile_ocr_summary_accepts_vendor_zero_as_letter_o(self) -> None:
+        result = server._parse_native_compile_diagnostics(
+            "Project Compile Message V O Errors V O Warning")
+        self.assertEqual(result, {"errors": 0, "warnings": 0,
+                                  "compile_pane_detected": True})
+
+    def test_capability_matrix_limits_native_compile_to_qualified_es2(self) -> None:
+        matrix = server._capability_matrix()
+        self.assertEqual(matrix["per_profile"]["ES2"]["native_compile_check"],
+                         "QUALIFIED_LIMITED_ISPSOFT_3_24_ES2")
+        self.assertEqual(matrix["native_compile_check"]["models"], ["ES2"])
+        self.assertEqual(matrix["plc_connection"]["status"], "NOT_QUALIFIED")
+
+    def test_native_compile_ocr_summary_reports_errors_and_missing_counts(self) -> None:
+        errors = server._parse_native_compile_diagnostics(
+            "Compile Message 2 Errors 1 Warning")
+        self.assertEqual(errors["errors"], 2)
+        self.assertEqual(errors["warnings"], 1)
+        self.assertTrue(errors["compile_pane_detected"])
+        missing = server._parse_native_compile_diagnostics("Compile Message")
+        self.assertIsNone(missing["errors"])
+        self.assertIsNone(missing["warnings"])
+        self.assertTrue(missing["compile_pane_detected"])
+
+    def test_native_compile_rejects_unknown_action_before_starting_ispsoft(self) -> None:
+        with patch.object(server, "ispsoft_start_background_session") as start:
+            result = json.loads(server.ispsoft_compile_and_check("not-a-project.isp", "download"))
+        self.assertEqual(result["status"], "REJECTED_BEFORE_OPEN")
+        self.assertEqual(result["vendor_compile"], "NOT_RUN")
+        start.assert_not_called()
+
+    def test_native_compile_rejects_non_string_action_and_invalid_timeout(self) -> None:
+        with patch.object(server, "ispsoft_start_background_session") as start:
+            action = json.loads(server.ispsoft_compile_and_check("ignored", ["compile"]))
+            timeout = json.loads(server.ispsoft_compile_and_check("ignored", "check", True))
+        self.assertEqual(action["status"], "REJECTED_BEFORE_OPEN")
+        self.assertEqual(timeout["status"], "REJECTED_BEFORE_OPEN")
+        start.assert_not_called()
+
+    def test_native_compile_rejects_unqualified_project_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "as-project.isp"
+            project.write_bytes(as_container())
+            with patch.object(server.sys, "platform", "win32"), \
+                 patch.object(server, "ispsoft_start_background_session") as start:
+                result = json.loads(server.ispsoft_compile_and_check(str(project), "check"))
+        self.assertEqual(result["status"], "MODEL_NOT_QUALIFIED")
+        self.assertEqual(result["qualified_models"], ["ES2"])
+        start.assert_not_called()
 
     def test_ide_session_reports_visible_window_evidence(self) -> None:
         window = {"handle": 42, "pid": 7, "title": "ISPSoft", "class_name": "Main",
