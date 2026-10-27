@@ -445,6 +445,20 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         self.assertEqual(result["qualified_models"], ["ES2"])
         start.assert_not_called()
 
+    def test_native_compile_refuses_while_users_ispsoft_window_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "es2-project.isp"
+            project.write_bytes(es2_v8_container())
+            with patch.object(server.sys, "platform", "win32"), \
+                 patch.object(server, "_process_ids", return_value=[7123]), \
+                 patch.object(server, "_foreground_process_id", return_value=7123), \
+                 patch.object(server, "ispsoft_start_background_session") as start:
+                result = json.loads(server.ispsoft_compile_and_check(str(project), "compile"))
+        self.assertEqual(result["status"], "VISIBLE_ISPSOFT_ACTIVE")
+        self.assertEqual(result["vendor_compile"], "NOT_RUN")
+        self.assertEqual(result["active_process_id"], 7123)
+        start.assert_not_called()
+
     def test_ide_session_reports_visible_window_evidence(self) -> None:
         window = {"handle": 42, "pid": 7, "title": "ISPSoft", "class_name": "Main",
                   "visible": True, "minimized": False}

@@ -151,6 +151,8 @@ ISPSoft sample smoke test is read-only. Real project and hardware qualification
 remains model- and version-specific. Native compile/check writes fixed-name
 compiler sidecars beneath the Windows roaming profile despite the worker's
 private `APPDATA`. MCP instances serialize their builds within the current
-Windows logon session; the visible ISPSoft GUI does not use that lock, so avoid
-starting a manual compile at the same time. In particular, DVP32ES2 COM1 transfer and
-monitor behavior still require a controlled physical PLC qualification.
+Windows logon session. To protect the user's open session, a build is refused
+while the visible ISPSoft window is foreground and is marked unverified if that
+window becomes foreground during the build. In particular, DVP32ES2 COM1
+transfer and monitor behavior still require a controlled physical PLC
+qualification.

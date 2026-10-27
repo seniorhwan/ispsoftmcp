@@ -603,6 +603,23 @@ def _last_user_input_tick() -> int | None:
     return int(info.dwTime) if user32.GetLastInputInfo(ctypes.byref(info)) else None
 
 
+def _foreground_process_id() -> int | None:
+    """Return the process owning the user's current foreground window."""
+    if sys.platform != "win32":
+        return None
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    window = user32.GetForegroundWindow()
+    if not window:
+        return None
+    process_id = wintypes.DWORD()
+    if not user32.GetWindowThreadProcessId(window, ctypes.byref(process_id)):
+        return None
+    return int(process_id.value)
+
+
 def _try_acquire_native_compile_mutex() -> int | None:
     """Serialize fixed-name ISPSoft compiler sidecars across MCP processes in this logon session."""
     if sys.platform != "win32":
@@ -1380,7 +1397,7 @@ def _capability_matrix() -> dict[str, Any]:
         "native_compile_check": {"status": "QUALIFIED_LIMITED", "ispsoft_versions": ["3.24"],
                                  "models": ["ES2"], "actions": ["check", "compile"],
                                  "result_verification": "Windows OCR of Compile Message error and warning counts",
-                                 "known_global_side_effect": "fixed-name compiler sidecars under Windows roaming profile; MCP servers serialize, but the visible ISPSoft GUI does not honor that lock"},
+                                 "known_global_side_effect": "fixed-name compiler sidecars under Windows roaming profile; MCP servers serialize and refuse/abort if the user's ISPSoft window is foreground, but ISPSoft does not honor the MCP lock"},
         "plc_connection": {"status": "NOT_QUALIFIED"},
         "upload_from_plc": {"status": "NOT_QUALIFIED"},
         "download_to_plc": {"status": "NOT_QUALIFIED", "write_guard": LIVE_WRITES_ENV},
@@ -2050,6 +2067,20 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
                       "model": project_info.get("project_model"),
                       "qualified_models": ["ES2"],
                       "error": "Native menu automation is currently qualified only against ISPSoft 3.24 ES2 projects."})
+    owned_process_ids = {int(record.get("process_id", -1))
+                         for record in _BACKGROUND_IDE_SESSIONS.values()}
+    try:
+        user_ide_process_ids = set(_process_ids("NewISPSoft.exe")) - owned_process_ids
+        initial_foreground_pid = _foreground_process_id()
+    except (OSError, AttributeError, ctypes.ArgumentError) as exc:
+        return _json({"success": False, "status": "FOREGROUND_INSPECTION_FAILED",
+                      "vendor_compile": "NOT_RUN", "project_path": str(source),
+                      "error": str(exc)})
+    if initial_foreground_pid in user_ide_process_ids:
+        return _json({"success": False, "status": "VISIBLE_ISPSOFT_ACTIVE",
+                      "vendor_compile": "NOT_RUN", "project_path": str(source),
+                      "active_process_id": initial_foreground_pid,
+                      "error": "The user's ISPSoft window is active. The background compile was not started to protect the shared compiler files."})
     if not _NATIVE_COMPILE_LOCK.acquire(blocking=False):
         return _json({"success": False, "status": "NATIVE_IDE_BUSY",
                       "vendor_compile": "NOT_RUN",
@@ -2099,9 +2130,13 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
         capture: dict[str, Any] | None = None
         diagnostics = ""
         ocr_error: str | None = None
+        user_ide_active_during_run = False
         counts = _parse_native_compile_diagnostics(diagnostics)
         compile_deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < compile_deadline:
+            if _foreground_process_id() in user_ide_process_ids:
+                user_ide_active_during_run = True
+                break
             main = next((window for window in process.windows()
                          if window.get("class_name") == "TMainFrm"), None)
             if main is None:
@@ -2116,6 +2151,9 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
             except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                 ocr_error = str(exc)
                 break
+            if _foreground_process_id() in user_ide_process_ids:
+                user_ide_active_during_run = True
+                break
             counts = _parse_native_compile_diagnostics(diagnostics)
             if counts["compile_pane_detected"] and counts["errors"] is not None and counts["warnings"] is not None:
                 break
@@ -2129,8 +2167,9 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
         appdata = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
         compiler_root = appdata / "Delta Industrial Automation" / "ISPSoft_New"
         changed_outputs: list[dict[str, Any]] = []
-        for name in ("CompiledCode.txt", "CompiledProgPos.txt", "CompiledProgStep.txt",
-                     "AccumlatorStep.txt"):
+        for name in (() if user_ide_active_during_run else
+                     ("CompiledCode.txt", "CompiledProgPos.txt", "CompiledProgStep.txt",
+                      "AccumlatorStep.txt")):
             path = compiler_root / name
             if not path.is_file():
                 continue
@@ -2159,6 +2198,9 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
         else:
             status = "NATIVE_COMMAND_TIMEOUT" if command_timed_out else "NATIVE_COMMAND_EXECUTED_RESULT_UNREADABLE"
             success = False
+        if user_ide_active_during_run:
+            status = "VISIBLE_ISPSOFT_BECAME_ACTIVE"
+            success = False
         if foreground_change_attributable_to_worker:
             status = "USER_FOREGROUND_CHANGED"
             success = False
@@ -2179,6 +2221,7 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
                 "foreground_handle_before": foreground_before,
                 "foreground_handle_after": foreground_after,
                 "user_input_during_run": user_input_during_run,
+                "visible_ispsoft_became_active": user_ide_active_during_run,
                 "foreground_change_attributable_to_worker": foreground_change_attributable_to_worker,
                 "diagnostic_counts": counts, "diagnostic_text": diagnostics,
                 "compile_pane_detected": pane_seen, "diagnostic_capture": capture,
@@ -2188,7 +2231,7 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
                 "compiler_outputs": changed_outputs,
                 "compiler_outputs_use_shared_windows_profile": True,
                 "verification": "Native ISPSoft menu command was invoked on a private desktop; a pass requires OCR of the worker's Compile Message pane with readable error and warning counts.",
-                "warning": "ISPSoft 3.24 writes fixed-name compiler sidecars beneath the Windows roaming profile even when the worker receives a private APPDATA. MCP compile calls serialize within this Windows logon session; avoid compiling manually in the visible ISPSoft at the same time."})
+                "warning": "ISPSoft 3.24 writes fixed-name compiler sidecars beneath the Windows roaming profile even when the worker receives a private APPDATA. MCP compile calls serialize within this Windows logon session. A background compile is refused or marked unverified if the user's ISPSoft window becomes active."})
     except (OSError, FileTransformError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         return _json({"success": False, "status": "NATIVE_COMPILE_FAILED",
                       "vendor_compile": "FAILED_OR_UNVERIFIED",
