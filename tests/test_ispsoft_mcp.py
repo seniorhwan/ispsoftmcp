@@ -394,8 +394,22 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             "ispsoft_get_ld_program_structure", "ispsoft_write_ld_network_candidate",
             "ispsoft_start_background_session", "ispsoft_get_background_sessions",
             "ispsoft_stop_background_session", "ispsoft_compile_and_check",
-            "ispsoft_list_commgr_drivers",
+            "ispsoft_list_commgr_drivers", "ispsoft_list_serial_ports",
         }.issubset(names))
+
+    def test_serial_port_inventory_does_not_claim_device_identity_or_contact(self) -> None:
+        ports = [{"port": "COM9", "friendly_name": "USB Serial Port (COM9)"}]
+        catalog = {"drivers": [{"targets": [{"transport": "serial", "port_number": "9"},
+                                               {"transport": "serial", "port_number": "1"}]}]}
+        with patch.object(server.sys, "platform", "win32"), \
+             patch.object(server, "_enumerate_windows_serial_ports", return_value=ports), \
+             patch.object(server, "_read_commgr_driver_catalog", return_value=catalog):
+            result = json.loads(server.ispsoft_list_serial_ports())
+        self.assertEqual(result["configured_ports_present"], ["COM9"])
+        self.assertEqual(result["configured_ports_missing"], ["COM1"])
+        self.assertFalse(result["device_contacted"])
+        self.assertFalse(result["serial_port_opened"])
+        self.assertFalse(result["identity_verified"])
 
     def test_native_compile_ocr_summary_accepts_vendor_zero_as_letter_o(self) -> None:
         result = server._parse_native_compile_diagnostics(

@@ -1169,6 +1169,73 @@ def _project_comment_map(source: str) -> dict[str, str]:
     return result
 
 
+def _enumerate_windows_serial_ports() -> list[dict[str, str]]:
+    """Enumerate present Windows Ports-class devices without opening them."""
+    if sys.platform != "win32":
+        raise OSError("Windows serial-port discovery is available only on Windows.")
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+    class SP_DEVINFO_DATA(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("ClassGuid", GUID),
+                    ("DevInst", wintypes.DWORD), ("Reserved", ctypes.c_size_t)]
+
+    ports_guid = GUID(0x4D36E978, 0xE325, 0x11CE,
+                      (ctypes.c_ubyte * 8)(0xBF, 0xC1, 0x08, 0x00, 0x2B, 0xE1, 0x03, 0x18))
+    setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+    setupapi.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(GUID), wintypes.LPCWSTR,
+                                               wintypes.HWND, wintypes.DWORD]
+    setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
+    setupapi.SetupDiEnumDeviceInfo.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                ctypes.POINTER(SP_DEVINFO_DATA)]
+    setupapi.SetupDiEnumDeviceInfo.restype = wintypes.BOOL
+    setupapi.SetupDiGetDeviceRegistryPropertyW.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(SP_DEVINFO_DATA), wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(ctypes.c_ubyte),
+        wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    setupapi.SetupDiGetDeviceRegistryPropertyW.restype = wintypes.BOOL
+    setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
+    setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
+
+    devices = setupapi.SetupDiGetClassDevsW(ctypes.byref(ports_guid), None, None, 0x2)
+    if devices == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    result: list[dict[str, str]] = []
+    try:
+        index = 0
+        while True:
+            item = SP_DEVINFO_DATA()
+            item.cbSize = ctypes.sizeof(item)
+            if not setupapi.SetupDiEnumDeviceInfo(devices, index, ctypes.byref(item)):
+                error = ctypes.get_last_error()
+                if error == 259:  # ERROR_NO_MORE_ITEMS
+                    break
+                raise ctypes.WinError(error)
+            index += 1
+            friendly_name = ""
+            for property_id in (12, 0):  # SPDRP_FRIENDLYNAME, then SPDRP_DEVICEDESC
+                registry_type = wintypes.DWORD()
+                required = wintypes.DWORD()
+                buffer = (ctypes.c_ubyte * 4096)()
+                if setupapi.SetupDiGetDeviceRegistryPropertyW(
+                        devices, ctypes.byref(item), property_id,
+                        ctypes.byref(registry_type), buffer, ctypes.sizeof(buffer),
+                        ctypes.byref(required)):
+                    friendly_name = ctypes.wstring_at(ctypes.addressof(buffer)).strip()
+                    if friendly_name:
+                        break
+            match = re.search(r"\((COM\d+)\)\s*$", friendly_name, re.I)
+            if match:
+                result.append({"port": match.group(1).upper(),
+                               "friendly_name": friendly_name})
+    finally:
+        setupapi.SetupDiDestroyDeviceInfoList(devices)
+    result.sort(key=lambda item: int(item["port"][3:]))
+    return result
+
+
 @mcp.tool()
 def ispsoft_get_status() -> str:
     """Report ISPSoft/COMMGR installation and process state without changing it."""
@@ -1189,10 +1256,43 @@ def ispsoft_get_status() -> str:
         "device_catalog_available": _installed_device_catalog()["available"],
         "configured_previous_project": _configured_previous_project_summary(),
         "active_ide_project": "not observable; a configured previous project is not proof of the project currently open",
-        "ide_automation": "process/window detection and startup only; native build/check remains not qualified",
+        "ide_automation": "process/window detection and startup; native Check/Compile qualified for ISPSoft 3.24 ES2",
         "online_transport": "not qualified; no device I/O is enabled",
         "live_writes_enabled": os.environ.get(LIVE_WRITES_ENV, "").strip().lower() in {"1", "true", "yes"},
     })
+
+
+@mcp.tool()
+def ispsoft_list_serial_ports() -> str:
+    """List present Windows serial adapters without opening ports or contacting PLCs."""
+    if sys.platform != "win32":
+        return _json({"status": "WINDOWS_REQUIRED", "ports": [],
+                      "device_contacted": False, "serial_port_opened": False})
+    try:
+        ports = _enumerate_windows_serial_ports()
+        catalog = _read_commgr_driver_catalog()
+        configured = sorted({f"COM{target.get('port_number')}" for driver in catalog.get("drivers", [])
+                             for target in driver.get("targets", [])
+                             if target.get("transport") == "serial" and
+                             str(target.get("port_number", "")).isdigit()},
+                           key=lambda port: int(port[3:]))
+        present = {port["port"].removeprefix("COM") for port in ports}
+        configured_numbers = {port.removeprefix("COM") for port in configured}
+        return _json({"status": "OK", "ports": ports,
+                      "configured_commgr_ports": configured,
+                      "configured_ports_present": sorted(
+                          (f"COM{number}" for number in present.intersection(configured_numbers)),
+                          key=lambda port: int(port[3:])),
+                      "configured_ports_missing": sorted(
+                          (f"COM{number}" for number in configured_numbers - present),
+                          key=lambda port: int(port[3:])),
+                      "device_contacted": False, "serial_port_opened": False,
+                      "identity_verified": False,
+                      "warning": "Windows port enumeration does not identify an attached PLC; no port was opened."})
+    except (OSError, ctypes.ArgumentError) as exc:
+        return _json({"status": "SERIAL_PORT_ENUMERATION_FAILED", "ports": [],
+                      "device_contacted": False, "serial_port_opened": False,
+                      "error": str(exc)})
 
 
 @mcp.tool()

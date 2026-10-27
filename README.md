@@ -54,6 +54,10 @@ that an MCP operation works on it.
 - Installed PLC family/model catalog and installed simulator executables are
   discovered from ISPSoft 3.24's own device configuration. This catalog is
   informational; MCP capability status remains per operation.
+- Windows serial-port enumeration is read-only and reports COM names and
+  adapter descriptions. It does not identify a connected PLC or verify serial
+  settings; transport remains disabled until the exact target and protocol are
+  qualified.
 - Project discovery under an explicit folder and readback-verified offline
   project cloning from a user-selected template are supported. Native blank
   project creation and active-project readback are not automated.
@@ -93,6 +97,7 @@ the detected Delta installation path.
 |---|---|
 | `ispsoft_get_status` | Detect installed/running ISPSoft, COMMGR, and the DVP ES2 simulator. Presence is not a connection check. |
 | `ispsoft_list_commgr_drivers` | Read the active user-profile COMMGR driver/endpoint catalog (falling back to the install default) without starting COMMGR or contacting a device. It flags multiple driver names that share a serial port or network target. Returned targets describe configuration only; they are not proof of identity or reachability. |
+| `ispsoft_list_serial_ports` | List Windows Ports-class adapters and compare configured COMMGR serial ports without opening a port. Adapter presence does not identify a PLC. |
 | `ispsoft_get_ide_session` | Report ISPSoft process IDs and visible top-level window metadata. Does not identify the open project. |
 | `ispsoft_start_ide` | Interactive-only: open an explicit project or ISPSoft's configured previous project. Does not start blank. Background agents should not call this tool. |
 | `ispsoft_start_background_session` | Open the requested project, or ISPSoft's configured previous project when `project_path` is omitted, on a private Windows desktop using a disposable copy and private settings profile. It refuses to start blank. |
