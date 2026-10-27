@@ -19,8 +19,9 @@ that an MCP operation works on it.
   new filenames when present. The result is `GENERATED_UNCOMPILED`; this
   server does not claim native ISPSoft compilation or IDE readback.
 - Project overview, POU-section reads, device-comment reads, and comment
-  candidate generation for DVP ES2. LD network blocks are returned as native
-  project text; the server does not decode those nodes into a ladder diagram.
+  candidate generation for DVP ES2. LD network blocks are returned as raw
+  native project text and can be read one at a time; the server does not yet
+  decode those nodes into a ladder diagram.
 - DVP IL-to-MPU POU generation and MPU-to-IL inspection for the qualified ES2,
   DVP12SE11R, and DVP12SE11T profiles. Supported mnemonics and network shapes
   are deliberately limited by the serializer; unsupported or lossy logic is
@@ -84,6 +85,7 @@ the detected Delta installation path.
 | `ispsoft_get_project_overview` | Summarize model, POUs, tasks, and device-comment count. |
 | `ispsoft_read_project_source` | Return project source and POU metadata. |
 | `ispsoft_read_pou` | Read a single POU's source sections. |
+| `ispsoft_read_ld_network` | Read one raw LD network by one-based POU order without modifying the project. |
 | `ispsoft_read_device_comments` | Read device comments from a project. |
 | `ispsoft_get_cross_references` | Build a best-effort reference list for one POU. |
 | `ispsoft_get_memory_usage_map` | Read declared ranges from `SYSTEM_VAR`. |

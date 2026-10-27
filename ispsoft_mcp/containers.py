@@ -143,6 +143,42 @@ def sections(text: str, tag: str):
     return list(re.finditer(rf'<{re.escape(tag)}>\r*\n(.*?)</{re.escape(tag)}>', text, re.S))
 
 
+def ld_networks(text: str) -> list[str]:
+    """Return raw ISPSoft LD network bodies between their marker tags."""
+    return [match.group(1) for match in
+            re.finditer(r'(?is)<NETWORK_START>\r*\n(.*?)\r*\n<NETWORK_END>', text)]
+
+
+def parse_ld_network(network_text: str) -> dict:
+    """Extract marker-delimited properties and raw LD nodes without assigning semantics."""
+    def marker_region(start: str, end: str) -> str:
+        match = re.search(rf'(?is)<{start}>\r*\n(.*?)\r*\n<{end}>', network_text)
+        return match.group(1) if match else ""
+
+    def fields(block: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for line in block.splitlines():
+            line = line.strip()
+            if "=" in line:
+                key, value = line.split("=", 1)
+                result[key.strip()] = value.strip()
+        return result
+
+    def nodes(section: str) -> list[dict[str, object]]:
+        result: list[dict[str, object]] = []
+        for match in re.finditer(r'(?is)\[LD_NODE\]\r*\n(.*?)\r*\n\[END_LD_NODE\]', section):
+            raw = match.group(1)
+            result.append({"fields": fields(raw), "raw_text": raw})
+        return result
+
+    properties = marker_region("PROPERTIES_START", "PROPERTIES_END")
+    roots = marker_region("ROOTLINK_START", "ROOTLINK_END")
+    outlinks = marker_region("OUTLINK_START", "OUTLINK_END")
+    return {"properties": fields(properties), "root_nodes": nodes(roots),
+            "outlink_nodes": nodes(outlinks), "root_section_raw": roots,
+            "outlink_section_raw": outlinks}
+
+
 def property_value(body: str, key: str) -> str | None:
     match = re.search(rf'(?m)^{re.escape(key)}=([^\r\n]*)', body)
     return match.group(1) if match else None

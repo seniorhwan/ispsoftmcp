@@ -220,6 +220,65 @@ class ContainerTests(unittest.TestCase):
             self.assertTrue(refs['Y0']['writes'])
             self.assertTrue(any(row['area'] == 'M' and row['end'] == 999 for row in memory['ranges']))
 
+    def test_ld_pou_networks_are_read_as_raw_blocks(self) -> None:
+        network = """<NETWORK_START>
+<PROPERTIES_START>
+NetworkID=1
+<PROPERTIES_END>
+<ROOTLINK_START>
+[LD_NODE]
+TYPE=1
+DEV_NAME=X0
+[END_LD_NODE]
+<ROOTLINK_END>
+<OUTLINK_START>
+[LD_NODE]
+TYPE=15
+DEV_NAME=Y0
+[END_LD_NODE]
+<OUTLINK_END>
+<NETWORK_END>
+"""
+        source = ES2_SOURCE.replace("P_Lang=2", "P_Lang=1").replace(
+            "</POU>", network + network.replace("NetworkID=1", "NetworkID=2") + "</POU>")
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "ld.isp"
+            project.write_bytes(es2_v8_container(source))
+            pou = json.loads(server.ispsoft_read_pou(str(project), "MainProgram"))
+            self.assertEqual(pou["network_count"], 2)
+            self.assertEqual(len(pou["sections"]["LD_NETWORKS"]), 2)
+            self.assertIn("DEV_NAME=X0", pou["sections"]["LD_NETWORKS"][0])
+            first = json.loads(server.ispsoft_read_ld_network(str(project), "MainProgram", 1))
+            self.assertEqual(first["status"], "READ_RAW_NETWORK")
+            self.assertEqual(first["network_count"], 2)
+            self.assertIn("DEV_NAME=Y0", first["network_text"])
+            self.assertEqual(first["structure"]["properties"]["NetworkID"], "1")
+            self.assertEqual(first["structure"]["root_nodes"][0]["fields"]["DEV_NAME"], "X0")
+            self.assertEqual(first["structure"]["outlink_nodes"][0]["fields"]["DEV_NAME"], "Y0")
+            out_of_range = json.loads(server.ispsoft_read_ld_network(str(project), "MainProgram", 3))
+            self.assertEqual(out_of_range["status"], "NETWORK_INDEX_OUT_OF_RANGE")
+            invalid_index = json.loads(server.ispsoft_read_ld_network(str(project), "MainProgram", 0))
+            self.assertEqual(invalid_index["status"], "REJECTED_BEFORE_READ")
+
+    def test_installed_station_project_exposes_ld_networks_when_available(self) -> None:
+        project = Path(r"C:\Users\jethr\OneDrive\Dokumen\Reading material\TA\PLC programming\finished\STATION 3 PROCESSINGAAAAA\STATION 3 PROCESSINGAAAAA.isp")
+        if not project.is_file():
+            self.skipTest("User's ISPSoft station project is not present on this machine.")
+        before = project.read_bytes()
+        overview = json.loads(server.ispsoft_get_project_overview(str(project)))
+        pou = json.loads(server.ispsoft_read_pou(str(project), "Prog0"))
+        first_network = json.loads(server.ispsoft_read_ld_network(str(project), "Prog0", 1))
+        xrefs = json.loads(server.ispsoft_get_cross_references(str(project), "Prog0"))
+        self.assertEqual(overview["model"], "ES2")
+        self.assertGreater(pou["network_count"], 0)
+        self.assertTrue(any("VAR_NODE_S" in network for network in pou["sections"]["LD_NETWORKS"]))
+        self.assertEqual(first_network["structure"]["properties"]["NET_ID"], "1")
+        self.assertEqual(first_network["structure"]["root_nodes"][0]["fields"]["DEV_NAME"], "M1002")
+        self.assertEqual(first_network["structure"]["outlink_nodes"][0]["fields"]["DEV_NAME"], "M1143")
+        refs = {row["address"]: row for row in xrefs["references"]}
+        self.assertIn("M1002", refs)
+        self.assertEqual(project.read_bytes(), before)
+
     def test_device_comment_candidate_merges_and_preserves_input(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -273,7 +332,7 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             "ispsoft_get_capabilities", "ispsoft_list_projects",
             "ispsoft_create_project_from_template", "ispsoft_connect",
             "ispsoft_upload_from_plc", "ispsoft_start_monitor", "ispsoft_stop_monitor",
-            "ispsoft_get_ide_session", "ispsoft_start_ide",
+            "ispsoft_get_ide_session", "ispsoft_start_ide", "ispsoft_read_ld_network",
         }.issubset(names))
 
     def test_ide_session_reports_visible_window_evidence(self) -> None:

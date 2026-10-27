@@ -650,13 +650,52 @@ def ispsoft_read_pou(project_path: str, pou_name: str) -> str:
         sections: dict[str, list[str]] = {}
         for tag in section_tags:
             sections[tag] = [match.group(1) for match in containers.sections(body, tag)]
+        networks = containers.ld_networks(body)
+        sections['LD_NETWORKS'] = networks
         return _json({"success": True, "name": pou_name,
                       "language": containers.property_value(body, 'P_Lang'),
                       "type": containers.property_value(body, 'P_type'),
+                      "network_count": len(networks),
                       "sections": sections,
-                      "note": "LD network sections are returned as native project text; no semantic rung decode is claimed."})
+                      "note": "LD_NETWORKS contains raw network bodies in project order; network marker keys are legacy and no semantic rung decode is claimed."})
     except (OSError, FileTransformError, ValueError) as exc:
         return _json({"success": False, "error": str(exc), "pou_name": pou_name})
+
+
+@mcp.tool()
+def ispsoft_read_ld_network(project_path: str, pou_name: str, network_index: int) -> str:
+    """Read one raw LD network body by its one-based order within a named POU."""
+    if not isinstance(network_index, int) or isinstance(network_index, bool) or network_index < 1:
+        return _json({"success": False, "status": "REJECTED_BEFORE_READ",
+                      "error": "network_index must be a positive one-based integer."})
+    try:
+        container = containers.read_container(project_path)
+        source = container.source.decode(container.encoding)
+        candidates = [match for match in containers.sections(source, 'POU')
+                      if containers.property_value(match.group(1), 'P_Name') == pou_name]
+        if len(candidates) != 1:
+            raise FileTransformError(f"Expected one POU named {pou_name!r}; found {len(candidates)}")
+        body = candidates[0].group(1)
+        networks = containers.ld_networks(body)
+        if not networks:
+            return _json({"success": False, "status": "NO_LD_NETWORKS",
+                          "project_path": str(Path(project_path).expanduser().resolve()),
+                          "pou_name": pou_name, "network_count": 0})
+        if network_index > len(networks):
+            return _json({"success": False, "status": "NETWORK_INDEX_OUT_OF_RANGE",
+                          "pou_name": pou_name, "network_index": network_index,
+                          "network_count": len(networks)})
+        network_text = networks[network_index - 1]
+        structure = containers.parse_ld_network(network_text)
+        return _json({"success": True, "status": "READ_RAW_NETWORK",
+                      "project_path": str(Path(project_path).expanduser().resolve()),
+                      "pou_name": pou_name, "language": containers.property_value(body, 'P_Lang'),
+                      "network_index": network_index, "network_count": len(networks),
+                      "network_text": network_text, "structure": structure,
+                      "interpretation": "Raw marker fields and ordered node records only; node type semantics, rung topology, and compilation are not inferred."})
+    except (OSError, FileTransformError, ValueError) as exc:
+        return _json({"success": False, "status": "READ_FAILED", "error": str(exc),
+                      "pou_name": pou_name})
 
 
 @mcp.tool()
@@ -672,8 +711,7 @@ def ispsoft_get_cross_references(project_path: str, pou_name: str) -> str:
         body = pous[0]
         code = '\n'.join(match.group(1) for match in containers.sections(body, 'IL_ST_CODE'))
         if not code.strip():
-            code = '\n'.join(match.group(0) for match in re.finditer(
-                r'(?is)<NETWORK_START>.*?</NETWORK_END>', body))
+            code = '\n'.join(containers.ld_networks(body))
         result = _cross_refs(code)
         return _json({"success": True, "pou_name": pou_name,
                       "analysis_kind": "best-effort textual cross-reference",
