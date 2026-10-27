@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import ctypes
 import ctypes.wintypes as wintypes
+import atexit
 import configparser
 import hashlib
 import json
@@ -16,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -56,6 +58,71 @@ WRITE_OPS = {"OUT", "SET", "RST", "MOV", "DMOV", "DADD", "DSUB", "DMUL", "INC", 
 
 mcp = FastMCP(SERVER_NAME)
 _BACKGROUND_IDE_SESSIONS: dict[str, dict[str, Any]] = {}
+
+
+class _PrivateDesktopProcess:
+    """Owned ISPSoft process and private desktop used for silent UI work."""
+
+    def __init__(self, process_id: int, process_handle: int, desktop_handle: int,
+                 desktop_name: str, command: str):
+        self.pid = process_id
+        self.process_handle = process_handle
+        self.desktop_handle = desktop_handle
+        self.desktop_name = desktop_name
+        self.command = command
+        self._closed = False
+
+    def poll(self) -> int | None:
+        if self._closed:
+            return getattr(self, "_exit_code", 0)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        if kernel32.WaitForSingleObject(self.process_handle, 0) == 0x00000102:
+            return None
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(self.process_handle, ctypes.byref(code)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(code.value)
+
+    def wait(self, timeout: float | None = None) -> int:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        timeout_ms = 0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000))
+        if kernel32.WaitForSingleObject(self.process_handle, timeout_ms) == 0x00000102:
+            raise subprocess.TimeoutExpired(self.command, timeout)
+        return self.poll() or 0
+
+    def terminate(self) -> None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+        if self.poll() is None and not kernel32.TerminateProcess(self.process_handle, 1):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    kill = terminate
+
+    def windows(self) -> list[dict[str, Any]]:
+        if self._closed:
+            return []
+        return _ide_windows_on_desktop(self.desktop_handle, self.pid)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._exit_code = self.poll()
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(self.process_handle)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+        user32.CloseDesktop.restype = wintypes.BOOL
+        user32.CloseDesktop(self.desktop_handle)
+        self._closed = True
 
 
 def _json(value: Any) -> str:
@@ -250,6 +317,118 @@ def _ide_windows() -> list[dict[str, Any]]:
     callback = callback_type(inspect)
     user32.EnumWindows(callback, 0)
     return windows
+
+
+def _ide_windows_on_desktop(desktop_handle: int, process_id: int) -> list[dict[str, Any]]:
+    """Enumerate ISPSoft windows on an MCP-owned private desktop."""
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.EnumDesktopWindows.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.LPARAM]
+    user32.EnumDesktopWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    windows: list[dict[str, Any]] = []
+
+    def inspect(hwnd: int, _lparam: int) -> bool:
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value != process_id:
+            return True
+        length = max(1, user32.GetWindowTextLengthW(hwnd) + 1)
+        title = ctypes.create_unicode_buffer(length)
+        class_name = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, title, length)
+        user32.GetClassNameW(hwnd, class_name, len(class_name))
+        windows.append({"handle": int(hwnd), "pid": pid.value, "title": title.value,
+                        "class_name": class_name.value,
+                        "visible": bool(user32.IsWindowVisible(hwnd)),
+                        "minimized": bool(user32.IsIconic(hwnd))})
+        return True
+
+    callback = callback_type(inspect)
+    if not user32.EnumDesktopWindows(desktop_handle, callback, 0):
+        error = ctypes.get_last_error()
+        if error:
+            raise ctypes.WinError(error)
+    return windows
+
+
+def _create_private_desktop(name: str) -> int:
+    """Create a worker desktop without switching the MCP/user thread to it."""
+    result: dict[str, Any] = {}
+
+    def create() -> None:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.CreateDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                         ctypes.c_void_p, wintypes.DWORD,
+                                         wintypes.DWORD, ctypes.c_void_p]
+        user32.CreateDesktopW.restype = wintypes.HANDLE
+        # Include window, menu, enumeration and object access for the legacy VCL UI.
+        # The worker must not have the right to switch the user's active desktop.
+        access = 0x0001 | 0x0002 | 0x0004 | 0x0040 | 0x0080
+        handle = user32.CreateDesktopW(name, None, None, 0, access, None)
+        result["handle"] = int(handle) if handle else 0
+        result["error"] = ctypes.get_last_error()
+
+    creator = threading.Thread(target=create, name=f"ispsoft-desktop-{name}", daemon=True)
+    creator.start()
+    creator.join()
+    if not result.get("handle"):
+        error = result.get("error", 0)
+        raise ctypes.WinError(error) if error else OSError("Windows did not create a private desktop.")
+    return result["handle"]
+
+
+def _create_private_desktop_process(executable: Path, project_path: Path,
+                                    environment: dict[str, str], desktop_name: str,
+                                    desktop_handle: int) -> _PrivateDesktopProcess:
+    """Start ISPSoft directly on its private desktop with the disposable project argument."""
+    class StartupInfo(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR),
+                    ("lpDesktop", wintypes.LPWSTR), ("lpTitle", wintypes.LPWSTR),
+                    ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
+                    ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD),
+                    ("dwXCountChars", wintypes.DWORD), ("dwYCountChars", wintypes.DWORD),
+                    ("dwFillAttribute", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("wShowWindow", wintypes.WORD), ("cbReserved2", wintypes.WORD),
+                    ("lpReserved2", ctypes.c_void_p), ("hStdInput", wintypes.HANDLE),
+                    ("hStdOutput", wintypes.HANDLE), ("hStdError", wintypes.HANDLE)]
+
+    class ProcessInformation(ctypes.Structure):
+        _fields_ = [("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE),
+                    ("dwProcessId", wintypes.DWORD), ("dwThreadId", wintypes.DWORD)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR,
+                                        ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL,
+                                        wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR,
+                                        ctypes.POINTER(StartupInfo), ctypes.POINTER(ProcessInformation)]
+    kernel32.CreateProcessW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    startup = StartupInfo()
+    startup.cb = ctypes.sizeof(startup)
+    desktop_spec = f"WinSta0\\{desktop_name}"
+    startup.lpDesktop = desktop_spec
+    startup.dwFlags = 0x00000001  # STARTF_USESHOWWINDOW
+    startup.wShowWindow = 0  # SW_HIDE on the isolated desktop.
+    command_line = subprocess.list2cmdline([str(executable), str(project_path)])
+    mutable_command = ctypes.create_unicode_buffer(command_line)
+    environment_data = "\0".join(f"{key}={value}" for key, value in
+                                  sorted(environment.items(), key=lambda item: item[0].casefold())) + "\0\0"
+    environment_block = ctypes.create_unicode_buffer(environment_data)
+    info = ProcessInformation()
+    flags = (0x00000008 | 0x00000200 | 0x00004000 | 0x00000400)  # detached, new group, below normal, Unicode environment
+    if not kernel32.CreateProcessW(str(executable), mutable_command, None, None, False,
+                                   flags, environment_block, str(executable.parent),
+                                   ctypes.byref(startup), ctypes.byref(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    kernel32.CloseHandle(info.hThread)
+    return _PrivateDesktopProcess(int(info.dwProcessId), int(info.hProcess),
+                                  desktop_handle, desktop_name, command_line)
 
 
 def _ide_session() -> dict[str, Any]:
@@ -613,7 +792,7 @@ def ispsoft_start_ide(project_path: str = "", wait_seconds: int = 15) -> str:
 
 @mcp.tool()
 def ispsoft_start_background_session(project_path: str, wait_seconds: int = 30) -> str:
-    """Start an isolated, hidden ISPSoft worker on a disposable project copy; never focus the user's IDE."""
+    """Start ISPSoft on a private Windows desktop with a disposable project copy."""
     if sys.platform != "win32":
         return _json({"success": False, "status": "WINDOWS_REQUIRED"})
     if not isinstance(wait_seconds, int) or isinstance(wait_seconds, bool) or not 1 <= wait_seconds <= 60:
@@ -625,9 +804,10 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 30) 
                       "error": "ISPSoft executable was not found. Set ISPSOFT_EXE to its installed path."})
 
     session_id = uuid.uuid4().hex
-    session_root = WORK_DIR / "background-sessions" / session_id
+    session_root = (WORK_DIR / "background-sessions" / session_id).resolve()
     project_copy: Path | None = None
-    process: subprocess.Popen[Any] | None = None
+    process: _PrivateDesktopProcess | None = None
+    desktop_handle = 0
     try:
         source = Path(project_path).expanduser().resolve(strict=True)
         if source.suffix.lower() not in {".isp", ".bak"}:
@@ -650,14 +830,10 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 30) 
         profile = _prepare_background_profile(session_root / "profile", project_copy)
         worker_env = os.environ.copy()
         worker_env["APPDATA"] = str(profile)
-        startup_info = subprocess.STARTUPINFO()
-        startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startup_info.wShowWindow = 0  # SW_HIDE: create the worker without showing or focusing it.
-        creation_flags = (getattr(subprocess, "DETACHED_PROCESS", 0) |
-                          getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) |
-                          getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000))
-        process = subprocess.Popen([str(executable), str(project_copy)], cwd=str(executable.parent), env=worker_env,
-                                   startupinfo=startup_info, creationflags=creation_flags)
+        desktop_name = f"ISPSoftMCP_{session_id[:12]}"
+        desktop_handle = _create_private_desktop(desktop_name)
+        process = _create_private_desktop_process(executable.resolve(), project_copy,
+                                                  worker_env, desktop_name, desktop_handle)
         record: dict[str, Any] = {
             "session_id": session_id, "process": process, "process_id": process.pid,
             "status": "STARTING", "project_path": str(source), "worker_project_path": str(project_copy),
@@ -665,8 +841,10 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 30) 
             "source_sha256": _sha(original), "worker_sha256": _sha(read_bytes(project_copy)),
             "readback_verified": read_bytes(project_copy) == original,
             "companion_path": str(copied_companion) if copied_companion else None,
-            "profile_path": str(profile), "launch_mode": "PROJECT_FILE_ARGUMENT_WITH_ISOLATED_PROFILE",
+            "profile_path": str(profile), "desktop_name": desktop_name,
+            "launch_mode": "PRIVATE_WINDOWS_DESKTOP_WITH_DISPOSABLE_PROJECT",
             "created_by_server": True, "priority_class": "BELOW_NORMAL",
+            "isolated_desktop": True, "visible_to_user": False,
         }
         _BACKGROUND_IDE_SESSIONS[session_id] = record
         expected = f"__mcp_{session_id[:12]}".casefold()
@@ -674,20 +852,25 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 30) 
         matching: list[dict[str, Any]] = []
         worker_windows: list[dict[str, Any]] = []
         while True:
-            _hide_ide_windows(process.pid)
-            worker_windows = [window for window in _ide_windows() if window["pid"] == process.pid]
+            worker_windows = process.windows()
             matching = [window for window in worker_windows
                         if expected in str(window.get("title", "")).casefold()]
-            if matching:
-                hidden = all(not window["visible"] for window in worker_windows)
-                record.update(success=hidden, status="BACKGROUND_PROJECT_OPEN_TITLE_MATCH", windows=worker_windows,
-                              title_match=True, hidden=hidden,
-                              message=None if hidden else
-                              "The requested project loaded, but at least one worker window could not be hidden.")
+            default_windows = [window for window in _ide_windows() if window["pid"] == process.pid]
+            if matching and not default_windows:
+                record.update(success=True, status="BACKGROUND_PROJECT_OPEN_TITLE_MATCH", windows=worker_windows,
+                              title_match=True, hidden=True,
+                              hidden_from_user=True,
+                              visible_on_private_desktop=any(window["visible"] for window in worker_windows),
+                              desktop_isolated=True,
+                              default_desktop_window_count=0,
+                              message="The project is open on a private desktop and cannot take focus from the user's desktop.")
                 return _json({key: value for key, value in record.items() if key != "process"})
             if process.poll() is not None:
                 record.update(status="BACKGROUND_PROCESS_EXITED", windows=worker_windows,
-                              title_match=False, hidden=True, exit_code=process.returncode)
+                              title_match=False, hidden=True, desktop_isolated=not default_windows,
+                              default_desktop_windows=default_windows, exit_code=process.poll())
+                process.close()
+                desktop_handle = 0
                 break
             if time.monotonic() >= deadline:
                 diagnostic_windows = [window for window in worker_windows
@@ -720,8 +903,13 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 30) 
                         pass
                 except (OSError, subprocess.SubprocessError):
                     pass
+                if process_stopped:
+                    process.close()
+                    desktop_handle = 0
                 record.update(success=False, status="BACKGROUND_PROJECT_OPEN_UNVERIFIED", windows=worker_windows,
-                              title_match=False, hidden=all(not window["visible"] for window in worker_windows),
+                              title_match=False, hidden=True,
+                              desktop_isolated=not default_windows,
+                              default_desktop_windows=default_windows,
                               dialog_details=diagnostics, failure_reason=failure_reason,
                               process_stopped=process_stopped,
                               message=("ISPSoft could not create a settings file in its resolved AppData folder; "
@@ -741,6 +929,20 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 30) 
                 process.wait(timeout=5)
             except (OSError, subprocess.SubprocessError):
                 pass
+        if process is not None:
+            if process.poll() is None:
+                return _json({"success": False, "status": "BACKGROUND_STOP_UNCONFIRMED",
+                              "error": str(exc), "process_id": process.pid,
+                              "desktop_name": process.desktop_name,
+                              "session_root": str(session_root),
+                              "worker_project_path": str(project_copy),
+                              "cleanup": "worker and desktop retained for explicit recovery"})
+            process.close()
+            desktop_handle = 0
+        if desktop_handle:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+            user32.CloseDesktop(desktop_handle)
         shutil.rmtree(session_root, ignore_errors=True)
         return _json({"success": False, "status": "BACKGROUND_START_FAILED", "error": str(exc),
                       "project_path": project_path, "created_paths_removed": not session_root.exists()})
@@ -748,15 +950,18 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 30) 
 
 @mcp.tool()
 def ispsoft_get_background_sessions() -> str:
-    """List only hidden ISPSoft workers created by this MCP server."""
+    """List private-desktop ISPSoft workers created by this MCP server."""
     sessions: list[dict[str, Any]] = []
     for session_id, record in list(_BACKGROUND_IDE_SESSIONS.items()):
         process = record.get("process")
         process_running = process is not None and process.poll() is None
-        windows = [window for window in _ide_windows() if window["pid"] == record.get("process_id")]
+        windows = process.windows() if process is not None and process_running else []
         sessions.append({key: value for key, value in record.items() if key != "process"} | {
             "session_id": session_id, "process_running": process_running,
-            "windows": windows, "hidden": all(not window["visible"] for window in windows),
+            "windows": windows, "hidden": bool(record.get("isolated_desktop")),
+            "hidden_from_user": bool(record.get("isolated_desktop")),
+            "visible_on_private_desktop": any(window["visible"] for window in windows),
+            "visible_to_user": not bool(record.get("isolated_desktop")),
         })
     return _json({"success": True, "sessions": sessions})
 
@@ -779,11 +984,33 @@ def ispsoft_stop_background_session(session_id: str) -> str:
         except (OSError, subprocess.SubprocessError) as exc:
             return _json({"success": False, "status": "STOP_FAILED", "error": str(exc),
                           "session_id": session_id, "process_id": record["process_id"]})
+    process.close()
     record["status"] = "STOPPED"
     return _json({"success": True, "status": "STOPPED", "session_id": session_id,
                   "process_id": record["process_id"], "session_root": record["session_root"],
                   "worker_project_path": record["worker_project_path"],
                   "original_project_untouched": True})
+
+
+def _stop_background_sessions_at_exit() -> None:
+    """Avoid orphaned private-desktop ISPSoft processes if the MCP server exits."""
+    for record in list(_BACKGROUND_IDE_SESSIONS.values()):
+        process = record.get("process")
+        if process is None:
+            continue
+        try:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+            if process.poll() is not None:
+                process.close()
+                record["status"] = "STOPPED_SERVER_EXIT"
+        except (OSError, subprocess.SubprocessError):
+            # Keep the OS handles open rather than closing a desktop still in use.
+            continue
+
+
+atexit.register(_stop_background_sessions_at_exit)
 
 
 @mcp.tool()
@@ -1460,7 +1687,7 @@ def ispsoft_write_device_comment_candidate(project_path: str, device_comments: d
 def ispsoft_compile_and_check(project_path: str) -> str:
     """Report native compile/check availability; never infer success from parsing."""
     return _json({"success": False, "status": "NOT_AVAILABLE",
-                  "error": "ISPSoft 3.24 native Compile/Check automation is not qualified. Open the candidate in ISPSoft and run Compile All/Check Program manually.",
+                  "error": "ISPSoft 3.24 native Compile/Check has not been executed and verified through MCP yet. Background project loading is available on an isolated Windows desktop; no compile result is claimed.",
                   "project_path": project_path, "vendor_compile": "NOT_RUN"})
 
 

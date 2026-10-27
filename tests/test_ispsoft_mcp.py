@@ -488,33 +488,38 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             source.write_bytes(original)
             window = {"handle": 42, "pid": 123,
                       "title": "station project__MCP_123456789abc - Delta ISPSoft",
-                      "class_name": "TMainFrm", "visible": False, "minimized": False}
+                      "class_name": "TMainFrm", "visible": True, "minimized": False}
             process = Mock()
             process.pid = 123
             process.poll.return_value = None
+            process.windows.return_value = [window]
             with patch.object(server, "WORK_DIR", root / "work"), \
                  patch.dict(server.os.environ, {"APPDATA": str(root / "user-appdata")}), \
                  patch.object(server, "_exe", return_value=Path("C:/Delta/NewISPSoft.exe")), \
-                 patch.object(server, "_ide_windows", return_value=[window]), \
-                 patch.object(server, "_hide_ide_windows") as hide, \
+                 patch.object(server, "_ide_windows", return_value=[]), \
+                 patch.object(server, "_create_private_desktop", return_value=555) as desktop, \
+                 patch.object(server, "_create_private_desktop_process", return_value=process) as launch, \
                  patch.object(server.uuid, "uuid4", return_value=Mock(hex="123456789abc00000000000000000000")), \
-                 patch.object(server.subprocess, "Popen", return_value=process) as popen, \
                  patch.object(server.sys, "platform", "win32"):
                 result = json.loads(server.ispsoft_start_background_session(str(source), 1))
             self.assertEqual(result["status"], "BACKGROUND_PROJECT_OPEN_TITLE_MATCH")
             self.assertTrue(result["success"])
             self.assertTrue(result["hidden"])
+            self.assertTrue(result["desktop_isolated"])
+            self.assertTrue(result["hidden_from_user"])
+            self.assertTrue(result["visible_on_private_desktop"])
+            self.assertFalse(result["visible_to_user"])
             self.assertTrue(result["readback_verified"])
             self.assertEqual(result["priority_class"], "BELOW_NORMAL")
-            self.assertTrue(popen.call_args.kwargs["creationflags"] & 0x00004000)
             self.assertEqual(Path(result["worker_project_path"]).read_bytes(), original)
             self.assertEqual(source.read_bytes(), original)
-            self.assertEqual(popen.call_args.args[0], [str(Path("C:/Delta/NewISPSoft.exe")),
-                                                      result["worker_project_path"]])
-            startup = popen.call_args.kwargs["startupinfo"]
-            self.assertEqual(startup.wShowWindow, 0)
-            self.assertEqual(popen.call_args.kwargs["env"]["APPDATA"], result["profile_path"])
-            hide.assert_called_once_with(123)
+            self.assertEqual(desktop.call_args.args[0], result["desktop_name"])
+            args = launch.call_args.args
+            self.assertEqual(args[0], Path("C:/Delta/NewISPSoft.exe"))
+            self.assertEqual(args[1], Path(result["worker_project_path"]))
+            self.assertEqual(args[2]["APPDATA"], result["profile_path"])
+            self.assertEqual(args[3], result["desktop_name"])
+            self.assertEqual(args[4], 555)
 
     def test_background_session_stops_only_its_owned_process(self) -> None:
         process = Mock()
@@ -529,6 +534,24 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         process.terminate.assert_called_once()
         process.wait.assert_called_once_with(timeout=10)
 
+    def test_background_session_listing_uses_the_private_desktop_windows(self) -> None:
+        process = Mock()
+        process.pid = 77
+        process.poll.return_value = None
+        window = {"handle": 42, "pid": 77, "title": "station__MCP_test - Delta ISPSoft",
+                  "class_name": "TMainFrm", "visible": True, "minimized": False}
+        process.windows.return_value = [window]
+        session_id = "session-123"
+        record = {"session_id": session_id, "process": process, "process_id": 77,
+                  "status": "BACKGROUND_PROJECT_OPEN_TITLE_MATCH", "isolated_desktop": True}
+        with patch.dict(server._BACKGROUND_IDE_SESSIONS, {session_id: record}):
+            result = json.loads(server.ispsoft_get_background_sessions())
+        self.assertEqual(result["sessions"][0]["windows"], [window])
+        self.assertTrue(result["sessions"][0]["hidden"])
+        self.assertTrue(result["sessions"][0]["hidden_from_user"])
+        self.assertTrue(result["sessions"][0]["visible_on_private_desktop"])
+        self.assertFalse(result["sessions"][0]["visible_to_user"])
+
     def test_background_session_stops_worker_when_ispsoft_cannot_write_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -539,13 +562,14 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             process.poll.return_value = None
             dialog = {"handle": 77, "pid": 123, "title": "Delta ISPSoft",
                       "class_name": "#32770", "visible": False, "minimized": False}
+            process.windows.return_value = [dialog]
             with patch.object(server, "WORK_DIR", root / "work"), \
                  patch.object(server, "_exe", return_value=Path("C:/Delta/NewISPSoft.exe")), \
-                 patch.object(server, "_ide_windows", return_value=[dialog]), \
+                 patch.object(server, "_ide_windows", return_value=[]), \
+                 patch.object(server, "_create_private_desktop", return_value=555), \
+                 patch.object(server, "_create_private_desktop_process", return_value=process), \
                  patch.object(server, "_window_child_texts", return_value=[{
                      "class_name": "Static", "text": "Cannot create file C:\\Users\\User\\AppData\\Roaming\\Delta\\foldeStrList.txt."}]), \
-                 patch.object(server, "_hide_ide_windows"), \
-                 patch.object(server.subprocess, "Popen", return_value=process), \
                  patch.object(server.time, "monotonic", side_effect=[0, 2]), \
                  patch.object(server.time, "sleep"), \
                  patch.object(server.sys, "platform", "win32"):
