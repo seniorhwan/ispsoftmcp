@@ -94,9 +94,16 @@ def atomic_write(path: str | Path, data: bytes, inputs: tuple[Path, ...] = ()) -
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        # A hard link publishes the complete file and fails atomically if another
-        # writer created the destination. Unlike replace(), it never overwrites.
-        os.link(temp, target)
+        # Rename on the same volume publishes the complete file atomically. On
+        # Windows os.rename fails when the target already exists, preserving the
+        # no-overwrite contract without requiring hard-link privileges (which
+        # are commonly unavailable in managed Windows environments).
+        if os.name == 'nt':
+            os.rename(temp, target)
+        else:
+            # POSIX rename replaces an existing destination, so use a hard link
+            # as the atomic create-if-absent operation there.
+            os.link(temp, target)
         return target
     finally:
         if temp is not None:

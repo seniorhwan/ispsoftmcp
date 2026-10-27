@@ -7,9 +7,10 @@ import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from unittest.mock import patch
 
 import ispsoft_mcp_server as server
-from ispsoft_mcp import containers, dvp
+from ispsoft_mcp import containers, dvp, limits
 
 
 AS_SOURCE = """<PROJECT>
@@ -92,6 +93,56 @@ def es2_v8_container(source: str = ES2_SOURCE, trailer: bytes = b"OPAQUE-TRAILER
 
 
 class ContainerTests(unittest.TestCase):
+    def test_project_discovery_reports_parsing_and_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "good.isp"
+            project.write_bytes(es2_v8_container())
+            (root / "bad.isp").write_text("not an ISPSoft project", encoding="ascii")
+            result = json.loads(server.ispsoft_list_projects(str(root)))
+            projects = {Path(row["path"]).name: row for row in result["projects"]}
+            self.assertTrue(projects["good.isp"]["readable"])
+            self.assertEqual(projects["good.isp"]["model"], "ES2")
+            self.assertFalse(projects["bad.isp"]["readable"])
+
+    def test_candidate_group_cleanup_when_companion_publish_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.isp"
+            source.write_bytes(es2_v8_container())
+            companion = source.with_suffix(".ini")
+            companion.write_bytes(b"[PRJ_DATA]\r\n")
+            target = root / "candidate.isp"
+            real_write = server._write_new
+
+            def fail_candidate_companion(path, data, inputs=()):
+                if Path(path) == target.with_suffix(".ini"):
+                    raise OSError("simulated companion publish failure")
+                return real_write(path, data, inputs)
+
+            with patch.object(server, "_write_new", side_effect=fail_candidate_companion):
+                with self.assertRaises(OSError):
+                    server._write_project_candidate_and_backup(source, target, source.read_bytes(), b"candidate")
+            self.assertFalse(target.exists())
+            self.assertFalse(target.with_name("candidate.before.isp").exists())
+            self.assertFalse(target.with_suffix(".ini").exists())
+            self.assertFalse(target.with_name("candidate.before.ini").exists())
+
+    def test_create_project_from_template_preserves_model_and_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            template = root / "template.isp"
+            output = root / "agent-project.isp"
+            original = es2_v8_container()
+            template.write_bytes(original)
+            template.with_suffix(".ini").write_bytes(b"[PRJ_DATA]\r\nDEVICE_TYPE=1\r\n")
+            result = json.loads(server.ispsoft_create_project_from_template(str(template), str(output)))
+            self.assertEqual(result["status"], "CREATED_FROM_TEMPLATE_UNCOMPILED")
+            self.assertTrue(result["readback_verified"])
+            self.assertEqual(output.read_bytes(), original)
+            self.assertEqual(output.with_suffix(".ini").read_bytes(), template.with_suffix(".ini").read_bytes())
+            self.assertEqual(template.read_bytes(), original)
+
     def test_v3010_roundtrip_preserves_compiled_prefix(self) -> None:
         original = as_container()
         parsed = containers.decode(original)
@@ -216,6 +267,71 @@ class DvpTests(unittest.TestCase):
 
 
 class AnalysisAndSafetyTests(unittest.TestCase):
+    def test_mcp_registry_exposes_new_agent_workflow_tools(self) -> None:
+        names = set(server.mcp._tool_manager._tools)
+        self.assertTrue({
+            "ispsoft_get_capabilities", "ispsoft_list_projects",
+            "ispsoft_create_project_from_template", "ispsoft_connect",
+            "ispsoft_upload_from_plc", "ispsoft_start_monitor", "ispsoft_stop_monitor",
+        }.issubset(names))
+
+    def test_windows_safe_atomic_artifact_write_refuses_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "artifact.bin"
+            limits.atomic_write(target, b"complete")
+            self.assertEqual(target.read_bytes(), b"complete")
+            with self.assertRaises(limits.FileTransformError):
+                limits.atomic_write(target, b"replacement")
+            self.assertEqual(target.read_bytes(), b"complete")
+
+    def test_installed_device_catalog_is_separate_from_operation_qualification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = root / "Network_Configuration" / "Devices" / "Devices.ini"
+            config.parent.mkdir(parents=True)
+            config.write_text("[PLC]**\n[DVP-Series]***\n[ES2\\ES2-C]****\n[AH-Series]***\n[CPU500-EN]****\n", encoding="cp1252")
+            ddf = root / "DIACommission" / "DataTracer" / "DeviceData" / "DDF" / "Device.xml"
+            ddf.parent.mkdir(parents=True)
+            ddf.write_text('<Devices><Device ProdClass="PLC" ProdFuncName="CPU" ProdType="AS228T-A" /></Devices>', encoding="utf-8")
+            with patch.object(server, "_ispsoft_root", return_value=root):
+                catalog = server._installed_device_catalog()
+            self.assertEqual(catalog["families"]["DVP"], ["ES2", "ES2-C"])
+            self.assertEqual(catalog["families"]["AH"], ["CPU500-EN"])
+            self.assertEqual(catalog["families"]["AS"], ["AS228T-A"])
+            self.assertIn("not qualify", catalog["note"])
+
+    def test_dvp32es2t_maps_to_es2_source_profile_but_not_live_qualification(self) -> None:
+        canonical, error = server._model("DVP32ES2T")
+        self.assertIsNone(error)
+        self.assertEqual(canonical, "ES2")
+        capabilities = json.loads(server.ispsoft_get_capabilities())
+        self.assertEqual(capabilities["operations"]["runtime_device_read"]["status"], "NOT_QUALIFIED")
+        self.assertEqual(capabilities["operations"]["online_monitor"]["status"], "NOT_QUALIFIED")
+
+    def test_online_tools_fail_closed_without_contacting_controller(self) -> None:
+        self.assertEqual(json.loads(server.ispsoft_connect("DVP32ES2T", "COM1"))["device_contacted"], False)
+        uploaded = json.loads(server.ispsoft_upload_from_plc("DVP32ES2T", "COM1", "backup.isp"))
+        self.assertEqual(uploaded["status"], "TRANSPORT_NOT_QUALIFIED")
+        monitor = json.loads(server.ispsoft_start_monitor("ES2", "COM1"))
+        self.assertFalse(monitor["monitoring"])
+        invalid_read = json.loads(server.ispsoft_runtime_read("ES2", ["X999999"]))
+        self.assertEqual(invalid_read["status"], "TRANSPORT_NOT_QUALIFIED")
+        invalid_syntax = json.loads(server.ispsoft_runtime_read("ES2", ["Y bad"]))
+        self.assertEqual(invalid_syntax["status"], "REJECTED_BEFORE_IO")
+
+    def test_simulator_presence_is_discovered_but_never_means_connected(self) -> None:
+        sim = Path(r"C:\Delta\DVPSimulator_ES2.exe")
+        with patch.object(server, "_installed", side_effect=[sim, sim]), \
+             patch.object(server, "_process_running", return_value=True):
+            status = json.loads(server.ispsoft_get_status())
+        self.assertTrue(status["dvp_es2_simulator_installed"])
+        self.assertTrue(status["dvp_es2_simulator_running"])
+        with patch.object(server, "_installed", return_value=sim), \
+             patch.object(server, "_process_running", return_value=True):
+            online = json.loads(server.ispsoft_online_status("ES2"))
+        self.assertFalse(online["connected"])
+        self.assertEqual(online["status"], "TRANSPORT_NOT_QUALIFIED")
+
     def test_cross_reference_detects_read_and_write(self) -> None:
         result = json.loads(server.ispsoft_analyze_source("LD X0\nOUT Y0\nMOV D0 D1"))
         refs = {item["address"]: item for item in result["devices"]}

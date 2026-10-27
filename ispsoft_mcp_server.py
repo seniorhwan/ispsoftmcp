@@ -6,6 +6,9 @@ never reports a transformed file as compiled, downloaded, or PLC-verified.
 from __future__ import annotations
 
 import datetime as dt
+import csv
+import ctypes
+import ctypes.wintypes as wintypes
 import hashlib
 import json
 import os
@@ -13,6 +16,8 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -30,11 +35,18 @@ APP_CANDIDATES = (
     Path(r"C:\Program Files (x86)\Delta Industrial Automation\ISPSoft 3.24\NewISPSoft.exe"),
     Path(r"C:\Program Files\Delta Industrial Automation\ISPSoft\NewISPSoft.exe"),
 )
+COMMGR_CANDIDATES = (
+    Path(r"C:\Program Files (x86)\Delta Industrial Automation\DIAStudio\DIATools\COMMGR 2.11\COMMGR.exe"),
+)
+DVP_ES2_SIMULATOR_CANDIDATES = (
+    Path(r"C:\Program Files (x86)\Delta Industrial Automation\DIAStudio\DIATools\COMMGR 2.11\Simulator\DVPSimulator_ES2.exe"),
+)
+DEFAULT_ISPSOFT_ROOT = Path(r"C:\Program Files (x86)\Delta Industrial Automation\ISPSoft 3.24")
 MODEL_PROFILES: dict[str, dict[str, Any]] = {
     "AS228T": {"family": "AS", "source_container": "qualified v3010", "languages": ["ST"]},
     "AS228P": {"family": "AS", "source_container": "qualified v3010", "languages": ["ST"]},
     "AS228R": {"family": "AS", "source_container": "qualified v3010", "languages": ["ST"]},
-    "ES2": {"family": "DVP", "project_model": "ES2", "source_container": "ISPSoft 3.24 v8 pointer/footer", "pou_exchange": "MPU", "languages": ["LD", "ST", "IL"]},
+    "ES2": {"family": "DVP", "project_model": "ES2", "source_container": "ISPSoft 3.24 v8 pointer/footer", "pou_exchange": "MPU", "languages": ["LD", "ST", "IL"], "qualification": "offline container and candidate transforms only"},
     "DVP12SE11R": {"family": "DVP", "pou_exchange": "MPU", "languages": ["LD", "IL"]},
     "DVP12SE11T": {"family": "DVP", "pou_exchange": "MPU", "languages": ["LD", "IL"]},
 }
@@ -57,6 +69,9 @@ def _model(model: str) -> tuple[str | None, str | None]:
         return None, "model must be a non-empty exact ISPSoft model name."
     key = re.sub(r"[- /]", "", model.strip().upper())
     aliases = {re.sub(r"[- /]", "", item): item for item in MODEL_PROFILES}
+    # ISPSoft's device catalog names the series ES2; the user's DVP32ES2
+    # transistor controller uses that project/device series profile.
+    aliases.update({"DVP32ES2": "ES2", "DVP32ES2T": "ES2"})
     canonical = aliases.get(key)
     if canonical is None:
         return None, f"Model {model!r} has no qualified MCP profile. Supported exact profiles: {', '.join(MODEL_PROFILES)}."
@@ -71,9 +86,164 @@ def _exe() -> Path | None:
     return next((p for p in APP_CANDIDATES if p.is_file()), None)
 
 
+def _ispsoft_root() -> Path | None:
+    exe = _exe()
+    if exe is not None:
+        return exe.parent
+    return DEFAULT_ISPSOFT_ROOT if DEFAULT_ISPSOFT_ROOT.is_dir() else None
+
+
+def _installed_device_catalog() -> dict[str, Any]:
+    """Read ISPSoft's own installed model catalog without inferring capabilities."""
+    root = _ispsoft_root()
+    path = root / "Network_Configuration" / "Devices" / "Devices.ini" if root else None
+    families: dict[str, list[str]] = {}
+    sources: list[str] = []
+    errors: list[str] = []
+    if path is not None and path.is_file():
+        sources.append(str(path))
+    else:
+        path = None
+    ddf_path = root / "DIACommission" / "DataTracer" / "DeviceData" / "DDF" / "Device.xml" if root else None
+    if ddf_path is not None and ddf_path.is_file():
+        sources.append(str(ddf_path))
+    else:
+        ddf_path = None
+    if not sources:
+        return {"available": False, "sources": [], "families": {}}
+    if path:
+        family: str | None = None
+        try:
+            text = path.read_text(encoding="cp1252", errors="replace")
+            for line in text.splitlines():
+                match = re.match(r"^\[([^\]]+)\]", line)
+                if not match:
+                    continue
+                name = match.group(1).strip()
+                if name == "DVP-Series":
+                    family = "DVP"
+                    families.setdefault(family, [])
+                elif name == "AH-Series":
+                    family = "AH"
+                    families.setdefault(family, [])
+                elif name in ("PLC", "All_Devices", "DMV", "TP", "DVP-Modules", "AH-Modules", "MODBUS Device"):
+                    family = None
+                elif family:
+                    # Entries sometimes contain aliases separated by a backslash.
+                    for model_name in name.split("\\"):
+                        model_name = model_name.strip()
+                        if model_name and model_name not in families[family]:
+                            families[family].append(model_name)
+        except OSError as exc:
+            errors.append(f"{path}: {exc}")
+    if ddf_path:
+        try:
+            xml_root = ET.parse(ddf_path).getroot()
+            as_models = families.setdefault("AS", [])
+            for device in xml_root.iter():
+                if (device.tag.rsplit("}", 1)[-1] == "Device" and
+                        device.get("ProdClass") == "PLC" and
+                        device.get("ProdFuncName") == "CPU"):
+                    model_name = device.get("ProdType")
+                    if (model_name and model_name != "Unknown" and "simulator" not in model_name.casefold()
+                            and model_name not in as_models):
+                        as_models.append(model_name)
+            as_models.sort()
+        except (OSError, ET.ParseError) as exc:
+            errors.append(f"{ddf_path}: {exc}")
+    for model_list in families.values():
+        model_list.sort()
+    return {"available": bool(families), "sources": sources, "families": families,
+            "errors": errors,
+            "note": "Installed ISPSoft catalog only; listing a model does not qualify MCP operations."}
+
+
+def _installed_simulators() -> list[dict[str, str]]:
+    root = _ispsoft_root()
+    simulator_dir = root.parent / "DIAStudio" / "DIATools" / "COMMGR 2.11" / "Simulator" if root else None
+    if simulator_dir is None or not simulator_dir.is_dir():
+        return []
+    return [{"name": path.stem, "path": str(path)} for path in sorted(simulator_dir.glob("*.exe"))]
+
+
+def _installed(candidates: tuple[Path, ...]) -> Path | None:
+    return next((path for path in candidates if path.is_file()), None)
+
+
 def _process_running(name: str) -> bool:
     if sys.platform != "win32":
         return False
+
+
+def _process_ids(name: str) -> list[int]:
+    if sys.platform != "win32":
+        return []
+    try:
+        result = subprocess.run(["tasklist", "/fo", "csv", "/nh", "/fi", f"IMAGENAME eq {name}"],
+                                capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids: list[int] = []
+    for row in csv.reader(result.stdout.splitlines()):
+        if len(row) >= 2 and row[0].casefold() == name.casefold() and row[1].isdigit():
+            pids.append(int(row[1]))
+    return pids
+
+
+def _ide_windows() -> list[dict[str, Any]]:
+    """Enumerate ISPSoft top-level windows without assuming the app is visible."""
+    if sys.platform != "win32":
+        return []
+    pids = set(_process_ids("NewISPSoft.exe"))
+    if not pids:
+        return []
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    windows: list[dict[str, Any]] = []
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def inspect(hwnd: int, _lparam: int) -> bool:
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value not in pids:
+            return True
+        length = max(1, user32.GetWindowTextLengthW(hwnd) + 1)
+        title = ctypes.create_unicode_buffer(length)
+        class_name = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, title, length)
+        user32.GetClassNameW(hwnd, class_name, len(class_name))
+        windows.append({"handle": int(hwnd), "pid": pid.value, "title": title.value,
+                        "class_name": class_name.value,
+                        "visible": bool(user32.IsWindowVisible(hwnd)),
+                        "minimized": bool(user32.IsIconic(hwnd))})
+        return True
+
+    callback = callback_type(inspect)
+    user32.EnumWindows(callback, 0)
+    return windows
+
+
+def _ide_session() -> dict[str, Any]:
+    running = _process_running("NewISPSoft.exe")
+    windows = _ide_windows() if running else []
+    visible = [window for window in windows if window["visible"] and not window["minimized"]]
+    if visible:
+        diagnosis = "VISIBLE_WINDOW"
+    elif windows:
+        diagnosis = "WINDOW_HIDDEN_OR_MINIMIZED"
+    elif running:
+        diagnosis = "PROCESS_WITHOUT_TOP_LEVEL_WINDOW"
+    else:
+        diagnosis = "PROCESS_NOT_RUNNING"
+    return {"process_running": running, "process_ids": _process_ids("NewISPSoft.exe"),
+            "windows": windows, "visible_window_count": len(visible), "diagnosis": diagnosis}
     try:
         result = subprocess.run(["tasklist", "/fo", "csv", "/nh"], capture_output=True,
                                 text=True, timeout=5, check=False)
@@ -104,16 +274,31 @@ def _write_project_candidate_and_backup(source_path: Path, target: Path,
     companion = source_path.with_suffix('.ini')
     target_companion = target.with_suffix('.ini')
     backup_companion = backup.with_suffix('.ini')
+    companion_data = read_bytes(companion) if companion.is_file() else None
     if target.exists() or backup.exists() or target_companion.exists() or backup_companion.exists():
         raise FileTransformError('Candidate, backup, or companion path already exists; refusing to overwrite.')
-    _write_new(backup, original, (source_path,))
-    _write_new(target, candidate, (source_path, backup))
-    if companion.is_file():
-        companion_data = read_bytes(companion)
-        _write_new(backup_companion, companion_data, (companion,))
-        _write_new(target_companion, companion_data, (companion, backup_companion))
-        return target, backup, target_companion
-    return target, backup, None
+    created: list[Path] = []
+    try:
+        _write_new(backup, original, (source_path,))
+        created.append(backup)
+        _write_new(target, candidate, (source_path, backup))
+        created.append(target)
+        if companion_data is not None:
+            _write_new(backup_companion, companion_data, (companion,))
+            created.append(backup_companion)
+            _write_new(target_companion, companion_data, (companion, backup_companion))
+            created.append(target_companion)
+            return target, backup, target_companion
+        return target, backup, None
+    except Exception:
+        # These paths were checked absent and are exclusively ours. Remove any
+        # partial artifact set so a failed candidate cannot look complete.
+        for path in reversed(created):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
 
 
 def _cross_refs(source: str) -> list[dict[str, Any]]:
@@ -153,11 +338,21 @@ def _project_comment_map(source: str) -> dict[str, str]:
 def ispsoft_get_status() -> str:
     """Report ISPSoft/COMMGR installation and process state without changing it."""
     exe = _exe()
+    simulator = _installed(DVP_ES2_SIMULATOR_CANDIDATES)
+    simulators = _installed_simulators()
     return _json({
         "ispsoft_installed": exe is not None,
         "ispsoft_executable": str(exe) if exe else None,
         "ispsoft_running": _process_running("NewISPSoft.exe"),
+        "ispsoft_version": "3.24" if exe and "3.24" in str(exe.parent) else None,
+        "commgr_installed": _installed(COMMGR_CANDIDATES) is not None,
         "commgr_running": _process_running("COMMGR.exe"),
+        "dvp_es2_simulator_installed": simulator is not None,
+        "dvp_es2_simulator_executable": str(simulator) if simulator else None,
+        "dvp_es2_simulator_running": _process_running(simulator.name) if simulator else False,
+        "installed_simulators": simulators,
+        "device_catalog_available": _installed_device_catalog()["available"],
+        "active_ide_project": "not observable; no ISPSoft window/session integration is qualified",
         "ide_automation": "not qualified; MCP will not claim build/check results",
         "online_transport": "not qualified; no device I/O is enabled",
         "live_writes_enabled": os.environ.get(LIVE_WRITES_ENV, "").strip().lower() in {"1", "true", "yes"},
@@ -166,16 +361,150 @@ def ispsoft_get_status() -> str:
 
 @mcp.tool()
 def ispsoft_list_supported_plc_types() -> str:
-    """List exact model profiles and the file operations qualified for each."""
+    """List installed ISPSoft models separately from MCP-qualified model profiles."""
+    catalog = _installed_device_catalog()
     return _json({
         "profiles": MODEL_PROFILES,
+        "model_aliases": {"DVP32ES2T": "ES2", "DVP32ES2": "ES2"},
+        "installed_model_catalog": catalog,
+        "capability_matrix": _capability_matrix(),
         "limitations": [
-            "AS source transformation is qualified only for AS228T/P/R v3010 containers.",
-            "DVP LD/IL POU exchange is qualified for ES2 and DVP12SE11R/T MPU generation.",
-            "These source operations do not compile or download a PLC program.",
-            "AH and other models are rejected until an exact profile is qualified.",
+            "The installed model catalog is informational and does not qualify model-specific MCP operations.",
+            "Candidate transformation support remains limited to the profiles below.",
+            "Native compile/check, PLC transfer, online monitoring, and live device I/O are not qualified.",
         ],
     })
+
+
+def _capability_matrix() -> dict[str, Any]:
+    per_profile = {}
+    for name, profile in MODEL_PROFILES.items():
+        per_profile[name] = {
+            "family": profile["family"],
+            "languages": profile.get("languages", []),
+            "project_inspection": "QUALIFIED_LIMITED",
+            "st_candidate_generation": "QUALIFIED_LIMITED" if "ST" in profile.get("languages", []) else "NOT_QUALIFIED",
+            "il_mpu_generation": "QUALIFIED_LIMITED" if profile.get("pou_exchange") == "MPU" else "NOT_QUALIFIED",
+            "native_compile_check": "NOT_QUALIFIED",
+            "plc_connection_upload_download": "NOT_QUALIFIED",
+            "online_monitor_and_device_io": "NOT_QUALIFIED",
+        }
+    per_profile["DVP32ES2T"] = {**per_profile["ES2"], "profile_alias_of": "ES2"}
+    return {
+        "per_profile": per_profile,
+        "project_inspection": {"status": "QUALIFIED_LIMITED", "formats": ["ISPSoft 3.24 v8 DVP pointer/footer", "legacy 0xAA/0xAC", "AS v3010"]},
+        "source_candidate_generation": {"status": "QUALIFIED_LIMITED", "models": list(MODEL_PROFILES), "never_compiles": True},
+        "project_template_clone": {"status": "QUALIFIED_LIMITED", "same_model_only": True, "native_compile": "NOT_QUALIFIED"},
+        "native_blank_project_creation": {"status": "NOT_QUALIFIED"},
+        "native_compile_check": {"status": "NOT_QUALIFIED"},
+        "plc_connection": {"status": "NOT_QUALIFIED"},
+        "upload_from_plc": {"status": "NOT_QUALIFIED"},
+        "download_to_plc": {"status": "NOT_QUALIFIED", "write_guard": LIVE_WRITES_ENV},
+        "online_monitor": {"status": "NOT_QUALIFIED"},
+        "runtime_device_read": {"status": "NOT_QUALIFIED"},
+        "runtime_device_write": {"status": "NOT_QUALIFIED", "write_guard": LIVE_WRITES_ENV},
+    }
+
+
+@mcp.tool()
+def ispsoft_get_capabilities() -> str:
+    """Return explicit MCP qualification separately from ISPSoft's installed catalog."""
+    return _json({"server": SERVER_NAME, "ispsoft_root": str(_ispsoft_root()) if _ispsoft_root() else None,
+                  "installed_model_catalog": _installed_device_catalog(),
+                  "qualified_profiles": MODEL_PROFILES,
+                  "model_aliases": {"DVP32ES2T": "ES2", "DVP32ES2": "ES2"},
+                  "operations": _capability_matrix()})
+
+
+@mcp.tool()
+def ispsoft_list_projects(search_path: str = "", max_results: int = 100) -> str:
+    """Find ISPSoft project files under a requested folder; report parseability per file."""
+    if not isinstance(max_results, int) or isinstance(max_results, bool) or not 1 <= max_results <= 500:
+        return _json({"success": False, "error": "max_results must be an integer from 1 to 500."})
+    roots: list[Path] = []
+    if search_path.strip():
+        root = Path(search_path).expanduser()
+        if not root.is_dir():
+            return _json({"success": False, "error": "search_path must be an existing directory.", "search_path": search_path})
+        roots.append(root.resolve())
+    else:
+        roots.append(WORK_DIR)
+        install_root = _ispsoft_root()
+        if install_root:
+            examples = install_root / "Projects"
+            if examples.is_dir():
+                roots.append(examples)
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+    visited: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            candidates = sorted((p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {".isp", ".bak"}),
+                                key=lambda p: str(p).casefold())
+        except OSError as exc:
+            errors.append(f"{root}: {exc}")
+            continue
+        for path in candidates:
+            key = str(path.resolve()).casefold()
+            if key in visited:
+                continue
+            visited.add(key)
+            record: dict[str, Any] = {"path": str(path), "bytes": path.stat().st_size}
+            try:
+                project = containers.read_container(path)
+                info = containers.inspect(project)
+                record.update(readable=True, model=info.get("project_model"), layout=project.layout,
+                              pou_count=len(info.get("pous", [])), sha256=_sha(read_bytes(path)))
+            except (OSError, FileTransformError, ValueError) as exc:
+                record.update(readable=False, error=str(exc))
+            results.append(record)
+            if len(results) >= max_results:
+                return _json({"success": True, "projects": results, "truncated": True, "errors": errors})
+    return _json({"success": True, "projects": results, "truncated": False, "errors": errors})
+
+
+@mcp.tool()
+def ispsoft_create_project_from_template(template_path: str, output_path: str) -> str:
+    """Create a new offline project copy from a user-selected matching template."""
+    created: list[Path] = []
+    try:
+        template = Path(template_path).expanduser().resolve(strict=True)
+        target = Path(output_path).expanduser().absolute()
+        if template.suffix.lower() not in {".isp", ".bak"} or target.suffix.lower() != ".isp":
+            raise FileTransformError("Template must be .isp/.bak and output must use the .isp extension.")
+        project = containers.read_container(template)
+        info = containers.inspect(project)
+        if not target.parent.is_dir():
+            raise FileTransformError("Output parent directory must already exist.")
+        if target.resolve() == template:
+            raise FileTransformError("Output path must differ from the selected template.")
+        companion = template.with_suffix(".ini")
+        target_companion = target.with_suffix(".ini")
+        if target.exists() or target.is_symlink() or target_companion.exists() or target_companion.is_symlink():
+            raise FileTransformError("Output project or companion already exists; refusing to overwrite.")
+        _write_new(target, read_bytes(template), (template,))
+        created.append(target)
+        if companion.is_file():
+            _write_new(target_companion, read_bytes(companion), (companion,))
+            created.append(target_companion)
+        copied = containers.read_container(target)
+        if copied.source != project.source:
+            raise FileTransformError("Created project readback differs from the template.")
+        return _json({"status": "CREATED_FROM_TEMPLATE_UNCOMPILED", "project_path": str(target),
+                      "template_path": str(template), "model": info.get("project_model"),
+                      "layout": project.layout, "sha256": _sha(read_bytes(target)),
+                      "companion_path": str(target_companion) if target_companion.exists() else None,
+                      "readback_verified": True, "vendor_compile": "NOT_RUN", "plc_download": "NOT_RUN"})
+    except (OSError, FileTransformError, ValueError) as exc:
+        removed = True
+        for path in reversed(created):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                removed = False
+        return _json({"status": "CREATE_FAILED", "error": str(exc), "created_paths_removed": removed})
 
 
 @mcp.tool()
@@ -564,9 +893,55 @@ def ispsoft_online_status(model: str) -> str:
     canonical, error = _model(model)
     if error:
         return _json({"connected": False, "status": "UNSUPPORTED_MODEL", "error": error})
+    simulator = _installed(DVP_ES2_SIMULATOR_CANDIDATES)
+    simulator_running = _process_running(simulator.name) if simulator else False
     return _json({"connected": False, "status": "TRANSPORT_NOT_QUALIFIED",
                   "model": canonical, "commgr_running": _process_running("COMMGR.exe"),
-                  "message": "COMMGR presence alone does not prove a PLC connection; online transport is disabled."})
+                  "dvp_es2_simulator_installed": simulator is not None,
+                  "dvp_es2_simulator_running": simulator_running,
+                  "message": "COMMGR or simulator process presence alone does not prove an active ISPSoft connection; no live transport is qualified and no device was contacted."})
+
+
+@mcp.tool()
+def ispsoft_connect(model: str, commgr_driver: str) -> str:
+    """Report that online connection is unavailable until the vendor adapter is qualified."""
+    canonical, error = _model(model)
+    if error:
+        return _json({"connected": False, "status": "UNSUPPORTED_MODEL", "error": error})
+    if not isinstance(commgr_driver, str) or not commgr_driver.strip():
+        return _json({"connected": False, "status": "REJECTED_BEFORE_IO", "error": "commgr_driver must be the exact configured COMMGR driver name."})
+    return _json({"connected": False, "status": "TRANSPORT_NOT_QUALIFIED", "model": canonical,
+                  "commgr_driver": commgr_driver, "device_contacted": False,
+                  "error": "No qualified COMMGR adapter can establish or verify the active target connection."})
+
+
+@mcp.tool()
+def ispsoft_upload_from_plc(model: str, commgr_driver: str, output_path: str) -> str:
+    """Fail closed: PLC-to-PC project transfer is not enabled without qualified vendor I/O."""
+    canonical, error = _model(model)
+    if error:
+        return _json({"success": False, "status": "UNSUPPORTED_MODEL", "error": error})
+    return _json({"success": False, "status": "TRANSPORT_NOT_QUALIFIED", "model": canonical,
+                  "commgr_driver": commgr_driver, "output_path": output_path,
+                  "device_contacted": False, "error": "Upload from PLC is not implemented; no device was contacted."})
+
+
+@mcp.tool()
+def ispsoft_start_monitor(model: str, commgr_driver: str) -> str:
+    """Fail closed until ISPSoft monitor mode has a qualified connection and readback adapter."""
+    canonical, error = _model(model)
+    if error:
+        return _json({"success": False, "status": "UNSUPPORTED_MODEL", "error": error})
+    return _json({"success": False, "status": "TRANSPORT_NOT_QUALIFIED", "model": canonical,
+                  "commgr_driver": commgr_driver, "monitoring": False, "device_contacted": False,
+                  "error": "Monitor mode is not implemented; no device was contacted."})
+
+
+@mcp.tool()
+def ispsoft_stop_monitor() -> str:
+    """Report monitor state; this server cannot currently enter monitor mode."""
+    return _json({"success": True, "status": "ALREADY_OFFLINE", "monitoring": False,
+                  "message": "No monitor session is owned by this server."})
 
 
 @mcp.tool()
@@ -575,6 +950,12 @@ def ispsoft_runtime_read(model: str, addresses: list[str]) -> str:
     canonical, error = _model(model)
     if error:
         return _json({"success": False, "status": "UNSUPPORTED_MODEL", "error": error})
+    if not isinstance(addresses, list) or not addresses or len(addresses) > 200:
+        return _json({"success": False, "status": "REJECTED_BEFORE_IO", "error": "addresses must contain 1-200 device addresses."})
+    invalid = [str(address) for address in addresses
+               if not isinstance(address, str) or not re.fullmatch(r"(?:X|Y|M|S|T|C|D|V|Z|R)\d+", address.strip(), re.I)]
+    if invalid:
+        return _json({"success": False, "status": "REJECTED_BEFORE_IO", "invalid_addresses": invalid})
     return _json({"success": False, "status": "TRANSPORT_NOT_QUALIFIED", "model": canonical,
                   "addresses": addresses, "error": "No live protocol implementation is qualified; no device was contacted."})
 
@@ -589,8 +970,14 @@ def ispsoft_runtime_write(model: str, values: dict[str, Any], confirm_live_write
     canonical, error = _model(model)
     if error:
         return _json({"success": False, "status": "UNSUPPORTED_MODEL", "error": error})
+    if not isinstance(values, dict) or not values or len(values) > 200:
+        return _json({"success": False, "status": "REJECTED_BEFORE_IO", "error": "values must contain 1-200 device/value pairs."})
+    invalid = [str(address) for address in values
+               if not isinstance(address, str) or not re.fullmatch(r"(?:X|Y|M|S|T|C|D|V|Z|R)\d+", address.strip(), re.I)]
+    if invalid:
+        return _json({"success": False, "status": "REJECTED_BEFORE_IO", "invalid_addresses": invalid})
     return _json({"success": False, "status": "TRANSPORT_NOT_QUALIFIED", "model": canonical,
-                  "values": values, "error": "Both safeguards are enabled, but live writes are not implemented; no device was contacted."})
+                  "addresses": list(values), "error": "Both safeguards are enabled, but live writes are not implemented; no device was contacted."})
 
 
 @mcp.tool()

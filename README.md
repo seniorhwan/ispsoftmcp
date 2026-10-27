@@ -1,8 +1,10 @@
 # ISPSoft MCP
 
-A Python MCP stdio server for conservative ISPSoft source and POU workflows. It
-borrows the validation, backup, and explicit-result patterns from the local
-SIMATIC STEP 7 and GX Works2 MCP projects.
+A Python MCP stdio server for Delta ISPSoft. It borrows the validation, backup,
+and explicit-result patterns from the local SIMATIC STEP 7 and GX Works2 MCP
+projects. The installed ISPSoft model catalog is discovered separately from
+operations qualified by this server; an installed or listed model is not proof
+that an MCP operation works on it.
 
 ## Current support
 
@@ -25,13 +27,20 @@ SIMATIC STEP 7 and GX Works2 MCP projects.
   rejected.
 - Textual cross-reference analysis and DVP-style comment-map validation.
 - Status and explicit “not qualified” responses for native build/check and PLC
-  operations. No live value or download operation is currently implemented.
-- Opening a recognized project can be requested through Windows file association;
-  the active project is not read back. Native project creation is not automated.
+  operations. PLC connection, upload, download, monitor mode, and live device
+  I/O remain disabled until a vendor adapter is implemented and qualified.
+- Installed PLC family/model catalog and installed simulator executables are
+  discovered from ISPSoft 3.24's own device configuration. This catalog is
+  informational; MCP capability status remains per operation.
+- Project discovery under an explicit folder and readback-verified offline
+  project cloning from a user-selected template are supported. Native blank
+  project creation and active-project readback are not automated.
 
-The included model profiles are narrow interoperability profiles, not a full
-catalog of every controller accepted by ISPSoft. Unknown models and unsupported
-container variants fail closed. The local ISPSoft 3.24 sample is a DVP ES2
+The included operation profiles are narrow interoperability profiles, not a
+claim of support for every controller accepted by ISPSoft. Unknown models and
+unsupported container variants fail closed. The DVP32ES2 transistor model maps
+to the ES2 project-source profile, but PLC communication is not qualified. The
+local ISPSoft 3.24 sample is a DVP ES2
 v8 pointer/footer project; its read/patch container path is covered by a
 portable synthetic regression and a conditional read-only smoke test. The
 sample itself is never modified by the test suite.
@@ -60,8 +69,11 @@ the detected Delta installation path.
 
 | Tool | Purpose |
 |---|---|
-| `ispsoft_get_status` | Detect installed/running ISPSoft and COMMGR processes. |
-| `ispsoft_list_supported_plc_types` | Show exact model and operation profiles. |
+| `ispsoft_get_status` | Detect installed/running ISPSoft, COMMGR, and the DVP ES2 simulator. Presence is not a connection check. |
+| `ispsoft_get_capabilities` | Separate detected ISPSoft models from MCP-qualified operation profiles. |
+| `ispsoft_list_supported_plc_types` | Show the installed model catalog and exact MCP operation profiles. |
+| `ispsoft_list_projects` | Find and inspect ISPSoft project files in a requested folder. |
+| `ispsoft_create_project_from_template` | Create a new offline project copy with verified readback; does not compile. |
 | `ispsoft_inspect_project` | Inspect a recognized `.isp` or `.bak` file. |
 | `ispsoft_get_project_overview` | Summarize model, POUs, tasks, and device-comment count. |
 | `ispsoft_read_project_source` | Return project source and POU metadata. |
@@ -78,8 +90,9 @@ the detected Delta installation path.
 | `ispsoft_analyze_source` | Build a best-effort text cross-reference. |
 | `ispsoft_validate_device_comments` | Validate DVP-style addresses and optionally emit a JSON map. |
 | `ispsoft_compile_and_check` | Explicitly report native IDE compile/check as unavailable. |
-| `ispsoft_online_status` / `ispsoft_runtime_read` | Explicitly report that no transport is qualified. |
-| `ispsoft_runtime_write` / `ispsoft_download` | Require both call confirmation and `ISPSOFT_WRITES_ENABLED=1`; even then they remain disabled until transport qualification is implemented. |
+| `ispsoft_online_status`, `ispsoft_connect`, `ispsoft_upload_from_plc`, `ispsoft_start_monitor`, `ispsoft_runtime_read` | Explicitly report that no PLC transport is qualified; no device is contacted. |
+| `ispsoft_runtime_write` / `ispsoft_download` | Require a call-level confirmation and `ISPSOFT_WRITES_ENABLED=1`; even then they remain disabled until transport qualification is implemented. |
+| `ispsoft_stop_monitor` | Report that this server has no active monitor session. |
 
 ## Safe write sequence
 
@@ -89,7 +102,8 @@ the detected Delta installation path.
 4. Open the candidate in ISPSoft and manually run native Compile All / Check
    Program. Review the resulting ladder and model-specific warnings.
 5. Transfer to hardware only through ISPSoft after engineering approval. MCP
-   downloads and runtime writes are not yet available.
+   downloads and runtime writes are not yet available. Never treat the
+   installed model catalog or COMMGR process presence as proof of connectivity.
 
 ## Tests
 
@@ -99,5 +113,7 @@ Run offline regression tests with:
 python -m unittest discover -s tests -v
 ```
 
-Tests use synthetic files and never open ISPSoft or contact a PLC. Real project
-and hardware qualification remains model- and version-specific.
+Tests use synthetic files and never open ISPSoft or contact a PLC. The installed
+ISPSoft sample smoke test is read-only. Real project and hardware qualification
+remains model- and version-specific. In particular, DVP32ES2 COM1 transfer and
+monitor behavior still require a controlled physical PLC qualification.
