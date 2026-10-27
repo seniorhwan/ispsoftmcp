@@ -780,6 +780,19 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         self.assertEqual(result["drivers"][0]["targets"][0]["port_number"], "1")
         self.assertEqual(result["drivers"][1]["targets"][0]["configured_model"], "DVP-ES2")
 
+    def test_commgr_driver_discovery_prefers_active_user_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            appdata = Path(temp) / "Roaming"
+            active = appdata / "Delta Industrial Automation" / "COMMGR" / "DriverInfo.dri"
+            active.parent.mkdir(parents=True)
+            active.write_text('<DriverInfo/>', encoding="utf-8")
+            installed_commgr = Path(temp) / "install" / "COMMGR.exe"
+            installed_commgr.parent.mkdir()
+            installed_commgr.touch()
+            with patch.dict(os.environ, {"APPDATA": str(appdata)}), \
+                 patch.object(server, "COMMGR_CANDIDATES", (installed_commgr,)):
+                self.assertEqual(server._commgr_driver_config_path(), active)
+
     def test_commgr_driver_discovery_fails_closed_on_duplicate_names(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             config = Path(temp) / "DriverInfo.dri"
@@ -789,6 +802,19 @@ class AnalysisAndSafetyTests(unittest.TestCase):
                 encoding="utf-8")
             result = server._read_commgr_driver_catalog(config)
         self.assertEqual(result["status"], "CONFIG_AMBIGUOUS")
+        self.assertFalse(result["device_contacted"])
+
+    def test_commgr_driver_discovery_marks_shared_serial_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "DriverInfo.dri"
+            driver = '<Driver DriverID="{id}" DriverName="{name}" CommInterface="1"><ComInfo PortNumber="9" PLCStationNum="3"/></Driver>'
+            config.write_text('<DriverInfo>' + driver.format(id="1", name="first")
+                              + driver.format(id="2", name="second") + '</DriverInfo>',
+                              encoding="utf-8")
+            result = server._read_commgr_driver_catalog(config)
+        self.assertTrue(result["has_target_conflicts"])
+        self.assertEqual(result["target_conflicts"][0]["drivers"], ["first", "second"])
+        self.assertTrue(result["drivers"][0]["targets"][0]["shared_endpoint"])
         self.assertFalse(result["device_contacted"])
 
     def test_simulator_presence_is_discovered_but_never_means_connected(self) -> None:

@@ -242,6 +242,11 @@ def _installed(candidates: tuple[Path, ...]) -> Path | None:
 
 
 def _commgr_driver_config_path() -> Path | None:
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        profile_config = Path(appdata) / "Delta Industrial Automation" / "COMMGR" / "DriverInfo.dri"
+        if profile_config.is_file():
+            return profile_config
     commgr = _installed(COMMGR_CANDIDATES)
     if commgr is None:
         return None
@@ -270,6 +275,7 @@ def _read_commgr_driver_catalog(path: Path | None = None) -> dict[str, Any]:
     drivers: list[dict[str, Any]] = []
     seen: set[str] = set()
     seen_ids: set[str] = set()
+    endpoint_owners: dict[tuple[str, ...], list[tuple[str, dict[str, Any]]]] = {}
     for driver in root.findall("Driver"):
         name = (driver.get("DriverName") or "").strip()
         driver_id = (driver.get("DriverID") or "").strip()
@@ -290,27 +296,55 @@ def _read_commgr_driver_catalog(path: Path | None = None) -> dict[str, Any]:
         }
         com = driver.find("ComInfo")
         if com is not None:
-            entry["targets"].append({
+            target = {
                 "transport": "serial",
                 "port_number": com.get("PortNumber"),
                 "station": com.get("PLCStationNum"),
-            })
+            }
+            entry["targets"].append(target)
+            key = ("serial", target["port_number"] or "")
+            endpoint_owners.setdefault(key, []).append((name, target))
         net = driver.find("NetInfo")
         if net is not None:
             for remote in net.findall("RemoteIP"):
-                entry["targets"].append({
+                target = {
                     "transport": "ethernet",
                     "address": remote.get("RemoteIPAddr"),
                     "port": remote.get("RemotePort"),
                     "station": net.get("StationID"),
                     "configured_model": remote.get("RemoteDeviceTypeStr"),
                     "comment": remote.get("RemoteComment"),
-                })
+                }
+                entry["targets"].append(target)
+                key = ("ethernet", (target["address"] or "").casefold(),
+                       target["port"] or "", target["station"] or "")
+                endpoint_owners.setdefault(key, []).append((name, target))
         if not entry["targets"]:
             entry["targets"].append({"transport": entry["interface"]})
         drivers.append(entry)
+    target_conflicts: list[dict[str, Any]] = []
+    for owners in endpoint_owners.values():
+        owner_names = sorted({name for name, _ in owners}, key=str.casefold)
+        if len(owner_names) < 2:
+            continue
+        first_target = owners[0][1]
+        conflict = {
+            "transport": first_target["transport"],
+            "drivers": owner_names,
+        }
+        if first_target["transport"] == "serial":
+            conflict["port_number"] = first_target.get("port_number")
+        else:
+            conflict.update({"address": first_target.get("address"),
+                             "port": first_target.get("port"),
+                             "station": first_target.get("station")})
+        target_conflicts.append(conflict)
+        for _, target in owners:
+            target["shared_endpoint"] = True
+            target["shared_driver_names"] = owner_names
     return {"status": "OK", "path": str(config_path), "drivers": drivers,
-            "driver_count": len(drivers), "device_contacted": False,
+            "driver_count": len(drivers), "target_conflicts": target_conflicts,
+            "has_target_conflicts": bool(target_conflicts), "device_contacted": False,
             "warning": "This is saved COMMGR configuration only. Driver status and target identity have not been verified live."}
 
 

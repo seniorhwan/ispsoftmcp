@@ -92,7 +92,7 @@ the detected Delta installation path.
 | Tool | Purpose |
 |---|---|
 | `ispsoft_get_status` | Detect installed/running ISPSoft, COMMGR, and the DVP ES2 simulator. Presence is not a connection check. |
-| `ispsoft_list_commgr_drivers` | Read the saved COMMGR driver/endpoint catalog without starting COMMGR or contacting a device. Returned targets describe configuration only; they are not proof of identity or reachability. |
+| `ispsoft_list_commgr_drivers` | Read the active user-profile COMMGR driver/endpoint catalog (falling back to the install default) without starting COMMGR or contacting a device. It flags multiple driver names that share a serial port or network target. Returned targets describe configuration only; they are not proof of identity or reachability. |
 | `ispsoft_get_ide_session` | Report ISPSoft process IDs and visible top-level window metadata. Does not identify the open project. |
 | `ispsoft_start_ide` | Interactive-only: open an explicit project or ISPSoft's configured previous project. Does not start blank. Background agents should not call this tool. |
 | `ispsoft_start_background_session` | Open the requested project, or ISPSoft's configured previous project when `project_path` is omitted, on a private Windows desktop using a disposable copy and private settings profile. It refuses to start blank. |
