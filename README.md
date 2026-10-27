@@ -120,7 +120,7 @@ the detected Delta installation path.
 | `ispsoft_read_mpu` | Inspect a supported MPU package as IL. |
 | `ispsoft_analyze_source` | Build a best-effort text cross-reference. |
 | `ispsoft_validate_device_comments` | Validate DVP-style addresses and optionally emit a JSON map. |
-| `ispsoft_compile_and_check` | Run ISPSoft 3.24 Compile or Check on an ES2 project copy in a private desktop; OCR the Compile Message pane and save compiler sidecars plus screenshot evidence. Set `action` to `"check"` to run Check, or `timeout_seconds` to wait up to five minutes. |
+| `ispsoft_compile_and_check` | Run ISPSoft 3.24 Compile or Check on an ES2 project copy in a private desktop; OCR the Compile Message pane and save compiler sidecars plus screenshot evidence. Set `action` to `"check"` to run Check, `timeout_seconds` to wait up to five minutes, or `idle_wait_seconds` to silently wait for the user's ISPSoft window to leave the foreground (default 15 seconds, maximum five minutes). |
 | `ispsoft_online_status`, `ispsoft_connect`, `ispsoft_upload_from_plc`, `ispsoft_start_monitor`, `ispsoft_runtime_read` | Explicitly report that no PLC transport is qualified; no device is contacted. Connect, upload, and monitor first require an exact saved COMMGR driver name and reject missing, ambiguous, or shared endpoints. `ispsoft_list_commgr_drivers` is configuration-only discovery. |
 | `ispsoft_runtime_write` / `ispsoft_download` | Require a call-level confirmation and `ISPSOFT_WRITES_ENABLED=1`; even then they remain disabled until transport qualification is implemented. |
 | `ispsoft_stop_monitor` | Report that this server has no active monitor session. |
@@ -155,7 +155,8 @@ private `APPDATA`. The MCP snapshots those files and restores their previous
 contents after the check only if no user activity occurred and each current
 file still matches the worker's captured output. A concurrent change is
 preserved and makes the result unverified. MCP instances serialize their
-builds within the current Windows logon session. A build is refused while the
-visible ISPSoft window is foreground and is marked unverified if the user
+builds within the current Windows logon session. A build waits briefly for the
+visible ISPSoft window to leave the foreground; if it remains active, the tool
+returns without starting a worker. It is marked unverified if the user
 interacts with ISPSoft during the build. In particular, DVP32ES2 COM1 transfer
 and monitor behavior still require a controlled physical PLC qualification.

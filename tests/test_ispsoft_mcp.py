@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import struct
@@ -431,8 +432,10 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         with patch.object(server, "ispsoft_start_background_session") as start:
             action = json.loads(server.ispsoft_compile_and_check("ignored", ["compile"]))
             timeout = json.loads(server.ispsoft_compile_and_check("ignored", "check", True))
+            idle_wait = json.loads(server.ispsoft_compile_and_check("ignored", "check", 120, True))
         self.assertEqual(action["status"], "REJECTED_BEFORE_OPEN")
         self.assertEqual(timeout["status"], "REJECTED_BEFORE_OPEN")
+        self.assertEqual(idle_wait["status"], "REJECTED_BEFORE_OPEN")
         start.assert_not_called()
 
     def test_native_compile_rejects_unqualified_project_model(self) -> None:
@@ -454,11 +457,26 @@ class AnalysisAndSafetyTests(unittest.TestCase):
                  patch.object(server, "_process_ids", return_value=[7123]), \
                  patch.object(server, "_foreground_process_id", return_value=7123), \
                  patch.object(server, "ispsoft_start_background_session") as start:
-                result = json.loads(server.ispsoft_compile_and_check(str(project), "compile"))
+                result = json.loads(server.ispsoft_compile_and_check(str(project), "compile", 120, 0))
         self.assertEqual(result["status"], "VISIBLE_ISPSOFT_ACTIVE")
         self.assertEqual(result["vendor_compile"], "NOT_RUN")
         self.assertEqual(result["active_process_id"], 7123)
         start.assert_not_called()
+
+    def test_native_compile_idle_wait_ends_when_user_leaves_ispsoft_foreground(self) -> None:
+        with patch.object(server, "_foreground_process_id", side_effect=[7123, 9000, 9000]), \
+             patch.object(server.time, "monotonic", side_effect=[0.0, 0.0, 0.1, 0.61]), \
+             patch.object(server.time, "sleep"):
+            result = server._wait_for_user_ide_idle({7123}, 5)
+        self.assertTrue(result["ready"])
+        self.assertIsNone(result["active_process_id"])
+        self.assertEqual(result["waited_seconds"], 0.61)
+
+    def test_native_compile_idle_wait_times_out_without_starting_worker(self) -> None:
+        with patch.object(server, "_foreground_process_id", return_value=7123):
+            result = server._wait_for_user_ide_idle({7123}, 0)
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["active_process_id"], 7123)
 
     def test_ide_session_reports_visible_window_evidence(self) -> None:
         window = {"handle": 42, "pid": 7, "title": "ISPSoft", "class_name": "Main",
@@ -677,6 +695,26 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         self.assertEqual(result["status"], "PREVIOUS_PROJECT_NOT_CONFIGURED")
         self.assertFalse(result["success"])
         executable.assert_not_called()
+
+    def test_background_session_reports_private_desktop_access_denial_without_visible_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "station project.isp"
+            original = es2_v8_container()
+            source.write_bytes(original)
+            with patch.object(server, "WORK_DIR", root / "work"), \
+                 patch.object(server, "_exe", return_value=Path("C:/Delta/NewISPSoft.exe")), \
+                 patch.object(server, "_create_private_desktop", side_effect=ctypes.WinError(5)), \
+                 patch.object(server, "_create_private_desktop_process") as launch, \
+                 patch.object(server.sys, "platform", "win32"):
+                result = json.loads(server.ispsoft_start_background_session(str(source), 1))
+            self.assertFalse(result["success"])
+            self.assertEqual(result["status"], "BACKGROUND_ISOLATION_DENIED")
+            self.assertEqual(result["stage"], "CREATING_PRIVATE_DESKTOP")
+            self.assertFalse(result["visible_fallback_used"])
+            self.assertTrue(result["created_paths_removed"])
+            self.assertEqual(source.read_bytes(), original)
+            launch.assert_not_called()
 
     def test_background_session_stops_only_its_owned_process(self) -> None:
         process = Mock()

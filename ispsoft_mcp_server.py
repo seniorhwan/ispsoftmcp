@@ -776,6 +776,34 @@ def _foreground_process_id() -> int | None:
     return int(process_id.value)
 
 
+def _wait_for_user_ide_idle(process_ids: set[int], timeout_seconds: int) -> dict[str, Any]:
+    """Wait quietly for the user's ISPSoft window to leave the foreground.
+
+    Native ISPSoft writes fixed-name sidecars in the shared Windows profile.
+    Never start the worker while the user's ISPSoft window is foreground; give
+    the user a bounded chance to finish their current interaction instead.
+    """
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    idle_since: float | None = None
+    last_foreground: int | None = None
+    while True:
+        last_foreground = _foreground_process_id()
+        now = time.monotonic()
+        if last_foreground not in process_ids:
+            if idle_since is None:
+                idle_since = now
+            if now - idle_since >= 0.5:
+                return {"ready": True, "waited_seconds": round(now - started, 2),
+                        "active_process_id": None}
+        else:
+            idle_since = None
+        if now >= deadline:
+            return {"ready": False, "waited_seconds": round(now - started, 2),
+                    "active_process_id": last_foreground}
+        time.sleep(min(0.1, max(0.0, deadline - now)))
+
+
 def _try_acquire_native_compile_mutex() -> int | None:
     """Serialize fixed-name ISPSoft compiler sidecars across MCP processes in this logon session."""
     if sys.platform != "win32":
@@ -1306,6 +1334,7 @@ def ispsoft_start_background_session(project_path: str = "", wait_seconds: int =
     project_copy: Path | None = None
     process: _PrivateDesktopProcess | None = None
     desktop_handle = 0
+    startup_stage = "VALIDATING_PROJECT"
     try:
         source = Path(project_path).expanduser().resolve(strict=True)
         if source.suffix.lower() not in {".isp", ".bak"}:
@@ -1325,11 +1354,14 @@ def ispsoft_start_background_session(project_path: str = "", wait_seconds: int =
         if companion.is_file():
             copied_companion = project_copy.with_suffix(".ini")
             _write_new(copied_companion, read_bytes(companion), (companion,))
+        startup_stage = "PREPARING_PRIVATE_PROFILE"
         profile = _prepare_background_profile(session_root / "profile", project_copy)
         worker_env = os.environ.copy()
         worker_env["APPDATA"] = str(profile)
         desktop_name = f"ISPSoftMCP_{session_id[:12]}"
+        startup_stage = "CREATING_PRIVATE_DESKTOP"
         desktop_handle = _create_private_desktop(desktop_name)
+        startup_stage = "LAUNCHING_ISPSOFT"
         process = _create_private_desktop_process(executable.resolve(), project_copy,
                                                   worker_env, desktop_name, desktop_handle)
         record: dict[str, Any] = {
@@ -1442,7 +1474,13 @@ def ispsoft_start_background_session(project_path: str = "", wait_seconds: int =
             user32.CloseDesktop.argtypes = [wintypes.HANDLE]
             user32.CloseDesktop(desktop_handle)
         shutil.rmtree(session_root, ignore_errors=True)
-        return _json({"success": False, "status": "BACKGROUND_START_FAILED", "error": str(exc),
+        isolation_denied = (startup_stage == "CREATING_PRIVATE_DESKTOP" and
+                            getattr(exc, "winerror", None) == 5)
+        return _json({"success": False,
+                      "status": "BACKGROUND_ISOLATION_DENIED" if isolation_denied else "BACKGROUND_START_FAILED",
+                      "stage": startup_stage,
+                      "error": str(exc),
+                      "visible_fallback_used": False,
                       "project_path": project_path, "created_paths_removed": not session_root.exists()})
 
 
@@ -2186,7 +2224,8 @@ def ispsoft_write_device_comment_candidate(project_path: str, device_comments: d
 
 @mcp.tool()
 def ispsoft_compile_and_check(project_path: str, action: str = "compile",
-                              timeout_seconds: int = 120) -> str:
+                              timeout_seconds: int = 120,
+                              idle_wait_seconds: int = 15) -> str:
     """Run ISPSoft 3.24 Check or Compile on a private worker and disposable copy.
 
     The visible user's ISPSoft session is never activated. Compile output and
@@ -2206,6 +2245,10 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
         return _json({"success": False, "status": "REJECTED_BEFORE_OPEN",
                       "vendor_compile": "NOT_RUN",
                       "error": "timeout_seconds must be an integer from 10 to 300."})
+    if not isinstance(idle_wait_seconds, int) or isinstance(idle_wait_seconds, bool) or not 0 <= idle_wait_seconds <= 300:
+        return _json({"success": False, "status": "REJECTED_BEFORE_OPEN",
+                      "vendor_compile": "NOT_RUN",
+                      "error": "idle_wait_seconds must be an integer from 0 to 300."})
     try:
         source = Path(project_path).expanduser().resolve(strict=True)
         if source.suffix.lower() not in {".isp", ".bak"}:
@@ -2232,11 +2275,22 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
         return _json({"success": False, "status": "FOREGROUND_INSPECTION_FAILED",
                       "vendor_compile": "NOT_RUN", "project_path": str(source),
                       "error": str(exc)})
+    idle_wait: dict[str, Any] = {"ready": True, "waited_seconds": 0.0,
+                                 "active_process_id": None}
     if initial_foreground_pid in user_ide_process_ids:
-        return _json({"success": False, "status": "VISIBLE_ISPSOFT_ACTIVE",
-                      "vendor_compile": "NOT_RUN", "project_path": str(source),
-                      "active_process_id": initial_foreground_pid,
-                      "error": "The user's ISPSoft window is active. The background compile was not started to protect the shared compiler files."})
+        try:
+            idle_wait = _wait_for_user_ide_idle(user_ide_process_ids, idle_wait_seconds)
+        except (OSError, AttributeError, ctypes.ArgumentError) as exc:
+            return _json({"success": False, "status": "FOREGROUND_INSPECTION_FAILED",
+                          "vendor_compile": "NOT_RUN", "project_path": str(source),
+                          "error": str(exc)})
+        if not idle_wait["ready"]:
+            return _json({"success": False, "status": "VISIBLE_ISPSOFT_ACTIVE",
+                          "vendor_compile": "NOT_RUN", "project_path": str(source),
+                          "active_process_id": idle_wait["active_process_id"],
+                          "idle_wait_seconds": idle_wait_seconds,
+                          "waited_seconds": idle_wait["waited_seconds"],
+                          "error": "The user's ISPSoft window stayed in the foreground; no background compile was started."})
     if not _NATIVE_COMPILE_LOCK.acquire(blocking=False):
         return _json({"success": False, "status": "NATIVE_IDE_BUSY",
                       "vendor_compile": "NOT_RUN",
@@ -2254,6 +2308,14 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
             return _json({"success": False, "status": "NATIVE_IDE_BUSY",
                           "vendor_compile": "NOT_RUN",
                           "error": "Another ISPSoft MCP server is compiling in this Windows logon session."})
+        foreground_at_launch = _foreground_process_id()
+        if foreground_at_launch in user_ide_process_ids:
+            return _json({"success": False, "status": "VISIBLE_ISPSOFT_ACTIVE",
+                          "vendor_compile": "NOT_RUN", "project_path": str(source),
+                          "active_process_id": foreground_at_launch,
+                          "idle_wait_seconds": idle_wait_seconds,
+                          "waited_seconds": idle_wait["waited_seconds"],
+                          "error": "The user's ISPSoft window became active before launch; no background compile was started."})
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.GetForegroundWindow.restype = wintypes.HWND
         before_handle = user32.GetForegroundWindow()
@@ -2401,6 +2463,8 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
                 "foreground_handle_after": foreground_after,
                 "user_input_during_run": user_input_during_run,
                 "visible_ispsoft_became_active": user_ide_active_during_run,
+                "idle_wait_seconds": idle_wait_seconds,
+                "waited_for_user_ide_idle_seconds": idle_wait["waited_seconds"],
                 "foreground_change_attributable_to_worker": foreground_change_attributable_to_worker,
                 "diagnostic_counts": counts, "diagnostic_text": diagnostics,
                 "compile_pane_detected": pane_seen, "diagnostic_capture": capture,
