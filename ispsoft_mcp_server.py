@@ -699,6 +699,49 @@ def ispsoft_read_ld_network(project_path: str, pou_name: str, network_index: int
 
 
 @mcp.tool()
+def ispsoft_get_ld_program_structure(project_path: str, pou_name: str) -> str:
+    """Summarize every LD network as ordered raw node records without semantic guesses."""
+    try:
+        container = containers.read_container(project_path)
+        source = container.source.decode(container.encoding)
+        candidates = [match for match in containers.sections(source, 'POU')
+                      if containers.property_value(match.group(1), 'P_Name') == pou_name]
+        if len(candidates) != 1:
+            raise FileTransformError(f"Expected one POU named {pou_name!r}; found {len(candidates)}")
+        body = candidates[0].group(1)
+        raw_networks = containers.ld_networks(body)
+        if not raw_networks:
+            return _json({"success": False, "status": "NO_LD_NETWORKS",
+                          "project_path": str(Path(project_path).expanduser().resolve()),
+                          "pou_name": pou_name, "network_count": 0})
+        networks: list[dict[str, Any]] = []
+        totals: dict[str, dict[str, int]] = {"root": {}, "outlink": {}}
+        for index, raw in enumerate(raw_networks, 1):
+            parsed = containers.parse_ld_network(raw)
+            root_nodes = parsed["root_nodes"]
+            outlink_nodes = parsed["outlink_nodes"]
+            for side, nodes in (("root", root_nodes), ("outlink", outlink_nodes)):
+                for node in nodes:
+                    fields = node["fields"]
+                    type_code = str(fields.get("TYPE", "UNSPECIFIED"))
+                    totals[side][type_code] = totals[side].get(type_code, 0) + 1
+            networks.append({"index": index, **parsed,
+                             "root_node_count": len(root_nodes),
+                             "outlink_node_count": len(outlink_nodes)})
+        return _json({"success": True, "status": "READ_RAW_STRUCTURE",
+                      "project_path": str(Path(project_path).expanduser().resolve()),
+                      "project_sha256": _sha(read_bytes(project_path)),
+                      "pou_name": pou_name,
+                      "language": containers.property_value(body, 'P_Lang'),
+                      "network_count": len(networks), "node_type_counts": totals,
+                      "networks": networks,
+                      "interpretation": "Ordered raw fields only; type-code meaning, rung topology, execution behavior, and compile status are not inferred."})
+    except (OSError, FileTransformError, ValueError) as exc:
+        return _json({"success": False, "status": "READ_FAILED", "error": str(exc),
+                      "pou_name": pou_name})
+
+
+@mcp.tool()
 def ispsoft_get_cross_references(project_path: str, pou_name: str) -> str:
     """Extract a text-based device reference list from one POU."""
     try:

@@ -255,6 +255,11 @@ DEV_NAME=Y0
             self.assertEqual(first["structure"]["properties"]["NetworkID"], "1")
             self.assertEqual(first["structure"]["root_nodes"][0]["fields"]["DEV_NAME"], "X0")
             self.assertEqual(first["structure"]["outlink_nodes"][0]["fields"]["DEV_NAME"], "Y0")
+            structure = json.loads(server.ispsoft_get_ld_program_structure(str(project), "MainProgram"))
+            self.assertEqual(structure["status"], "READ_RAW_STRUCTURE")
+            self.assertEqual(structure["network_count"], 2)
+            self.assertEqual(structure["node_type_counts"]["root"]["1"], 2)
+            self.assertEqual(structure["node_type_counts"]["outlink"]["15"], 2)
             out_of_range = json.loads(server.ispsoft_read_ld_network(str(project), "MainProgram", 3))
             self.assertEqual(out_of_range["status"], "NETWORK_INDEX_OUT_OF_RANGE")
             invalid_index = json.loads(server.ispsoft_read_ld_network(str(project), "MainProgram", 0))
@@ -268,6 +273,7 @@ DEV_NAME=Y0
         overview = json.loads(server.ispsoft_get_project_overview(str(project)))
         pou = json.loads(server.ispsoft_read_pou(str(project), "Prog0"))
         first_network = json.loads(server.ispsoft_read_ld_network(str(project), "Prog0", 1))
+        structure = json.loads(server.ispsoft_get_ld_program_structure(str(project), "Prog0"))
         xrefs = json.loads(server.ispsoft_get_cross_references(str(project), "Prog0"))
         self.assertEqual(overview["model"], "ES2")
         self.assertGreater(pou["network_count"], 0)
@@ -275,6 +281,8 @@ DEV_NAME=Y0
         self.assertEqual(first_network["structure"]["properties"]["NET_ID"], "1")
         self.assertEqual(first_network["structure"]["root_nodes"][0]["fields"]["DEV_NAME"], "M1002")
         self.assertEqual(first_network["structure"]["outlink_nodes"][0]["fields"]["DEV_NAME"], "M1143")
+        self.assertEqual(structure["network_count"], 38)
+        self.assertEqual(structure["networks"][0]["properties"]["NET_ID"], "1")
         refs = {row["address"]: row for row in xrefs["references"]}
         self.assertIn("M1002", refs)
         self.assertEqual(project.read_bytes(), before)
@@ -333,6 +341,7 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             "ispsoft_create_project_from_template", "ispsoft_connect",
             "ispsoft_upload_from_plc", "ispsoft_start_monitor", "ispsoft_stop_monitor",
             "ispsoft_get_ide_session", "ispsoft_start_ide", "ispsoft_read_ld_network",
+            "ispsoft_get_ld_program_structure",
         }.issubset(names))
 
     def test_ide_session_reports_visible_window_evidence(self) -> None:

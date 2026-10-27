@@ -86,6 +86,7 @@ the detected Delta installation path.
 | `ispsoft_read_project_source` | Return project source and POU metadata. |
 | `ispsoft_read_pou` | Read a single POU's source sections. |
 | `ispsoft_read_ld_network` | Read one raw LD network by one-based POU order without modifying the project. |
+| `ispsoft_get_ld_program_structure` | Return all LD networks as ordered node fields and raw type-code counts, without guessing type semantics. |
 | `ispsoft_read_device_comments` | Read device comments from a project. |
 | `ispsoft_get_cross_references` | Build a best-effort reference list for one POU. |
 | `ispsoft_get_memory_usage_map` | Read declared ranges from `SYSTEM_VAR`. |
