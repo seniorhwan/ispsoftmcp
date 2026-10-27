@@ -7,7 +7,7 @@ import tempfile
 import unittest
 import zlib
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import ispsoft_mcp_server as server
 from ispsoft_mcp import containers, dvp, limits
@@ -391,6 +391,8 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             "ispsoft_upload_from_plc", "ispsoft_start_monitor", "ispsoft_stop_monitor",
             "ispsoft_get_ide_session", "ispsoft_start_ide", "ispsoft_read_ld_network",
             "ispsoft_get_ld_program_structure", "ispsoft_write_ld_network_candidate",
+            "ispsoft_start_background_session", "ispsoft_get_background_sessions",
+            "ispsoft_stop_background_session",
         }.issubset(names))
 
     def test_ide_session_reports_visible_window_evidence(self) -> None:
@@ -477,6 +479,77 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             self.assertEqual(result["status"], "PROJECT_ALREADY_VISIBLE")
             self.assertTrue(result["already_open"])
             popen.assert_not_called()
+
+    def test_background_session_uses_hidden_isolated_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "station project.isp"
+            original = es2_v8_container()
+            source.write_bytes(original)
+            window = {"handle": 42, "pid": 123, "title": "station project - Delta ISPSoft",
+                      "class_name": "TMainFrm", "visible": False, "minimized": False}
+            process = Mock()
+            process.pid = 123
+            process.poll.return_value = None
+            with patch.object(server, "WORK_DIR", root / "work"), \
+                 patch.dict(server.os.environ, {"APPDATA": str(root / "user-appdata")}), \
+                 patch.object(server, "_exe", return_value=Path("C:/Delta/NewISPSoft.exe")), \
+                 patch.object(server, "_ide_windows", return_value=[window]), \
+                 patch.object(server, "_hide_ide_windows") as hide, \
+                 patch.object(server.subprocess, "Popen", return_value=process) as popen, \
+                 patch.object(server.sys, "platform", "win32"):
+                result = json.loads(server.ispsoft_start_background_session(str(source), 1))
+            self.assertEqual(result["status"], "BACKGROUND_PROJECT_OPEN_TITLE_MATCH")
+            self.assertTrue(result["hidden"])
+            self.assertTrue(result["readback_verified"])
+            self.assertEqual(Path(result["worker_project_path"]).read_bytes(), original)
+            self.assertEqual(source.read_bytes(), original)
+            self.assertEqual(popen.call_args.args[0], [str(Path("C:/Delta/NewISPSoft.exe")),
+                                                      result["worker_project_path"]])
+            startup = popen.call_args.kwargs["startupinfo"]
+            self.assertEqual(startup.wShowWindow, 0)
+            self.assertEqual(popen.call_args.kwargs["env"]["APPDATA"], result["profile_path"])
+            hide.assert_called_once_with(123)
+
+    def test_background_session_stops_only_its_owned_process(self) -> None:
+        process = Mock()
+        process.poll.return_value = None
+        session_id = "session-123"
+        record = {"session_id": session_id, "process": process, "process_id": 77,
+                  "session_root": "C:/work/session-123", "worker_project_path": "C:/work/proj.isp"}
+        with patch.dict(server._BACKGROUND_IDE_SESSIONS, {session_id: record}):
+            result = json.loads(server.ispsoft_stop_background_session(session_id))
+        self.assertEqual(result["status"], "STOPPED")
+        self.assertTrue(result["original_project_untouched"])
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=10)
+
+    def test_background_session_stops_worker_when_ispsoft_cannot_write_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "station project.isp"
+            source.write_bytes(es2_v8_container())
+            process = Mock()
+            process.pid = 123
+            process.poll.return_value = None
+            dialog = {"handle": 77, "pid": 123, "title": "Delta ISPSoft",
+                      "class_name": "#32770", "visible": False, "minimized": False}
+            with patch.object(server, "WORK_DIR", root / "work"), \
+                 patch.object(server, "_exe", return_value=Path("C:/Delta/NewISPSoft.exe")), \
+                 patch.object(server, "_ide_windows", return_value=[dialog]), \
+                 patch.object(server, "_window_child_texts", return_value=[{
+                     "class_name": "Static", "text": "Cannot create file C:\\Users\\User\\AppData\\Roaming\\Delta\\foldeStrList.txt."}]), \
+                 patch.object(server, "_hide_ide_windows"), \
+                 patch.object(server.subprocess, "Popen", return_value=process), \
+                 patch.object(server.time, "monotonic", side_effect=[0, 2]), \
+                 patch.object(server.time, "sleep"), \
+                 patch.object(server.sys, "platform", "win32"):
+                result = json.loads(server.ispsoft_start_background_session(str(source), 1))
+            self.assertFalse(result["success"])
+            self.assertEqual(result["failure_reason"], "PROFILE_WRITE_DENIED")
+            self.assertTrue(result["process_stopped"])
+            process.terminate.assert_called_once()
+            process.wait.assert_called_once_with(timeout=5)
 
     def test_open_project_reports_visible_filename_title_match(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

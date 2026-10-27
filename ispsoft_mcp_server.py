@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,7 @@ from ispsoft_mcp.limits import FileTransformError, atomic_write, read_bytes
 SERVER_NAME = "ispsoft"
 ISPSOFT_EXE_ENV = "ISPSOFT_EXE"
 LIVE_WRITES_ENV = "ISPSOFT_WRITES_ENABLED"
-WORK_DIR = Path.home() / "Documents" / "Codex-ISPSoft"
+WORK_DIR = Path(os.environ.get("ISPSOFT_WORK_DIR", str(Path.home() / "Documents" / "Codex-ISPSoft"))).expanduser()
 APP_CANDIDATES = (
     Path(r"C:\Program Files (x86)\Delta Industrial Automation\ISPSoft 3.24\NewISPSoft.exe"),
     Path(r"C:\Program Files\Delta Industrial Automation\ISPSoft\NewISPSoft.exe"),
@@ -54,6 +55,7 @@ DEVICE_RE = re.compile(r"(?<![A-Z0-9_])(X|Y|M|S|T|C|D|V|Z|R)\s*(\d+)(?![A-Z0-9_]
 WRITE_OPS = {"OUT", "SET", "RST", "MOV", "DMOV", "DADD", "DSUB", "DMUL", "INC", "DEC", "ZRST"}
 
 mcp = FastMCP(SERVER_NAME)
+_BACKGROUND_IDE_SESSIONS: dict[str, dict[str, Any]] = {}
 
 
 def _json(value: Any) -> str:
@@ -267,6 +269,7 @@ def _ide_session() -> dict[str, Any]:
     minimized_windows = [window for window in windows if window["visible"] and window["minimized"]]
     return {"process_running": running, "process_ids": process_ids,
             "windows": visible_windows, "window_count": len(windows),
+            "all_windows": windows,
             "minimized_window_count": len(minimized_windows),
             "hidden_window_count": len(windows) - len(visible_windows) - len(minimized_windows),
             "visible_window_count": len(visible), "diagnosis": diagnosis}
@@ -309,6 +312,82 @@ def _configured_previous_project_summary() -> dict[str, Any]:
                       sha256=_sha(data))
     except (OSError, FileTransformError, ValueError) as exc:
         result.update(exists=path.exists(), readable=False, error=str(exc))
+    return result
+
+
+def _prepare_background_profile(profile_root: Path, project_path: Path) -> Path:
+    """Create an ISPSoft per-worker settings profile pointing at a disposable project copy."""
+    app_settings = profile_root / "Delta Industrial Automation" / "ISPSoft_New"
+    app_settings.mkdir(parents=True, exist_ok=True)
+    user_appdata = os.environ.get("APPDATA")
+    user_settings = (Path(user_appdata) / "Delta Industrial Automation" / "ISPSoft_New"
+                     if user_appdata else None)
+    if user_settings is not None and user_settings.is_dir():
+        for name in ("ISPSoft.ini", "ISPSoftBar.ini", "ISPSoftDock.ini"):
+            source = user_settings / name
+            if source.is_file():
+                shutil.copy2(source, app_settings / name)
+    config_path = app_settings / "ISPSoft.ini"
+    config = configparser.ConfigParser(interpolation=None)
+    if config_path.is_file():
+        with config_path.open("r", encoding="cp1252") as stream:
+            config.read_file(stream)
+    if not config.has_section("MainForm"):
+        config.add_section("MainForm")
+    if not config.has_section("Project"):
+        config.add_section("Project")
+    config.set("MainForm", "loadPreviousPrj", "1")
+    config.set("Project", "ProjectName", str(project_path))
+    config.set("MainForm", "MRUfile0", str(project_path))
+    with config_path.open("w", encoding="cp1252", newline="") as stream:
+        config.write(stream)
+    return profile_root
+
+
+def _hide_ide_windows(process_id: int) -> None:
+    """Hide only windows owned by an MCP-launched ISPSoft worker process."""
+    if sys.platform != "win32":
+        return
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    for window in _ide_windows():
+        if window["pid"] == process_id and window["visible"]:
+            user32.ShowWindow(window["handle"], 0)  # SW_HIDE; never activate/focus the worker.
+
+
+def _window_child_texts(window_handle: int, limit: int = 24) -> list[dict[str, str]]:
+    """Read short standard control labels from one worker window for silent diagnostics."""
+    if sys.platform != "win32":
+        return []
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumChildWindows.argtypes = [wintypes.HWND, callback_type, wintypes.LPARAM]
+    user32.EnumChildWindows.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    result: list[dict[str, str]] = []
+
+    def inspect(hwnd: int, _lparam: int) -> bool:
+        if len(result) >= limit:
+            return False
+        class_name = ctypes.create_unicode_buffer(128)
+        user32.GetClassNameW(hwnd, class_name, len(class_name))
+        if class_name.value not in {"Static", "Button", "Edit", "TLabel", "TButton"}:
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if not length:
+            return True
+        text_buffer = ctypes.create_unicode_buffer(min(length + 1, 513))
+        user32.GetWindowTextW(hwnd, text_buffer, len(text_buffer))
+        text = text_buffer.value.strip()
+        if text:
+            result.append({"class_name": class_name.value, "text": text[:512]})
+        return True
+
+    callback = callback_type(inspect)
+    user32.EnumChildWindows(window_handle, callback, 0)
     return result
 
 
@@ -517,7 +596,7 @@ def _open_project_and_observe(project_path: str, wait_seconds: int) -> dict[str,
 
 @mcp.tool()
 def ispsoft_start_ide(project_path: str = "", wait_seconds: int = 15) -> str:
-    """Open a specific or ISPSoft-configured previous project; never starts blank."""
+    """Interactive GUI launch for an explicitly requested project; background agents should use ispsoft_start_background_session."""
     if sys.platform != "win32":
         return _json({"success": False, "status": "WINDOWS_REQUIRED"})
     if not isinstance(project_path, str):
@@ -530,6 +609,165 @@ def ispsoft_start_ide(project_path: str = "", wait_seconds: int = 15) -> str:
                           "error": "No ISPSoft previous project is configured; provide project_path. ISPSoft will not be started blank."})
         project_path = str(configured)
     return _json(_open_project_and_observe(project_path, wait_seconds))
+
+
+@mcp.tool()
+def ispsoft_start_background_session(project_path: str, wait_seconds: int = 20) -> str:
+    """Start an isolated, hidden ISPSoft worker on a disposable project copy; never focus the user's IDE."""
+    if sys.platform != "win32":
+        return _json({"success": False, "status": "WINDOWS_REQUIRED"})
+    if not isinstance(wait_seconds, int) or isinstance(wait_seconds, bool) or not 1 <= wait_seconds <= 60:
+        return _json({"success": False, "status": "REJECTED_BEFORE_START",
+                      "error": "wait_seconds must be an integer from 1 to 60."})
+    executable = _exe()
+    if executable is None:
+        return _json({"success": False, "status": "NOT_INSTALLED",
+                      "error": "ISPSoft executable was not found. Set ISPSOFT_EXE to its installed path."})
+
+    session_id = uuid.uuid4().hex
+    session_root = WORK_DIR / "background-sessions" / session_id
+    project_copy: Path | None = None
+    process: subprocess.Popen[Any] | None = None
+    try:
+        source = Path(project_path).expanduser().resolve(strict=True)
+        if source.suffix.lower() not in {".isp", ".bak"}:
+            raise FileTransformError("Project path must refer to an .isp or .bak file.")
+        original = read_bytes(source)
+        container = containers.read_container(source)
+        project_info = containers.inspect(container)
+        project_dir = session_root / "project"
+        project_dir.mkdir(parents=True, exist_ok=False)
+        project_copy = project_dir / source.name
+        _write_new(project_copy, original, (source,))
+        companion = source.with_suffix(".ini")
+        copied_companion: Path | None = None
+        if companion.is_file():
+            copied_companion = project_copy.with_suffix(".ini")
+            _write_new(copied_companion, read_bytes(companion), (companion,))
+        profile = _prepare_background_profile(session_root / "profile", project_copy)
+        worker_env = os.environ.copy()
+        worker_env["APPDATA"] = str(profile)
+        startup_info = subprocess.STARTUPINFO()
+        startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup_info.wShowWindow = 0  # SW_HIDE: create the worker without showing or focusing it.
+        creation_flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        process = subprocess.Popen([str(executable), str(project_copy)], cwd=str(executable.parent), env=worker_env,
+                                   startupinfo=startup_info, creationflags=creation_flags)
+        record: dict[str, Any] = {
+            "session_id": session_id, "process": process, "process_id": process.pid,
+            "status": "STARTING", "project_path": str(source), "worker_project_path": str(project_copy),
+            "session_root": str(session_root), "model": project_info.get("project_model"),
+            "source_sha256": _sha(original), "worker_sha256": _sha(read_bytes(project_copy)),
+            "readback_verified": read_bytes(project_copy) == original,
+            "companion_path": str(copied_companion) if copied_companion else None,
+            "profile_path": str(profile), "launch_mode": "PROJECT_FILE_ARGUMENT_WITH_ISOLATED_PROFILE",
+            "created_by_server": True,
+        }
+        _BACKGROUND_IDE_SESSIONS[session_id] = record
+        expected = source.stem.casefold()
+        deadline = time.monotonic() + wait_seconds
+        matching: list[dict[str, Any]] = []
+        worker_windows: list[dict[str, Any]] = []
+        while True:
+            _hide_ide_windows(process.pid)
+            worker_windows = [window for window in _ide_windows() if window["pid"] == process.pid]
+            matching = [window for window in worker_windows
+                        if expected in str(window.get("title", "")).casefold()]
+            if matching:
+                hidden = all(not window["visible"] for window in worker_windows)
+                record.update(status="BACKGROUND_PROJECT_OPEN_TITLE_MATCH", windows=worker_windows,
+                              title_match=True, hidden=hidden)
+                return _json({key: value for key, value in record.items() if key != "process"})
+            if process.poll() is not None:
+                record.update(status="BACKGROUND_PROCESS_EXITED", windows=worker_windows,
+                              title_match=False, hidden=True, exit_code=process.returncode)
+                break
+            if time.monotonic() >= deadline:
+                diagnostic_windows = [window for window in worker_windows
+                                      if window.get("title") or window.get("class_name") in {"#32770", "TWaitFrm", "TWaitForm_C"}]
+                diagnostics = [{"title": window.get("title", ""),
+                                "class_name": window.get("class_name", ""),
+                                "controls": _window_child_texts(window["handle"])}
+                               for window in diagnostic_windows[:8]]
+                dialog_text = " ".join(control["text"] for window in diagnostics
+                                        for control in window["controls"]).casefold()
+                failure_reason = ("PROFILE_WRITE_DENIED" if "cannot create file" in dialog_text or
+                                  "access is denied" in dialog_text else "PROJECT_TITLE_NOT_CONFIRMED")
+                process_stopped = False
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                    process_stopped = True
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                        process.wait(timeout=5)
+                        process_stopped = True
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                record.update(success=False, status="BACKGROUND_PROJECT_OPEN_UNVERIFIED", windows=worker_windows,
+                              title_match=False, hidden=all(not window["visible"] for window in worker_windows),
+                              dialog_details=diagnostics, failure_reason=failure_reason,
+                              process_stopped=process_stopped,
+                              message=("ISPSoft could not create a settings file in its resolved AppData folder; "
+                                       "the project did not load in this worker. The worker was stopped."
+                                       if failure_reason == "PROFILE_WRITE_DENIED" else
+                                       "The worker was launched hidden, but no worker window title confirmed the requested project."))
+                break
+            time.sleep(0.25)
+        return _json({key: value for key, value in record.items() if key != "process"})
+    except (OSError, FileTransformError, ValueError, configparser.Error, subprocess.SubprocessError) as exc:
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        shutil.rmtree(session_root, ignore_errors=True)
+        return _json({"success": False, "status": "BACKGROUND_START_FAILED", "error": str(exc),
+                      "project_path": project_path, "created_paths_removed": not session_root.exists()})
+
+
+@mcp.tool()
+def ispsoft_get_background_sessions() -> str:
+    """List only hidden ISPSoft workers created by this MCP server."""
+    sessions: list[dict[str, Any]] = []
+    for session_id, record in list(_BACKGROUND_IDE_SESSIONS.items()):
+        process = record.get("process")
+        process_running = process is not None and process.poll() is None
+        windows = [window for window in _ide_windows() if window["pid"] == record.get("process_id")]
+        sessions.append({key: value for key, value in record.items() if key != "process"} | {
+            "session_id": session_id, "process_running": process_running,
+            "windows": windows, "hidden": all(not window["visible"] for window in windows),
+        })
+    return _json({"success": True, "sessions": sessions})
+
+
+@mcp.tool()
+def ispsoft_stop_background_session(session_id: str) -> str:
+    """Stop only the hidden ISPSoft process started by this MCP session."""
+    record = _BACKGROUND_IDE_SESSIONS.get(session_id)
+    if record is None:
+        return _json({"success": False, "status": "UNKNOWN_SESSION",
+                      "error": "No background worker with that session_id was started by this MCP process."})
+    process = record["process"]
+    if process.poll() is None:
+        try:
+            process.terminate()
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return _json({"success": False, "status": "STOP_FAILED", "error": str(exc),
+                          "session_id": session_id, "process_id": record["process_id"]})
+    record["status"] = "STOPPED"
+    return _json({"success": True, "status": "STOPPED", "session_id": session_id,
+                  "process_id": record["process_id"], "session_root": record["session_root"],
+                  "worker_project_path": record["worker_project_path"],
+                  "original_project_untouched": True})
 
 
 @mcp.tool()
@@ -902,7 +1140,7 @@ def ispsoft_read_device_comments(project_path: str) -> str:
 
 @mcp.tool()
 def ispsoft_open_project(project_path: str) -> str:
-    """Open one exact supported project and verify its filename appears in the ISPSoft window title."""
+    """Interactive GUI open for a specific project; use the background-session tools for silent agent work."""
     return ispsoft_start_ide(project_path, 15)
 
 

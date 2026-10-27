@@ -36,6 +36,13 @@ that an MCP operation works on it.
   available through `ispsoft_get_ide_session` and `ispsoft_start_ide`. These
   report visible windows and startup failures; they do not inspect the active
   project or automate compile/check.
+- Silent background sessions run in a separate hidden ISPSoft process with a
+  private settings profile and a disposable project copy. They do not reuse,
+  focus, or modify the user's open IDE/project. Use the background session
+  tools for agent work; GUI start/open tools are interactive-only. A session is
+  usable only when its result confirms the requested project title. If ISPSoft
+  cannot initialize its settings or open that project, the server reports the
+  failure and stops that worker; it does not claim the project was loaded.
 - Installed PLC family/model catalog and installed simulator executables are
   discovered from ISPSoft 3.24's own device configuration. This catalog is
   informational; MCP capability status remains per operation.
@@ -78,7 +85,10 @@ the detected Delta installation path.
 |---|---|
 | `ispsoft_get_status` | Detect installed/running ISPSoft, COMMGR, and the DVP ES2 simulator. Presence is not a connection check. |
 | `ispsoft_get_ide_session` | Report ISPSoft process IDs and visible top-level window metadata. Does not identify the open project. |
-| `ispsoft_start_ide` | Open an explicit project, or ISPSoft's configured previous project when no path is supplied; verify that its filename appears in a visible ISPSoft window title. Refuses to start ISPSoft blank. |
+| `ispsoft_start_ide` | Interactive-only: open an explicit project or ISPSoft's configured previous project. Does not start blank. Background agents should not call this tool. |
+| `ispsoft_start_background_session` | Start a hidden isolated ISPSoft worker on a disposable copy of a project with a private settings profile. |
+| `ispsoft_get_background_sessions` | Report background workers created by this MCP process, including their hidden windows and project-copy paths. |
+| `ispsoft_stop_background_session` | Stop only a hidden worker created by this MCP process; retains its disposable project folder for inspection. |
 | `ispsoft_get_capabilities` | Separate detected ISPSoft models from MCP-qualified operation profiles. |
 | `ispsoft_list_supported_plc_types` | Show the installed model catalog and exact MCP operation profiles. |
 | `ispsoft_list_projects` | Find and inspect ISPSoft project files in a requested folder. |
@@ -92,7 +102,7 @@ the detected Delta installation path.
 | `ispsoft_read_device_comments` | Read device comments from a project. |
 | `ispsoft_get_cross_references` | Build a best-effort reference list for one POU. |
 | `ispsoft_get_memory_usage_map` | Read declared ranges from `SYSTEM_VAR`. |
-| `ispsoft_open_project` | Open a recognized project and report visible title-match evidence; reports unverified if Windows does not expose a matching ISPSoft window. |
+| `ispsoft_open_project` | Interactive-only: open a project in the user's IDE; background agents should use an isolated background session. |
 | `ispsoft_write_st_candidate` | Patch an existing ST POU into a new `.isp` candidate with a backup. |
 | `ispsoft_write_ld_network_candidate` | Replace one raw ES2 LD network into a backed-up `.isp` candidate; structural checks only, never compile or download. |
 | `ispsoft_write_device_comment_candidate` | Merge comments into a new ES2 project candidate. |
