@@ -571,6 +571,45 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             self.assertEqual(args[3], result["desktop_name"])
             self.assertEqual(args[4], 555)
 
+    def test_background_session_uses_configured_previous_project_when_path_is_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "previous station.isp"
+            original = es2_v8_container()
+            source.write_bytes(original)
+            window = {"handle": 42, "pid": 123,
+                      "title": "previous station__MCP_123456789abc - Delta ISPSoft",
+                      "class_name": "TMainFrm", "visible": True, "minimized": False}
+            process = Mock()
+            process.pid = 123
+            process.poll.return_value = None
+            process.windows.return_value = [window]
+            with patch.object(server, "WORK_DIR", root / "work"), \
+                 patch.object(server, "_configured_previous_project", return_value=source) as previous, \
+                 patch.dict(server.os.environ, {"APPDATA": str(root / "user-appdata")}), \
+                 patch.object(server, "_exe", return_value=Path("C:/Delta/NewISPSoft.exe")), \
+                 patch.object(server, "_ide_windows", return_value=[]), \
+                 patch.object(server, "_create_private_desktop", return_value=555), \
+                 patch.object(server, "_create_private_desktop_process", return_value=process) as launch, \
+                 patch.object(server.uuid, "uuid4", return_value=Mock(hex="123456789abc00000000000000000000")), \
+                 patch.object(server.sys, "platform", "win32"):
+                result = json.loads(server.ispsoft_start_background_session())
+            previous.assert_called_once_with()
+            self.assertTrue(result["success"])
+            self.assertEqual(result["project_path"], str(source.resolve()))
+            self.assertEqual(Path(result["worker_project_path"]).read_bytes(), original)
+            self.assertEqual(source.read_bytes(), original)
+            self.assertEqual(launch.call_args.args[1], Path(result["worker_project_path"]))
+
+    def test_background_session_refuses_blank_launch_without_saved_previous_project(self) -> None:
+        with patch.object(server, "_configured_previous_project", return_value=None), \
+             patch.object(server, "_exe") as executable, \
+             patch.object(server.sys, "platform", "win32"):
+            result = json.loads(server.ispsoft_start_background_session(""))
+        self.assertEqual(result["status"], "PREVIOUS_PROJECT_NOT_CONFIGURED")
+        self.assertFalse(result["success"])
+        executable.assert_not_called()
+
     def test_background_session_stops_only_its_owned_process(self) -> None:
         process = Mock()
         process.poll.return_value = None

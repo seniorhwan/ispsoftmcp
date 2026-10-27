@@ -94,7 +94,7 @@ the detected Delta installation path.
 | `ispsoft_get_status` | Detect installed/running ISPSoft, COMMGR, and the DVP ES2 simulator. Presence is not a connection check. |
 | `ispsoft_get_ide_session` | Report ISPSoft process IDs and visible top-level window metadata. Does not identify the open project. |
 | `ispsoft_start_ide` | Interactive-only: open an explicit project or ISPSoft's configured previous project. Does not start blank. Background agents should not call this tool. |
-| `ispsoft_start_background_session` | Start ISPSoft on a private Windows desktop using a disposable project copy and private settings profile. |
+| `ispsoft_start_background_session` | Open the requested project, or ISPSoft's configured previous project when `project_path` is omitted, on a private Windows desktop using a disposable copy and private settings profile. It refuses to start blank. |
 | `ispsoft_get_background_sessions` | Report private-desktop workers created by this MCP process, including worker windows and project-copy paths. |
 | `ispsoft_stop_background_session` | Stop only a private-desktop worker created by this MCP process; retains its disposable project folder for inspection. |
 | `ispsoft_get_capabilities` | Separate detected ISPSoft models from MCP-qualified operation profiles. |

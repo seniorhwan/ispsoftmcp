@@ -1107,10 +1107,19 @@ def ispsoft_start_ide(project_path: str = "", wait_seconds: int = 15) -> str:
 
 
 @mcp.tool()
-def ispsoft_start_background_session(project_path: str, wait_seconds: int = 30) -> str:
-    """Start ISPSoft on a private Windows desktop with a disposable project copy."""
+def ispsoft_start_background_session(project_path: str = "", wait_seconds: int = 30) -> str:
+    """Open the requested or configured previous project on a private desktop using a disposable copy."""
     if sys.platform != "win32":
         return _json({"success": False, "status": "WINDOWS_REQUIRED"})
+    if not isinstance(project_path, str):
+        return _json({"success": False, "status": "PROJECT_REJECTED",
+                      "error": "project_path must be text or empty to use ISPSoft's configured previous project."})
+    if not project_path.strip():
+        configured = _configured_previous_project()
+        if configured is None:
+            return _json({"success": False, "status": "PREVIOUS_PROJECT_NOT_CONFIGURED",
+                          "error": "No ISPSoft previous project is configured; provide project_path. ISPSoft will not be started blank."})
+        project_path = str(configured)
     if not isinstance(wait_seconds, int) or isinstance(wait_seconds, bool) or not 1 <= wait_seconds <= 60:
         return _json({"success": False, "status": "REJECTED_BEFORE_START",
                       "error": "wait_seconds must be an integer from 1 to 60."})
