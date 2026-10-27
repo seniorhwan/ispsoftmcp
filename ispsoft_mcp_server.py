@@ -2164,6 +2164,8 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
             counts["compile_pane_detected"] and counts["errors"] is not None
             and counts["warnings"] is not None)
 
+        if _foreground_process_id() in user_ide_process_ids:
+            user_ide_active_during_run = True
         appdata = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
         compiler_root = appdata / "Delta Industrial Automation" / "ISPSoft_New"
         changed_outputs: list[dict[str, Any]] = []
@@ -2180,6 +2182,9 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
                                    "size_bytes": len(data), "sha256": _sha(data),
                                    "source_path": str(path)})
 
+        if _foreground_process_id() in user_ide_process_ids:
+            user_ide_active_during_run = True
+            changed_outputs = []
         error_count, warning_count = counts["errors"], counts["warnings"]
         pane_seen = counts["compile_pane_detected"]
         after_handle = user32.GetForegroundWindow()
