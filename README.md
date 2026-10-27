@@ -20,8 +20,10 @@ that an MCP operation works on it.
   server does not claim native ISPSoft compilation or IDE readback.
 - Project overview, POU-section reads, device-comment reads, and comment
   candidate generation for DVP ES2. LD network blocks are returned as raw
-  native project text and can be read one at a time; the server does not yet
-  decode those nodes into a ladder diagram.
+  native project text and can be read one at a time or summarized as ordered
+  node records. A structurally validated raw-network candidate editor writes
+  a new project and byte-identical backup. Node type semantics and rung
+  topology are not inferred, and candidates remain uncompiled.
 - DVP IL-to-MPU POU generation and MPU-to-IL inspection for the qualified ES2,
   DVP12SE11R, and DVP12SE11T profiles. Supported mnemonics and network shapes
   are deliberately limited by the serializer; unsupported or lossy logic is
@@ -92,6 +94,7 @@ the detected Delta installation path.
 | `ispsoft_get_memory_usage_map` | Read declared ranges from `SYSTEM_VAR`. |
 | `ispsoft_open_project` | Ask Windows to open a recognized project; active project is not verified. |
 | `ispsoft_write_st_candidate` | Patch an existing ST POU into a new `.isp` candidate with a backup. |
+| `ispsoft_write_ld_network_candidate` | Replace one raw ES2 LD network into a backed-up `.isp` candidate; structural checks only, never compile or download. |
 | `ispsoft_write_device_comment_candidate` | Merge comments into a new ES2 project candidate. |
 | `ispsoft_validate_il` | Validate supported DVP IL and prove MPU serialization/readback. |
 | `ispsoft_generate_mpu` | Generate a `.mpu` POU artifact; it does not import it into a project. |

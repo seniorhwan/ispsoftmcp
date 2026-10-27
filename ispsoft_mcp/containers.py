@@ -145,8 +145,12 @@ def sections(text: str, tag: str):
 
 def ld_networks(text: str) -> list[str]:
     """Return raw ISPSoft LD network bodies between their marker tags."""
-    return [match.group(1) for match in
-            re.finditer(r'(?is)<NETWORK_START>\r*\n(.*?)\r*\n<NETWORK_END>', text)]
+    return [match.group(1) for match in ld_network_matches(text)]
+
+
+def ld_network_matches(text: str) -> list[re.Match[str]]:
+    """Return source spans for marker-delimited LD network bodies."""
+    return list(re.finditer(r'(?is)<NETWORK_START>\r*\n(.*?)\r*\n<NETWORK_END>', text))
 
 
 def parse_ld_network(network_text: str) -> dict:
@@ -177,6 +181,48 @@ def parse_ld_network(network_text: str) -> dict:
     return {"properties": fields(properties), "root_nodes": nodes(roots),
             "outlink_nodes": nodes(outlinks), "root_section_raw": roots,
             "outlink_section_raw": outlinks}
+
+
+def validate_ld_network(network_text: str) -> list[str]:
+    """Validate marker and node-record structure without interpreting TYPE values."""
+    errors: list[str] = []
+    if not isinstance(network_text, str) or not network_text.strip():
+        return ["replacement network must be non-empty text"]
+    try:
+        size = len(network_text.encode("utf-8"))
+    except UnicodeEncodeError:
+        return ["replacement network contains invalid Unicode"]
+    if size > 1_000_000:
+        return ["replacement network exceeds 1 MB"]
+    if re.search(r'(?i)</?NETWORK_(?:START|END)>', network_text):
+        errors.append("replacement must contain a network body only, without NETWORK_START/NETWORK_END wrappers")
+    required_pairs = (("PROPERTIES_START", "PROPERTIES_END"),
+                      ("ROOTLINK_START", "ROOTLINK_END"),
+                      ("OUTLINK_START", "OUTLINK_END"))
+    positions: list[int] = []
+    for start, end in required_pairs:
+        starts = list(re.finditer(rf'(?i)<{start}>', network_text))
+        ends = list(re.finditer(rf'(?i)<{end}>', network_text))
+        if len(starts) != 1 or len(ends) != 1:
+            errors.append(f"expected exactly one {start}/{end} marker pair")
+        elif starts[0].start() >= ends[0].start():
+            errors.append(f"{start} must precede {end}")
+        else:
+            positions.extend((starts[0].start(), ends[0].start()))
+    if len(positions) == 6 and positions != sorted(positions):
+        errors.append("network sections must be ordered PROPERTIES, ROOTLINK, then OUTLINK")
+    opens = len(re.findall(r'(?i)\[LD_NODE\]', network_text))
+    closes = len(re.findall(r'(?i)\[END_LD_NODE\]', network_text))
+    if opens != closes:
+        errors.append("LD_NODE and END_LD_NODE records are unbalanced")
+    parsed = parse_ld_network(network_text)
+    parsed_nodes = parsed["root_nodes"] + parsed["outlink_nodes"]
+    if len(parsed_nodes) != opens:
+        errors.append("every LD_NODE record must be fully contained in ROOTLINK or OUTLINK")
+    for index, node in enumerate(parsed_nodes, 1):
+        if not node["fields"].get("TYPE"):
+            errors.append(f"LD_NODE record {index} is missing TYPE")
+    return errors
 
 
 def property_value(body: str, key: str) -> str | None:

@@ -460,6 +460,7 @@ def _capability_matrix() -> dict[str, Any]:
             "languages": profile.get("languages", []),
             "project_inspection": "QUALIFIED_LIMITED",
             "st_candidate_generation": "QUALIFIED_LIMITED" if "ST" in profile.get("languages", []) else "NOT_QUALIFIED",
+            "ld_network_candidate_generation": "QUALIFIED_LIMITED" if name == "ES2" else "NOT_QUALIFIED",
             "il_mpu_generation": "QUALIFIED_LIMITED" if profile.get("pou_exchange") == "MPU" else "NOT_QUALIFIED",
             "native_compile_check": "NOT_QUALIFIED",
             "plc_connection_upload_download": "NOT_QUALIFIED",
@@ -470,6 +471,7 @@ def _capability_matrix() -> dict[str, Any]:
         "per_profile": per_profile,
         "project_inspection": {"status": "QUALIFIED_LIMITED", "formats": ["ISPSoft 3.24 v8 DVP pointer/footer", "legacy 0xAA/0xAC", "AS v3010"]},
         "source_candidate_generation": {"status": "QUALIFIED_LIMITED", "models": list(MODEL_PROFILES), "never_compiles": True},
+        "ld_network_candidate_generation": {"status": "QUALIFIED_LIMITED", "models": ["ES2"], "raw_network_replacement_only": True, "native_compile": "NOT_QUALIFIED"},
         "project_template_clone": {"status": "QUALIFIED_LIMITED", "same_model_only": True, "native_compile": "NOT_QUALIFIED"},
         "native_blank_project_creation": {"status": "NOT_QUALIFIED"},
         "native_compile_check": {"status": "NOT_QUALIFIED"},
@@ -864,6 +866,83 @@ def ispsoft_write_st_candidate(project_path: str, pou_name: str, code: str,
                       "plc_download": "NOT_RUN"})
     except (OSError, FileTransformError, ValueError) as exc:
         return _json({"status": "CANDIDATE_FAILED", "error": str(exc)})
+
+
+@mcp.tool()
+def ispsoft_write_ld_network_candidate(project_path: str, pou_name: str, network_index: int,
+                                       replacement_network: str, model: str,
+                                       output_path: str = "") -> str:
+    """Replace one raw ES2 LD network in a new candidate; never alter or compile the source."""
+    canonical, model_error = _model(model)
+    if model_error:
+        return _json({"status": "REJECTED_BEFORE_WRITE", "error": model_error})
+    if canonical != "ES2":
+        return _json({"status": "REJECTED_BEFORE_WRITE",
+                      "error": "Raw LD network candidate editing is qualified only for ISPSoft 3.24 DVP ES2 projects."})
+    if not isinstance(network_index, int) or isinstance(network_index, bool) or network_index < 1:
+        return _json({"status": "REJECTED_BEFORE_WRITE",
+                      "error": "network_index must be a positive one-based integer."})
+    validation_errors = containers.validate_ld_network(replacement_network)
+    if validation_errors:
+        return _json({"status": "REJECTED_BEFORE_WRITE", "validation_errors": validation_errors})
+    try:
+        source_path = Path(project_path).expanduser().resolve(strict=True)
+        if source_path.suffix.lower() not in {".isp", ".bak"}:
+            raise FileTransformError("Source project must use .isp or .bak extension.")
+        original = read_bytes(source_path)
+        container = containers.read_container(source_path)
+        info = containers.inspect(container)
+        if str(info.get("project_model") or "").upper() != "ES2":
+            raise FileTransformError("Project metadata does not match the DVP ES2 profile.")
+        pou_matches = [match for match in containers.sections(
+            container.source.decode(container.encoding), "POU")
+                       if containers.property_value(match.group(1), "P_Name") == pou_name]
+        if len(pou_matches) != 1 or containers.property_value(pou_matches[0].group(1), "P_Lang") != "1":
+            raise FileTransformError("Expected exactly one LD POU with the requested name.")
+        source = container.source.decode(container.encoding)
+        pou_match = pou_matches[0]
+        pou_body = pou_match.group(1)
+        network_matches = containers.ld_network_matches(pou_body)
+        if network_index > len(network_matches):
+            raise FileTransformError(f"POU {pou_name!r} has {len(network_matches)} LD networks; index {network_index} is out of range.")
+        old_match = network_matches[network_index - 1]
+        normalized_network = containers.normalized(replacement_network).replace("\n", container.newline)
+        new_source = (source[:pou_match.start(1) + old_match.start(1)] + normalized_network +
+                      source[pou_match.start(1) + old_match.end(1):])
+        candidate_bytes = container.rebuild(new_source.encode(container.encoding))
+        verified = containers.decode(candidate_bytes)
+        verified_source = verified.source.decode(verified.encoding)
+        verified_pous = [match for match in containers.sections(verified_source, "POU")
+                         if containers.property_value(match.group(1), "P_Name") == pou_name]
+        if len(verified_pous) != 1:
+            raise FileTransformError("Candidate readback did not preserve the target POU.")
+        verified_networks = containers.ld_networks(verified_pous[0].group(1))
+        if len(verified_networks) != len(network_matches):
+            raise FileTransformError("Candidate readback changed the POU network count.")
+        if verified_networks[network_index - 1] != normalized_network:
+            raise FileTransformError("Candidate network readback differs from the requested replacement.")
+        if output_path.strip():
+            target = Path(output_path).expanduser().absolute()
+            if target.suffix.lower() != ".isp":
+                raise FileTransformError("Candidate output must use the .isp extension.")
+            if not target.parent.is_dir():
+                raise FileTransformError("Output parent directory must already exist.")
+        else:
+            target = _artifact_path(f"{source_path.stem}-{pou_name}-network-{network_index}-candidate", ".isp")
+        target, backup, companion = _write_project_candidate_and_backup(
+            source_path, target, original, candidate_bytes)
+        return _json({"status": "GENERATED_UNCOMPILED", "candidate": str(target),
+                      "backup": str(backup), "candidate_companion": str(companion) if companion else None,
+                      "model": canonical, "pou_name": pou_name,
+                      "network_index": network_index, "network_count": len(verified_networks),
+                      "source_sha256": _sha(container.source),
+                      "candidate_sha256": _sha(verified.source),
+                      "readback_verified": True, "vendor_compile": "NOT_RUN",
+                      "plc_download": "NOT_RUN"})
+    except (OSError, FileTransformError, ValueError, UnicodeError) as exc:
+        return _json({"status": "CANDIDATE_FAILED", "error": str(exc),
+                      "project_path": project_path, "pou_name": pou_name,
+                      "network_index": network_index})
 
 
 @mcp.tool()

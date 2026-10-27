@@ -260,6 +260,35 @@ DEV_NAME=Y0
             self.assertEqual(structure["network_count"], 2)
             self.assertEqual(structure["node_type_counts"]["root"]["1"], 2)
             self.assertEqual(structure["node_type_counts"]["outlink"]["15"], 2)
+            original = project.read_bytes()
+            replacement = containers.ld_networks(source)[0].replace("DEV_NAME=Y0", "DEV_NAME=Y2")
+            candidate_path = Path(temp) / "candidate.isp"
+            candidate = json.loads(server.ispsoft_write_ld_network_candidate(
+                str(project), "MainProgram", 1, replacement, "ES2", str(candidate_path)))
+            self.assertEqual(candidate["status"], "GENERATED_UNCOMPILED", candidate)
+            self.assertTrue(candidate["readback_verified"])
+            self.assertEqual(project.read_bytes(), original)
+            self.assertEqual(Path(candidate["backup"]).read_bytes(), original)
+            candidate_container = containers.read_container(candidate_path)
+            candidate_source = candidate_container.source.decode(candidate_container.encoding)
+            candidate_pou = next(match.group(1) for match in containers.sections(candidate_source, "POU")
+                                 if containers.property_value(match.group(1), "P_Name") == "MainProgram")
+            candidate_networks = containers.ld_networks(candidate_pou)
+            self.assertIn("DEV_NAME=Y2", candidate_networks[0])
+            self.assertEqual(candidate_networks[1], containers.ld_networks(source)[1])
+            rejected = json.loads(server.ispsoft_write_ld_network_candidate(
+                str(project), "MainProgram", 1, "<BROKEN>", "ES2", str(Path(temp) / "invalid.isp")))
+            self.assertEqual(rejected["status"], "REJECTED_BEFORE_WRITE")
+            self.assertFalse((Path(temp) / "invalid.isp").exists())
+            missing_type = replacement.replace("TYPE=1\n", "")
+            rejected_node = json.loads(server.ispsoft_write_ld_network_candidate(
+                str(project), "MainProgram", 1, missing_type, "ES2", str(Path(temp) / "invalid-node.isp")))
+            self.assertEqual(rejected_node["status"], "REJECTED_BEFORE_WRITE")
+            self.assertTrue(any("missing TYPE" in error for error in rejected_node["validation_errors"]))
+            self.assertFalse((Path(temp) / "invalid-node.isp").exists())
+            wrong_model = json.loads(server.ispsoft_write_ld_network_candidate(
+                str(project), "MainProgram", 1, replacement, "DVP12SE11R"))
+            self.assertEqual(wrong_model["status"], "REJECTED_BEFORE_WRITE")
             out_of_range = json.loads(server.ispsoft_read_ld_network(str(project), "MainProgram", 3))
             self.assertEqual(out_of_range["status"], "NETWORK_INDEX_OUT_OF_RANGE")
             invalid_index = json.loads(server.ispsoft_read_ld_network(str(project), "MainProgram", 0))
@@ -285,6 +314,26 @@ DEV_NAME=Y0
         self.assertEqual(structure["networks"][0]["properties"]["NET_ID"], "1")
         refs = {row["address"]: row for row in xrefs["references"]}
         self.assertIn("M1002", refs)
+        with tempfile.TemporaryDirectory() as temp:
+            disposable_source = Path(temp) / project.name
+            disposable_source.write_bytes(before)
+            companion = project.with_suffix(".ini")
+            if companion.is_file():
+                disposable_source.with_suffix(".ini").write_bytes(companion.read_bytes())
+            raw_network = pou["sections"]["LD_NETWORKS"][0]
+            self.assertIn("NET_BOOKMARK=FALSE", raw_network)
+            replacement = raw_network.replace("NET_BOOKMARK=FALSE", "NET_BOOKMARK=TRUE", 1)
+            candidate_path = Path(temp) / "station-candidate.isp"
+            candidate = json.loads(server.ispsoft_write_ld_network_candidate(
+                str(disposable_source), "Prog0", 1, replacement, "ES2", str(candidate_path)))
+            self.assertEqual(candidate["status"], "GENERATED_UNCOMPILED", candidate)
+            self.assertTrue(candidate["readback_verified"])
+            self.assertEqual(disposable_source.read_bytes(), before)
+            self.assertEqual(Path(candidate["backup"]).read_bytes(), before)
+            candidate_source = containers.read_container(candidate_path).source.decode("cp1252")
+            candidate_pou = next(match.group(1) for match in containers.sections(candidate_source, "POU")
+                                 if containers.property_value(match.group(1), "P_Name") == "Prog0")
+            self.assertIn("NET_BOOKMARK=TRUE", containers.ld_networks(candidate_pou)[0])
         self.assertEqual(project.read_bytes(), before)
 
     def test_device_comment_candidate_merges_and_preserves_input(self) -> None:
@@ -341,7 +390,7 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             "ispsoft_create_project_from_template", "ispsoft_connect",
             "ispsoft_upload_from_plc", "ispsoft_start_monitor", "ispsoft_stop_monitor",
             "ispsoft_get_ide_session", "ispsoft_start_ide", "ispsoft_read_ld_network",
-            "ispsoft_get_ld_program_structure",
+            "ispsoft_get_ld_program_structure", "ispsoft_write_ld_network_candidate",
         }.issubset(names))
 
     def test_ide_session_reports_visible_window_evidence(self) -> None:
@@ -423,6 +472,7 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         capabilities = json.loads(server.ispsoft_get_capabilities())
         self.assertEqual(capabilities["operations"]["runtime_device_read"]["status"], "NOT_QUALIFIED")
         self.assertEqual(capabilities["operations"]["online_monitor"]["status"], "NOT_QUALIFIED")
+        self.assertEqual(capabilities["operations"]["ld_network_candidate_generation"]["models"], ["ES2"])
 
     def test_online_tools_fail_closed_without_contacting_controller(self) -> None:
         self.assertEqual(json.loads(server.ispsoft_connect("DVP32ES2T", "COM1"))["device_contacted"], False)
