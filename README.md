@@ -121,7 +121,7 @@ the detected Delta installation path.
 | `ispsoft_analyze_source` | Build a best-effort text cross-reference. |
 | `ispsoft_validate_device_comments` | Validate DVP-style addresses and optionally emit a JSON map. |
 | `ispsoft_compile_and_check` | Run ISPSoft 3.24 Compile or Check on an ES2 project copy in a private desktop; OCR the Compile Message pane and save compiler sidecars plus screenshot evidence. Set `action` to `"check"` to run Check, or `timeout_seconds` to wait up to five minutes. |
-| `ispsoft_online_status`, `ispsoft_connect`, `ispsoft_upload_from_plc`, `ispsoft_start_monitor`, `ispsoft_runtime_read` | Explicitly report that no PLC transport is qualified; no device is contacted. `ispsoft_list_commgr_drivers` is configuration-only discovery. |
+| `ispsoft_online_status`, `ispsoft_connect`, `ispsoft_upload_from_plc`, `ispsoft_start_monitor`, `ispsoft_runtime_read` | Explicitly report that no PLC transport is qualified; no device is contacted. Connect, upload, and monitor first require an exact saved COMMGR driver name and reject missing, ambiguous, or shared endpoints. `ispsoft_list_commgr_drivers` is configuration-only discovery. |
 | `ispsoft_runtime_write` / `ispsoft_download` | Require a call-level confirmation and `ISPSOFT_WRITES_ENABLED=1`; even then they remain disabled until transport qualification is implemented. |
 | `ispsoft_stop_monitor` | Report that this server has no active monitor session. |
 
@@ -151,9 +151,11 @@ Tests use synthetic files and never open ISPSoft or contact a PLC. The installed
 ISPSoft sample smoke test is read-only. Real project and hardware qualification
 remains model- and version-specific. Native compile/check writes fixed-name
 compiler sidecars beneath the Windows roaming profile despite the worker's
-private `APPDATA`. MCP instances serialize their builds within the current
-Windows logon session. To protect the user's open session, a build is refused
-while the visible ISPSoft window is foreground and is marked unverified if that
-window becomes foreground during the build. In particular, DVP32ES2 COM1
-transfer and monitor behavior still require a controlled physical PLC
-qualification.
+private `APPDATA`. The MCP snapshots those files and restores their previous
+contents after the check only if no user activity occurred and each current
+file still matches the worker's captured output. A concurrent change is
+preserved and makes the result unverified. MCP instances serialize their
+builds within the current Windows logon session. A build is refused while the
+visible ISPSoft window is foreground and is marked unverified if the user
+interacts with ISPSoft during the build. In particular, DVP32ES2 COM1 transfer
+and monitor behavior still require a controlled physical PLC qualification.

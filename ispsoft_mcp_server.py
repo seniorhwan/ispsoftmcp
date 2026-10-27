@@ -700,6 +700,52 @@ def _parse_native_compile_diagnostics(text: str) -> dict[str, Any]:
             "compile_pane_detected": bool(re.search(r"Compile\s+Message", text, re.I))}
 
 
+_COMPILER_SIDECAR_NAMES = (
+    "CompiledCode.txt", "CompiledProgPos.txt", "CompiledProgStep.txt",
+    "AccumlatorStep.txt",
+)
+
+
+def _snapshot_compiler_sidecars(root: Path) -> dict[str, bytes | None]:
+    """Preserve pre-existing ISPSoft compiler state before running a worker."""
+    return {name: read_bytes(root / name) if (root / name).is_file() else None
+            for name in _COMPILER_SIDECAR_NAMES}
+
+
+def _restore_compiler_sidecars(root: Path, before: dict[str, bytes | None],
+                               worker_hashes: dict[str, str]) -> dict[str, Any]:
+    """Restore the prior shared compiler files only when their current bytes
+    still match this worker's captured outputs. Preserve concurrent changes.
+    """
+    restored: list[str] = []
+    conflicts: list[str] = []
+    for name, original in before.items():
+        path = root / name
+        current = read_bytes(path) if path.is_file() else None
+        if current == original:
+            continue
+        expected_hash = worker_hashes.get(name)
+        if current is not None and expected_hash is not None and _sha(current) != expected_hash:
+            conflicts.append(name)
+            continue
+        if current is not None and expected_hash is None:
+            conflicts.append(name)
+            continue
+        if original is None:
+            if current is not None:
+                path.unlink()
+        else:
+            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.restore")
+            try:
+                atomic_write(temporary, original)
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        restored.append(name)
+    return {"success": not conflicts, "restored_files": restored,
+            "concurrent_change_files": conflicts}
+
+
 def _last_user_input_tick() -> int | None:
     """Read the desktop's last physical-input tick to avoid blaming user activity on the worker."""
     if sys.platform != "win32":
@@ -2200,6 +2246,8 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
     native_mutex_handle: int | None = None
     foreground_before: int | None = None
     input_tick_before: int | None = None
+    compiler_root: Path | None = None
+    compiler_sidecars_before: dict[str, bytes | None] | None = None
     try:
         native_mutex_handle = _try_acquire_native_compile_mutex()
         if native_mutex_handle is None:
@@ -2211,6 +2259,9 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
         before_handle = user32.GetForegroundWindow()
         foreground_before = int(before_handle) if before_handle else None
         input_tick_before = _last_user_input_tick()
+        appdata = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+        compiler_root = appdata / "Delta Industrial Automation" / "ISPSoft_New"
+        compiler_sidecars_before = _snapshot_compiler_sidecars(compiler_root)
         launch = json.loads(ispsoft_start_background_session(str(source), 30))
         if not launch.get("success"):
             return _json({"success": False, "status": "BACKGROUND_WORKER_FAILED",
@@ -2276,8 +2327,6 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
 
         if _foreground_process_id() in user_ide_process_ids:
             user_ide_active_during_run = True
-        appdata = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
-        compiler_root = appdata / "Delta Industrial Automation" / "ISPSoft_New"
         changed_outputs: list[dict[str, Any]] = []
         for name in (() if user_ide_active_during_run else
                      ("CompiledCode.txt", "CompiledProgPos.txt", "CompiledProgStep.txt",
@@ -2304,6 +2353,18 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
         user_input_during_run = (input_tick_before is not None and input_tick_after is not None
                                  and input_tick_before != input_tick_after)
         foreground_change_attributable_to_worker = (not foreground_unchanged and not user_input_during_run)
+        if user_ide_active_during_run or user_input_during_run:
+            sidecar_restore = {"success": False, "restored_files": [],
+                               "concurrent_change_files": [],
+                               "status": "SKIPPED_DURING_USER_ACTIVITY"}
+        else:
+            try:
+                sidecar_restore = _restore_compiler_sidecars(
+                    compiler_root, compiler_sidecars_before,
+                    {item["name"]: item["sha256"] for item in changed_outputs})
+            except OSError as exc:
+                sidecar_restore = {"success": False, "restored_files": [],
+                                   "concurrent_change_files": [], "error": str(exc)}
         if pane_seen and error_count == 0 and warning_count is not None:
             status = "NATIVE_CHECK_PASSED" if action == "check" else "NATIVE_COMPILE_PASSED"
             success = True
@@ -2318,6 +2379,9 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
             success = False
         if foreground_change_attributable_to_worker:
             status = "USER_FOREGROUND_CHANGED"
+            success = False
+        if not sidecar_restore["success"] and not user_ide_active_during_run:
+            status = "COMPILER_SIDECAR_RESTORE_FAILED"
             success = False
         return _json({"success": success, "status": status,
                 "vendor_compile": "PASSED" if success else "EXECUTED_RESULT_UNVERIFIED",
@@ -2345,8 +2409,9 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
                 "menu_ocr_text": command.get("menu_ocr_text"),
                 "compiler_outputs": changed_outputs,
                 "compiler_outputs_use_shared_windows_profile": True,
+                "compiler_sidecar_restore": sidecar_restore,
                 "verification": "Native ISPSoft menu command was invoked on a private desktop; a pass requires OCR of the worker's Compile Message pane with readable error and warning counts.",
-                "warning": "ISPSoft 3.24 writes fixed-name compiler sidecars beneath the Windows roaming profile even when the worker receives a private APPDATA. MCP compile calls serialize within this Windows logon session. A background compile is refused or marked unverified if the user's ISPSoft window becomes active."})
+                "warning": "ISPSoft 3.24 writes fixed-name compiler sidecars beneath the Windows roaming profile even when the worker receives a private APPDATA. The MCP restores their previous contents only when they still match this worker's captured output and no user activity occurred. Any conflict fails verification and is preserved. MCP compile calls serialize within this Windows logon session."})
     except (OSError, FileTransformError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         return _json({"success": False, "status": "NATIVE_COMPILE_FAILED",
                       "vendor_compile": "FAILED_OR_UNVERIFIED",
@@ -2371,6 +2436,33 @@ def ispsoft_list_commgr_drivers() -> str:
     return _json(_read_commgr_driver_catalog())
 
 
+def _resolve_commgr_target(commgr_driver: str) -> dict[str, Any]:
+    """Resolve an exact saved COMMGR name and reject shared endpoints offline."""
+    if not isinstance(commgr_driver, str) or not commgr_driver.strip():
+        return {"status": "REJECTED_BEFORE_IO",
+                "error": "commgr_driver must be the exact configured COMMGR driver name."}
+    catalog = _read_commgr_driver_catalog()
+    if catalog.get("status") != "OK":
+        return {"status": "COMMGR_CONFIG_UNAVAILABLE",
+                "configuration_status": catalog.get("status"),
+                "error": "The saved COMMGR target configuration could not be read unambiguously."}
+    driver = next((item for item in catalog.get("drivers", [])
+                   if item.get("name") == commgr_driver), None)
+    if driver is None:
+        return {"status": "DRIVER_NOT_FOUND",
+                "available_drivers": [item.get("name") for item in catalog.get("drivers", [])],
+                "error": "commgr_driver must exactly match a saved COMMGR driver name."}
+    conflict = next((item for item in catalog.get("target_conflicts", [])
+                     if commgr_driver in item.get("drivers", [])), None)
+    if conflict is not None:
+        return {"status": "TARGET_ENDPOINT_CONFLICT", "driver": driver,
+                "conflict": conflict,
+                "error": "This saved driver shares its endpoint with another COMMGR driver; no connection was attempted."}
+    return {"status": "SAVED_TARGET_FOUND", "driver": driver,
+            "identity_verified": False,
+            "warning": "Saved configuration does not prove the live device identity or reachability."}
+
+
 @mcp.tool()
 def ispsoft_online_status(model: str) -> str:
     """Report transport qualification for an exact model without connecting."""
@@ -2392,10 +2484,14 @@ def ispsoft_connect(model: str, commgr_driver: str) -> str:
     canonical, error = _model(model)
     if error:
         return _json({"connected": False, "status": "UNSUPPORTED_MODEL", "error": error})
-    if not isinstance(commgr_driver, str) or not commgr_driver.strip():
-        return _json({"connected": False, "status": "REJECTED_BEFORE_IO", "error": "commgr_driver must be the exact configured COMMGR driver name."})
+    target = _resolve_commgr_target(commgr_driver)
+    if target["status"] != "SAVED_TARGET_FOUND":
+        return _json({"connected": False, "status": target["status"],
+                      "model": canonical, "commgr_driver": commgr_driver,
+                      "device_contacted": False, "target_resolution": target})
     return _json({"connected": False, "status": "TRANSPORT_NOT_QUALIFIED", "model": canonical,
                   "commgr_driver": commgr_driver, "device_contacted": False,
+                  "target_resolution": target,
                   "error": "No qualified COMMGR adapter can establish or verify the active target connection."})
 
 
@@ -2405,8 +2501,15 @@ def ispsoft_upload_from_plc(model: str, commgr_driver: str, output_path: str) ->
     canonical, error = _model(model)
     if error:
         return _json({"success": False, "status": "UNSUPPORTED_MODEL", "error": error})
+    target = _resolve_commgr_target(commgr_driver)
+    if target["status"] != "SAVED_TARGET_FOUND":
+        return _json({"success": False, "status": target["status"],
+                      "model": canonical, "commgr_driver": commgr_driver,
+                      "output_path": output_path, "device_contacted": False,
+                      "target_resolution": target})
     return _json({"success": False, "status": "TRANSPORT_NOT_QUALIFIED", "model": canonical,
                   "commgr_driver": commgr_driver, "output_path": output_path,
+                  "target_resolution": target,
                   "device_contacted": False, "error": "Upload from PLC is not implemented; no device was contacted."})
 
 
@@ -2416,8 +2519,15 @@ def ispsoft_start_monitor(model: str, commgr_driver: str) -> str:
     canonical, error = _model(model)
     if error:
         return _json({"success": False, "status": "UNSUPPORTED_MODEL", "error": error})
+    target = _resolve_commgr_target(commgr_driver)
+    if target["status"] != "SAVED_TARGET_FOUND":
+        return _json({"success": False, "status": target["status"],
+                      "model": canonical, "commgr_driver": commgr_driver,
+                      "monitoring": False, "device_contacted": False,
+                      "target_resolution": target})
     return _json({"success": False, "status": "TRANSPORT_NOT_QUALIFIED", "model": canonical,
                   "commgr_driver": commgr_driver, "monitoring": False, "device_contacted": False,
+                  "target_resolution": target,
                   "error": "Monitor mode is not implemented; no device was contacted."})
 
 

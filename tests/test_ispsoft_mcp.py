@@ -504,6 +504,52 @@ class AnalysisAndSafetyTests(unittest.TestCase):
              patch.object(server.ctypes, "get_last_error", return_value=18):
             self.assertEqual(server._ide_windows_on_desktop(555, 123), [])
 
+    def test_native_check_restores_shared_compiler_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sidecar = root / "CompiledCode.txt"
+            prior = b"prior compile state"
+            worker = b"worker compile state"
+            sidecar.write_bytes(prior)
+            snapshot = server._snapshot_compiler_sidecars(root)
+            sidecar.write_bytes(worker)
+            result = server._restore_compiler_sidecars(
+                root, snapshot, {sidecar.name: server._sha(worker)})
+            current = sidecar.read_bytes()
+        self.assertTrue(result["success"])
+        self.assertEqual(result["restored_files"], ["CompiledCode.txt"])
+        self.assertEqual(current, prior)
+
+    def test_native_check_preserves_concurrent_compiler_sidecar_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sidecar = root / "CompiledCode.txt"
+            sidecar.write_bytes(b"prior compile state")
+            snapshot = server._snapshot_compiler_sidecars(root)
+            sidecar.write_bytes(b"worker compile state")
+            expected_worker_hash = server._sha(sidecar.read_bytes())
+            sidecar.write_bytes(b"concurrent user compile state")
+            result = server._restore_compiler_sidecars(
+                root, snapshot, {sidecar.name: expected_worker_hash})
+            current = sidecar.read_bytes()
+        self.assertFalse(result["success"])
+        self.assertEqual(result["concurrent_change_files"], ["CompiledCode.txt"])
+        self.assertEqual(current, b"concurrent user compile state")
+
+    def test_native_check_removes_worker_sidecars_that_did_not_exist_before(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            snapshot = server._snapshot_compiler_sidecars(root)
+            sidecar = root / "CompiledCode.txt"
+            worker = b"worker compile state"
+            sidecar.write_bytes(worker)
+            result = server._restore_compiler_sidecars(
+                root, snapshot, {sidecar.name: server._sha(worker)})
+            remains = sidecar.exists()
+        self.assertTrue(result["success"])
+        self.assertEqual(result["restored_files"], ["CompiledCode.txt"])
+        self.assertFalse(remains)
+
     def test_start_ide_refuses_to_start_without_a_project(self) -> None:
         with patch.object(server, "_ide_session") as observe, \
              patch.object(server, "_configured_previous_project", return_value=None), \
@@ -759,15 +805,43 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         self.assertEqual(capabilities["operations"]["ld_network_candidate_generation"]["models"], ["ES2"])
 
     def test_online_tools_fail_closed_without_contacting_controller(self) -> None:
-        self.assertEqual(json.loads(server.ispsoft_connect("DVP32ES2T", "COM1"))["device_contacted"], False)
-        uploaded = json.loads(server.ispsoft_upload_from_plc("DVP32ES2T", "COM1", "backup.isp"))
+        target = {"status": "SAVED_TARGET_FOUND", "driver": {"name": "COM1"},
+                  "identity_verified": False}
+        with patch.object(server, "_resolve_commgr_target", return_value=target):
+            connected = json.loads(server.ispsoft_connect("DVP32ES2T", "COM1"))
+            uploaded = json.loads(server.ispsoft_upload_from_plc("DVP32ES2T", "COM1", "backup.isp"))
+            monitor = json.loads(server.ispsoft_start_monitor("ES2", "COM1"))
+        self.assertFalse(connected["device_contacted"])
         self.assertEqual(uploaded["status"], "TRANSPORT_NOT_QUALIFIED")
-        monitor = json.loads(server.ispsoft_start_monitor("ES2", "COM1"))
         self.assertFalse(monitor["monitoring"])
         invalid_read = json.loads(server.ispsoft_runtime_read("ES2", ["X999999"]))
         self.assertEqual(invalid_read["status"], "TRANSPORT_NOT_QUALIFIED")
         invalid_syntax = json.loads(server.ispsoft_runtime_read("ES2", ["Y bad"]))
         self.assertEqual(invalid_syntax["status"], "REJECTED_BEFORE_IO")
+
+    def test_connect_rejects_a_commgr_endpoint_shared_by_multiple_drivers(self) -> None:
+        driver = {"name": "DVP_COM9", "targets": [{"transport": "serial",
+                    "port_number": "9", "station": "3", "shared_endpoint": True,
+                    "shared_driver_names": ["DVP_COM9", "Driver CUY"]}]}
+        conflict = {"transport": "serial", "drivers": ["DVP_COM9", "Driver CUY"],
+                    "port_number": "9"}
+        with patch.object(server, "_read_commgr_driver_catalog", return_value={
+                "status": "OK", "drivers": [driver], "target_conflicts": [conflict]}):
+            result = json.loads(server.ispsoft_connect("ES2", "DVP_COM9"))
+        self.assertEqual(result["status"], "TARGET_ENDPOINT_CONFLICT")
+        self.assertFalse(result["connected"])
+        self.assertFalse(result["device_contacted"])
+
+    def test_commgr_target_resolution_requires_exact_saved_name(self) -> None:
+        driver = {"name": "DVP_COM1", "targets": [{"transport": "serial",
+                    "port_number": "1", "station": "2"}]}
+        with patch.object(server, "_read_commgr_driver_catalog", return_value={
+                "status": "OK", "drivers": [driver], "target_conflicts": []}):
+            exact = server._resolve_commgr_target("DVP_COM1")
+            mismatched_case = server._resolve_commgr_target("dvp_com1")
+        self.assertEqual(exact["status"], "SAVED_TARGET_FOUND")
+        self.assertFalse(exact["identity_verified"])
+        self.assertEqual(mismatched_case["status"], "DRIVER_NOT_FOUND")
 
     def test_commgr_driver_discovery_reads_config_without_contacting_device(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
