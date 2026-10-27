@@ -394,45 +394,71 @@ def ispsoft_get_ide_session() -> str:
                       "diagnosis": "WINDOW_ENUMERATION_FAILED"})
 
 
-@mcp.tool()
-def ispsoft_start_ide(wait_seconds: int = 15) -> str:
-    """Start ISPSoft if stopped and verify the process/window state without opening a project."""
+def _open_project_and_observe(project_path: str, wait_seconds: int) -> dict[str, Any]:
+    """Open one exact project through its Windows file association and observe its title."""
     if sys.platform != "win32":
-        return _json({"success": False, "status": "WINDOWS_REQUIRED"})
+        return {"success": False, "status": "WINDOWS_REQUIRED"}
+    if not isinstance(project_path, str) or not project_path.strip():
+        return {"success": False, "status": "PROJECT_PATH_REQUIRED",
+                "error": "A project path is required; ISPSoft will not be started blank."}
     if not isinstance(wait_seconds, int) or isinstance(wait_seconds, bool) or not 1 <= wait_seconds <= 60:
-        return _json({"success": False, "status": "REJECTED_BEFORE_START",
-                      "error": "wait_seconds must be an integer from 1 to 60."})
-    session = _ide_session()
-    if session["process_running"]:
-        status = "ALREADY_RUNNING" if session["visible_window_count"] else "RUNNING_WITHOUT_VISIBLE_WINDOW"
-        return _json({"success": session["visible_window_count"] > 0, "status": status,
-                      "session": session, "started_by_server": False})
+        return {"success": False, "status": "REJECTED_BEFORE_OPEN",
+                "error": "wait_seconds must be an integer from 1 to 60."}
+    try:
+        path = Path(project_path).expanduser().resolve(strict=True)
+        if path.suffix.lower() not in {".isp", ".bak"}:
+            raise FileTransformError("Project path must refer to an .isp or .bak file.")
+        container = containers.read_container(path)
+        project_info = containers.inspect(container)
+    except (OSError, FileTransformError, ValueError) as exc:
+        return {"success": False, "status": "PROJECT_REJECTED", "error": str(exc),
+                "project_path": project_path}
+
+    # The Windows .isp association registers NewISPSoft.exe "%1". Launch that
+    # same command directly: os.startfile currently fails with WinError 87 on
+    # some managed Windows setups even though the association is present.
     executable = _exe()
     if executable is None:
-        return _json({"success": False, "status": "NOT_INSTALLED",
-                      "error": "ISPSoft executable was not found. Set ISPSOFT_EXE to its installed path."})
+        return {"success": False, "status": "NOT_INSTALLED",
+                "error": "ISPSoft executable was not found. Set ISPSOFT_EXE to its installed path.",
+                "project_path": str(path)}
     try:
-        flags = getattr(subprocess, "DETACHED_PROCESS", 0)
-        process = subprocess.Popen([str(executable)], cwd=str(executable.parent), creationflags=flags)
+        launcher = subprocess.Popen([str(executable), str(path)], cwd=str(executable.parent),
+                                    creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
     except (OSError, subprocess.SubprocessError) as exc:
-        return _json({"success": False, "status": "START_FAILED", "error": str(exc),
-                      "executable": str(executable)})
+        return {"success": False, "status": "OPEN_FAILED", "error": str(exc),
+                "project_path": str(path), "model": project_info.get("project_model"),
+                "executable": str(executable)}
+
+    expected = path.stem.casefold()
     deadline = time.monotonic() + wait_seconds
-    while time.monotonic() < deadline:
-        session = _ide_session()
-        if session["visible_window_count"]:
-            return _json({"success": True, "status": "VISIBLE_WINDOW",
-                          "session": session, "started_by_server": True,
-                          "launcher_pid": process.pid})
-        if process.poll() is not None:
-            return _json({"success": False, "status": "PROCESS_EXITED_BEFORE_WINDOW",
-                          "session": session, "started_by_server": True,
-                          "launcher_pid": process.pid, "exit_code": process.returncode})
+    session = _ide_session()
+    while True:
+        matching = [window for window in session.get("windows", [])
+                    if window.get("visible") and not window.get("minimized")
+                    and expected in str(window.get("title", "")).casefold()]
+        if matching:
+            return {"success": True, "status": "PROJECT_WINDOW_TITLE_MATCH",
+                    "project_path": str(path), "model": project_info.get("project_model"),
+                    "windows": matching, "title_match": True,
+                    "verification": "visible ISPSoft top-level window title contains the exact project filename stem"}
+        if time.monotonic() >= deadline:
+            break
         time.sleep(0.25)
-    return _json({"success": False, "status": "WINDOW_NOT_VISIBLE",
-                  "session": session, "started_by_server": True,
-                  "launcher_pid": process.pid,
-                  "message": "ISPSoft was launched, but no visible top-level window appeared before the timeout."})
+        session = _ide_session()
+    return {"success": False, "status": "OPEN_REQUESTED_UNVERIFIED",
+            "project_path": str(path), "model": project_info.get("project_model"),
+            "launcher_pid": launcher.pid, "executable": str(executable),
+            "session": session, "title_match": False,
+            "message": "Windows received the exact project-file open request, but no visible ISPSoft window title confirmed it."}
+
+
+@mcp.tool()
+def ispsoft_start_ide(project_path: str, wait_seconds: int = 15) -> str:
+    """Open and verify a specific project; refuses to start ISPSoft without a project path."""
+    if sys.platform != "win32":
+        return _json({"success": False, "status": "WINDOWS_REQUIRED"})
+    return _json(_open_project_and_observe(project_path, wait_seconds))
 
 
 @mcp.tool()
@@ -805,18 +831,8 @@ def ispsoft_read_device_comments(project_path: str) -> str:
 
 @mcp.tool()
 def ispsoft_open_project(project_path: str) -> str:
-    """Ask Windows to open a supported project in its registered ISPSoft app."""
-    path = Path(project_path).expanduser().resolve()
-    try:
-        containers.read_container(path)
-        if sys.platform != 'win32':
-            return _json({"success": False, "status": "WINDOWS_REQUIRED", "project_path": str(path)})
-        os.startfile(str(path))  # type: ignore[attr-defined]
-        return _json({"success": True, "status": "OPEN_REQUESTED_UNVERIFIED",
-                      "project_path": str(path),
-                      "message": "Windows received the file-open request; the active ISPSoft project was not inspected."})
-    except (OSError, FileTransformError, ValueError) as exc:
-        return _json({"success": False, "status": "OPEN_FAILED", "error": str(exc), "project_path": str(path)})
+    """Open one exact supported project and verify its filename appears in the ISPSoft window title."""
+    return ispsoft_start_ide(project_path, 15)
 
 
 @mcp.tool()

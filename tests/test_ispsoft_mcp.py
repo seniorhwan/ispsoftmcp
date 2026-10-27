@@ -430,15 +430,47 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         self.assertEqual(session["minimized_window_count"], 1)
         self.assertEqual(session["windows"], [])
 
-    def test_start_ide_does_not_duplicate_an_existing_instance(self) -> None:
-        session = {"process_running": True, "process_ids": [7], "windows": [],
-                   "visible_window_count": 0, "diagnosis": "PROCESS_WITHOUT_TOP_LEVEL_WINDOW"}
-        with patch.object(server, "_ide_session", return_value=session), \
+    def test_start_ide_refuses_to_start_without_a_project(self) -> None:
+        with patch.object(server, "_ide_session") as observe, \
              patch.object(server.subprocess, "Popen") as popen:
-            result = json.loads(server.ispsoft_start_ide())
-        self.assertEqual(result["status"], "RUNNING_WITHOUT_VISIBLE_WINDOW")
+            result = json.loads(server.ispsoft_start_ide(""))
+        self.assertEqual(result["status"], "PROJECT_PATH_REQUIRED")
         self.assertFalse(result["success"])
+        observe.assert_not_called()
         popen.assert_not_called()
+
+    def test_open_project_reports_visible_filename_title_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "station project.isp"
+            project.write_bytes(es2_v8_container())
+            session = {"windows": [{"handle": 42, "title": "station project - Delta ISPSoft",
+                                    "visible": True, "minimized": False}]}
+            with patch.object(server, "_ide_session", return_value=session), \
+                 patch.object(server, "_exe", return_value=Path("C:/Delta/NewISPSoft.exe")), \
+                 patch.object(server.subprocess, "Popen") as popen, \
+                 patch.object(server.sys, "platform", "win32"):
+                result = json.loads(server.ispsoft_open_project(str(project)))
+            popen.assert_called_once()
+            self.assertEqual(popen.call_args.args[0], [str(Path("C:/Delta/NewISPSoft.exe")), str(project.resolve())])
+            self.assertEqual(result["status"], "PROJECT_WINDOW_TITLE_MATCH")
+            self.assertTrue(result["title_match"])
+            self.assertEqual(result["project_path"], str(project.resolve()))
+
+    def test_open_project_does_not_claim_title_match_when_only_blank_window_is_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "station project.isp"
+            project.write_bytes(es2_v8_container())
+            session = {"windows": [{"handle": 42, "title": "Delta ISPSoft",
+                                    "visible": True, "minimized": False}]}
+            with patch.object(server, "_ide_session", return_value=session), \
+                 patch.object(server, "_exe", return_value=Path("C:/Delta/NewISPSoft.exe")), \
+                 patch.object(server.subprocess, "Popen"), \
+                 patch.object(server.sys, "platform", "win32"), \
+                 patch.object(server.time, "monotonic", side_effect=[0.0, 16.0]), \
+                 patch.object(server.time, "sleep"):
+                result = json.loads(server.ispsoft_open_project(str(project)))
+            self.assertEqual(result["status"], "OPEN_REQUESTED_UNVERIFIED")
+            self.assertFalse(result["title_match"])
 
     def test_windows_safe_atomic_artifact_write_refuses_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

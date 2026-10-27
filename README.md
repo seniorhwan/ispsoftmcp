@@ -78,7 +78,7 @@ the detected Delta installation path.
 |---|---|
 | `ispsoft_get_status` | Detect installed/running ISPSoft, COMMGR, and the DVP ES2 simulator. Presence is not a connection check. |
 | `ispsoft_get_ide_session` | Report ISPSoft process IDs and visible top-level window metadata. Does not identify the open project. |
-| `ispsoft_start_ide` | Start ISPSoft if stopped and verify a visible window; does not open or modify a project. |
+| `ispsoft_start_ide` | Open a required project path through Windows' ISPSoft file association and verify that its filename appears in a visible ISPSoft window title. Refuses to start ISPSoft blank. |
 | `ispsoft_get_capabilities` | Separate detected ISPSoft models from MCP-qualified operation profiles. |
 | `ispsoft_list_supported_plc_types` | Show the installed model catalog and exact MCP operation profiles. |
 | `ispsoft_list_projects` | Find and inspect ISPSoft project files in a requested folder. |
@@ -92,7 +92,7 @@ the detected Delta installation path.
 | `ispsoft_read_device_comments` | Read device comments from a project. |
 | `ispsoft_get_cross_references` | Build a best-effort reference list for one POU. |
 | `ispsoft_get_memory_usage_map` | Read declared ranges from `SYSTEM_VAR`. |
-| `ispsoft_open_project` | Ask Windows to open a recognized project; active project is not verified. |
+| `ispsoft_open_project` | Open a recognized project and report visible title-match evidence; reports unverified if Windows does not expose a matching ISPSoft window. |
 | `ispsoft_write_st_candidate` | Patch an existing ST POU into a new `.isp` candidate with a backup. |
 | `ispsoft_write_ld_network_candidate` | Replace one raw ES2 LD network into a backed-up `.isp` candidate; structural checks only, never compile or download. |
 | `ispsoft_write_device_comment_candidate` | Merge comments into a new ES2 project candidate. |
