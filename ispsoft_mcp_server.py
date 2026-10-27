@@ -2764,13 +2764,15 @@ def ispsoft_online_status(model: str) -> str:
     """Report transport qualification for an exact model without connecting."""
     canonical, error = _model(model)
     if error:
-        return _json({"connected": False, "status": "UNSUPPORTED_MODEL", "error": error})
+        return _json({"connected": False, "status": "UNSUPPORTED_MODEL",
+                      "device_contacted": False, "error": error})
     simulator = _installed(DVP_ES2_SIMULATOR_CANDIDATES)
     simulator_running = _process_running(simulator.name) if simulator else False
     return _json({"connected": False, "status": "TRANSPORT_NOT_QUALIFIED",
                   "model": canonical, "commgr_running": _process_running("COMMGR.exe"),
                   "dvp_es2_simulator_installed": simulator is not None,
                   "dvp_es2_simulator_running": simulator_running,
+                  "device_contacted": False,
                   "message": "COMMGR or simulator process presence alone does not prove an active ISPSoft connection; no live transport is qualified and no device was contacted."})
 
 
