@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import ctypes
 import ctypes.wintypes as wintypes
+import configparser
 import hashlib
 import json
 import os
@@ -271,6 +272,28 @@ def _ide_session() -> dict[str, Any]:
             "visible_window_count": len(visible), "diagnosis": diagnosis}
 
 
+def _configured_previous_project() -> Path | None:
+    """Read ISPSoft's saved previous project only when its reopen flag is enabled."""
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    settings = Path(appdata) / "Delta Industrial Automation" / "ISPSoft_New" / "ISPSoft.ini"
+    if not settings.is_file():
+        return None
+    config = configparser.ConfigParser(interpolation=None)
+    try:
+        with settings.open("r", encoding="cp1252") as stream:
+            config.read_file(stream)
+        if not config.getboolean("MainForm", "loadPreviousPrj", fallback=False):
+            return None
+        saved_path = config.get("Project", "ProjectName", fallback="").strip().strip('"')
+        if not saved_path:
+            saved_path = config.get("MainForm", "MRUfile0", fallback="").strip().strip('"')
+        return Path(saved_path).expanduser() if saved_path else None
+    except (OSError, configparser.Error, ValueError):
+        return None
+
+
 def _artifact_path(prefix: str, suffix: str) -> Path:
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -414,16 +437,24 @@ def _open_project_and_observe(project_path: str, wait_seconds: int) -> dict[str,
         return {"success": False, "status": "PROJECT_REJECTED", "error": str(exc),
                 "project_path": project_path}
 
-    # The Windows .isp association registers NewISPSoft.exe "%1". Launch that
-    # same command directly: os.startfile currently fails with WinError 87 on
-    # some managed Windows setups even though the association is present.
+    # ISPSoft's saved previous-project setting is the only supported no-argument
+    # launch path. Use it only if it identifies this exact project; otherwise
+    # follow the registered .isp command NewISPSoft.exe "%1".
     executable = _exe()
     if executable is None:
         return {"success": False, "status": "NOT_INSTALLED",
                 "error": "ISPSoft executable was not found. Set ISPSOFT_EXE to its installed path.",
                 "project_path": str(path)}
+    configured_previous = _configured_previous_project()
+    use_previous_project_setting = False
+    if configured_previous is not None:
+        try:
+            use_previous_project_setting = configured_previous.resolve(strict=True) == path
+        except OSError:
+            pass
+    command = [str(executable)] if use_previous_project_setting else [str(executable), str(path)]
     try:
-        launcher = subprocess.Popen([str(executable), str(path)], cwd=str(executable.parent),
+        launcher = subprocess.Popen(command, cwd=str(executable.parent),
                                     creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
     except (OSError, subprocess.SubprocessError) as exc:
         return {"success": False, "status": "OPEN_FAILED", "error": str(exc),
@@ -441,6 +472,7 @@ def _open_project_and_observe(project_path: str, wait_seconds: int) -> dict[str,
             return {"success": True, "status": "PROJECT_WINDOW_TITLE_MATCH",
                     "project_path": str(path), "model": project_info.get("project_model"),
                     "windows": matching, "title_match": True,
+                    "launch_mode": "ISPSoft_PREVIOUS_PROJECT_SETTING" if use_previous_project_setting else "PROJECT_FILE_ARGUMENT",
                     "verification": "visible ISPSoft top-level window title contains the exact project filename stem"}
         if time.monotonic() >= deadline:
             break
@@ -449,15 +481,25 @@ def _open_project_and_observe(project_path: str, wait_seconds: int) -> dict[str,
     return {"success": False, "status": "OPEN_REQUESTED_UNVERIFIED",
             "project_path": str(path), "model": project_info.get("project_model"),
             "launcher_pid": launcher.pid, "executable": str(executable),
+            "launch_mode": "ISPSoft_PREVIOUS_PROJECT_SETTING" if use_previous_project_setting else "PROJECT_FILE_ARGUMENT",
             "session": session, "title_match": False,
             "message": "Windows received the exact project-file open request, but no visible ISPSoft window title confirmed it."}
 
 
 @mcp.tool()
-def ispsoft_start_ide(project_path: str, wait_seconds: int = 15) -> str:
-    """Open and verify a specific project; refuses to start ISPSoft without a project path."""
+def ispsoft_start_ide(project_path: str = "", wait_seconds: int = 15) -> str:
+    """Open a specific or ISPSoft-configured previous project; never starts blank."""
     if sys.platform != "win32":
         return _json({"success": False, "status": "WINDOWS_REQUIRED"})
+    if not isinstance(project_path, str):
+        return _json({"success": False, "status": "PROJECT_REJECTED",
+                      "error": "project_path must be text or empty to use ISPSoft's configured previous project."})
+    if not project_path.strip():
+        configured = _configured_previous_project()
+        if configured is None:
+            return _json({"success": False, "status": "PREVIOUS_PROJECT_NOT_CONFIGURED",
+                          "error": "No ISPSoft previous project is configured; provide project_path. ISPSoft will not be started blank."})
+        project_path = str(configured)
     return _json(_open_project_and_observe(project_path, wait_seconds))
 
 

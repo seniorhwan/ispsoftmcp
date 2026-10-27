@@ -78,7 +78,7 @@ the detected Delta installation path.
 |---|---|
 | `ispsoft_get_status` | Detect installed/running ISPSoft, COMMGR, and the DVP ES2 simulator. Presence is not a connection check. |
 | `ispsoft_get_ide_session` | Report ISPSoft process IDs and visible top-level window metadata. Does not identify the open project. |
-| `ispsoft_start_ide` | Open a required project path through Windows' ISPSoft file association and verify that its filename appears in a visible ISPSoft window title. Refuses to start ISPSoft blank. |
+| `ispsoft_start_ide` | Open an explicit project, or ISPSoft's configured previous project when no path is supplied; verify that its filename appears in a visible ISPSoft window title. Refuses to start ISPSoft blank. |
 | `ispsoft_get_capabilities` | Separate detected ISPSoft models from MCP-qualified operation profiles. |
 | `ispsoft_list_supported_plc_types` | Show the installed model catalog and exact MCP operation profiles. |
 | `ispsoft_list_projects` | Find and inspect ISPSoft project files in a requested folder. |

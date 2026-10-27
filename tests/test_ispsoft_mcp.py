@@ -432,12 +432,36 @@ class AnalysisAndSafetyTests(unittest.TestCase):
 
     def test_start_ide_refuses_to_start_without_a_project(self) -> None:
         with patch.object(server, "_ide_session") as observe, \
+             patch.object(server, "_configured_previous_project", return_value=None), \
              patch.object(server.subprocess, "Popen") as popen:
             result = json.loads(server.ispsoft_start_ide(""))
-        self.assertEqual(result["status"], "PROJECT_PATH_REQUIRED")
+        self.assertEqual(result["status"], "PREVIOUS_PROJECT_NOT_CONFIGURED")
         self.assertFalse(result["success"])
         observe.assert_not_called()
         popen.assert_not_called()
+
+    def test_start_ide_uses_ispsoft_configured_previous_project_without_cli_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "station project.isp"
+            project.write_bytes(es2_v8_container())
+            settings = root / "Delta Industrial Automation" / "ISPSoft_New" / "ISPSoft.ini"
+            settings.parent.mkdir(parents=True)
+            settings.write_text(
+                "[MainForm]\nloadPreviousPrj=1\n[Project]\nProjectName=" + str(project) + "\n",
+                encoding="cp1252")
+            session = {"windows": [{"handle": 42, "title": "station project - Delta ISPSoft",
+                                    "visible": True, "minimized": False}]}
+            with patch.dict(server.os.environ, {"APPDATA": str(root)}), \
+                 patch.object(server, "_exe", return_value=Path("C:/Delta/NewISPSoft.exe")), \
+                 patch.object(server, "_ide_session", return_value=session), \
+                 patch.object(server.subprocess, "Popen") as popen, \
+                 patch.object(server.sys, "platform", "win32"):
+                result = json.loads(server.ispsoft_start_ide())
+            self.assertEqual(result["status"], "PROJECT_WINDOW_TITLE_MATCH")
+            self.assertEqual(result["project_path"], str(project.resolve()))
+            self.assertEqual(result["launch_mode"], "ISPSoft_PREVIOUS_PROJECT_SETTING")
+            self.assertEqual(popen.call_args.args[0], [str(Path("C:/Delta/NewISPSoft.exe"))])
 
     def test_open_project_reports_visible_filename_title_match(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
