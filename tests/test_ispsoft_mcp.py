@@ -204,6 +204,46 @@ class ContainerTests(unittest.TestCase):
             self.assertEqual(original_path.read_bytes(), original)
             self.assertEqual(containers.inspect(containers.read_container(result["candidate"]))["project_model"], "ES2")
 
+    def test_local_variables_candidate_preserves_original_and_verifies_readback(self) -> None:
+        local_variables = "<VAR>\n{\nH87 : WORD :=  [@D7000@] {VAR}\n(*\nStart request\n*)\n}\n</VAR>\n"
+        source = ES2_SOURCE.replace("<LOCAL_VAR>\r\r\n</LOCAL_VAR>",
+                                    "<LOCAL_VAR>\r\r\n" + local_variables.replace("\n", "\r\r\n") +
+                                    "</LOCAL_VAR>")
+        original = es2_v8_container(source)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "es2.isp"
+            project.write_bytes(original)
+            companion = project.with_suffix(".ini")
+            companion.write_bytes(b"[PRJ_DATA]\r\nDEVICE_TYPE=1\r\n")
+            candidate_path = root / "candidate.isp"
+            result = json.loads(server.ispsoft_write_local_variables_candidate(
+                str(project), "MainProgram", local_variables, "DVP32ES2T", str(candidate_path)))
+            self.assertEqual(result["status"], "GENERATED_UNCOMPILED", result)
+            self.assertTrue(result["readback_verified"])
+            self.assertEqual(project.read_bytes(), original)
+            self.assertEqual(Path(result["backup"]).read_bytes(), original)
+            self.assertEqual(Path(result["candidate_companion"]).read_bytes(), companion.read_bytes())
+            candidate = containers.read_container(candidate_path)
+            candidate_source = candidate.source.decode(candidate.encoding)
+            candidate_pou = next(match.group(1) for match in containers.sections(candidate_source, "POU")
+                                 if containers.property_value(match.group(1), "P_Name") == "MainProgram")
+            self.assertEqual(containers.normalized(containers.sections(candidate_pou, "LOCAL_VAR")[0].group(1)),
+                             containers.normalized(local_variables))
+
+    def test_local_variables_candidate_rejects_project_delimiters_before_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "es2.isp"
+            original = es2_v8_container()
+            project.write_bytes(original)
+            result = json.loads(server.ispsoft_write_local_variables_candidate(
+                str(project), "MainProgram", "</TASK>", "ES2", str(root / "bad.isp")))
+            self.assertEqual(result["status"], "CANDIDATE_FAILED")
+            self.assertFalse((root / "bad.isp").exists())
+            self.assertFalse((root / "bad.before.isp").exists())
+            self.assertEqual(project.read_bytes(), original)
+
     def test_project_overview_and_pou_read(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp) / 'es2.isp'
@@ -396,6 +436,7 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             "ispsoft_start_background_session", "ispsoft_get_background_sessions",
             "ispsoft_stop_background_session", "ispsoft_compile_and_check",
             "ispsoft_list_commgr_drivers", "ispsoft_list_serial_ports",
+            "ispsoft_write_local_variables_candidate",
         }.issubset(names))
 
     def test_serial_port_inventory_does_not_claim_device_identity_or_contact(self) -> None:
@@ -423,6 +464,9 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         self.assertEqual(matrix["per_profile"]["ES2"]["native_compile_check"],
                          "QUALIFIED_LIMITED_ISPSOFT_3_24_ES2")
         self.assertEqual(matrix["native_compile_check"]["models"], ["ES2"])
+        self.assertEqual(matrix["local_variable_candidate_generation"]["models"], ["ES2"])
+        self.assertEqual(matrix["per_profile"]["ES2"]["local_variable_candidate_generation"],
+                         "QUALIFIED_LIMITED")
         self.assertEqual(matrix["plc_connection"]["status"], "NOT_QUALIFIED")
 
     def test_native_compile_ocr_summary_reports_errors_and_missing_counts(self) -> None:

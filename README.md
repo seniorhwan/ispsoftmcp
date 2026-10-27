@@ -19,6 +19,11 @@ that an MCP operation works on it.
   new filenames when present. The result is `GENERATED_UNCOMPILED`; this
   candidate-generation tool does not compile or claim IDE readback. Use the
   separate native compile/check tool for qualified ES2 projects.
+- Local-variable/symbol section replacement to a **new ES2 candidate file**.
+  The caller supplies the complete inner `LOCAL_VAR` text returned by
+  `ispsoft_read_pou`; the original project and its companion file are preserved,
+  and the candidate section is verified by decoding it again. This is a raw
+  native-section edit, so the candidate remains uncompiled until native Check.
 - Project overview, POU-section reads, device-comment reads, and comment
   candidate generation for DVP ES2. LD network blocks are returned as raw
   native project text and can be read one at a time or summarized as ordered
@@ -118,6 +123,7 @@ the detected Delta installation path.
 | `ispsoft_get_memory_usage_map` | Read declared ranges from `SYSTEM_VAR`. |
 | `ispsoft_open_project` | Interactive-only: open a project in the user's IDE; background agents should use an isolated background session. |
 | `ispsoft_write_st_candidate` | Patch an existing ST POU into a new `.isp` candidate with a backup. |
+| `ispsoft_write_local_variables_candidate` | Replace one ES2 POU's native `LOCAL_VAR` symbol section in a new backed-up candidate, with exact decoded readback verification. |
 | `ispsoft_write_ld_network_candidate` | Replace one raw ES2 LD network into a backed-up `.isp` candidate; structural checks only, never compile or download. |
 | `ispsoft_write_device_comment_candidate` | Merge comments into a new ES2 project candidate. |
 | `ispsoft_validate_il` | Validate supported DVP IL and prove MPU serialization/readback. |

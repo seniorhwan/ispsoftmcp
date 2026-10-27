@@ -1685,6 +1685,7 @@ def _capability_matrix() -> dict[str, Any]:
             "languages": profile.get("languages", []),
             "project_inspection": "QUALIFIED_LIMITED",
             "st_candidate_generation": "QUALIFIED_LIMITED" if "ST" in profile.get("languages", []) else "NOT_QUALIFIED",
+            "local_variable_candidate_generation": "QUALIFIED_LIMITED" if name == "ES2" else "NOT_QUALIFIED",
             "ld_network_candidate_generation": "QUALIFIED_LIMITED" if name == "ES2" else "NOT_QUALIFIED",
             "il_mpu_generation": "QUALIFIED_LIMITED" if profile.get("pou_exchange") == "MPU" else "NOT_QUALIFIED",
             "native_compile_check": "QUALIFIED_LIMITED_ISPSOFT_3_24_ES2" if name == "ES2" else "NOT_QUALIFIED",
@@ -1696,6 +1697,10 @@ def _capability_matrix() -> dict[str, Any]:
         "per_profile": per_profile,
         "project_inspection": {"status": "QUALIFIED_LIMITED", "formats": ["ISPSoft 3.24 v8 DVP pointer/footer", "legacy 0xAA/0xAC", "AS v3010"]},
         "source_candidate_generation": {"status": "QUALIFIED_LIMITED", "models": list(MODEL_PROFILES), "never_compiles": True},
+        "local_variable_candidate_generation": {"status": "QUALIFIED_LIMITED", "models": ["ES2"],
+                                                "input": "complete native LOCAL_VAR inner text",
+                                                "readback": "exact decoded section match",
+                                                "native_compile": "separate ISPSoft 3.24 Check/Compile"},
         "ld_network_candidate_generation": {"status": "QUALIFIED_LIMITED", "models": ["ES2"], "raw_network_replacement_only": True, "native_compile": "NOT_QUALIFIED"},
         "project_template_clone": {"status": "QUALIFIED_LIMITED", "same_model_only": True, "native_compile": "NOT_QUALIFIED"},
         "native_blank_project_creation": {"status": "NOT_QUALIFIED"},
@@ -2083,6 +2088,89 @@ def ispsoft_write_st_candidate(project_path: str, pou_name: str, code: str,
                       "vendor_compile": "NOT_RUN: ISPSoft native build/check automation is not qualified",
                       "plc_download": "NOT_RUN"})
     except (OSError, FileTransformError, ValueError) as exc:
+        return _json({"status": "CANDIDATE_FAILED", "error": str(exc)})
+
+
+@mcp.tool()
+def ispsoft_write_local_variables_candidate(project_path: str, pou_name: str,
+                                             variables: str, model: str,
+                                             output_path: str = "") -> str:
+    """Replace one POU's native local-symbol declaration section in a backed-up candidate.
+
+    ``variables`` is the complete inner text of the section returned by
+    ``ispsoft_read_pou`` under ``sections.LOCAL_VAR``. The original file is
+    retained; this tool does not interpret ladder-node semantics or compile.
+    """
+    canonical, model_error = _model(model)
+    if model_error:
+        return _json({"status": "REJECTED_BEFORE_WRITE", "error": model_error})
+    if canonical != "ES2":
+        return _json({"status": "REJECTED_BEFORE_WRITE",
+                      "error": "Local-variable candidate generation is currently qualified only for the DVP ES2 project container."})
+    if not isinstance(project_path, str) or not project_path.strip():
+        return _json({"status": "REJECTED_BEFORE_READ", "error": "project_path must be a non-empty path."})
+    if not isinstance(pou_name, str) or not pou_name.strip() or len(pou_name) > 128:
+        return _json({"status": "REJECTED_BEFORE_READ", "error": "pou_name must be 1-128 characters."})
+    if not isinstance(variables, str) or not variables.strip():
+        return _json({"status": "REJECTED_BEFORE_WRITE",
+                      "error": "variables must be non-empty text."})
+    try:
+        if len(variables.encode("utf-8")) > 1_000_000:
+            return _json({"status": "REJECTED_BEFORE_WRITE",
+                          "error": "variables must be no larger than 1 MB."})
+    except UnicodeEncodeError:
+        return _json({"status": "REJECTED_BEFORE_WRITE",
+                      "error": "variables contains invalid Unicode."})
+    try:
+        source_path = Path(project_path).expanduser().resolve(strict=True)
+        original = read_bytes(source_path)
+        container = containers.read_container(source_path)
+        project_info = containers.inspect(container)
+        if project_info.get("project_model") != "ES2":
+            raise FileTransformError("Project metadata does not match the DVP ES2 profile.")
+        source = container.source.decode(container.encoding)
+        matching_pous = [match for match in containers.sections(source, "POU")
+                         if containers.property_value(match.group(1), "P_Name") == pou_name]
+        if len(matching_pous) != 1:
+            raise FileTransformError(f"Expected one POU named {pou_name!r}; found {len(matching_pous)}.")
+        local_sections = containers.sections(matching_pous[0].group(1), "LOCAL_VAR")
+        if len(local_sections) != 1:
+            raise FileTransformError("Expected exactly one LOCAL_VAR section in the named POU.")
+        # Only the observed VAR wrapper is valid markup in this ES2 table;
+        # other tags could escape the POU section or corrupt project structure.
+        variable_tags = re.findall(r"<(/?)([A-Za-z_][A-Za-z0-9_]*)\b[^>]*>", variables)
+        if any(tag.upper() != "VAR" for _, tag in variable_tags):
+            raise FileTransformError("Replacement contains markup outside the supported VAR wrapper.")
+        if sum(not closing for closing, _ in variable_tags) != sum(bool(closing) for closing, _ in variable_tags):
+            raise FileTransformError("Replacement VAR wrapper is unbalanced.")
+
+        candidate_bytes = containers.patch_st(container, pou_name, None, variables)
+        verified = containers.decode(candidate_bytes)
+        verified_source = verified.source.decode(verified.encoding)
+        verified_pous = [match for match in containers.sections(verified_source, "POU")
+                         if containers.property_value(match.group(1), "P_Name") == pou_name]
+        if len(verified_pous) != 1:
+            raise FileTransformError("Candidate readback no longer contains exactly one target POU.")
+        verified_sections = containers.sections(verified_pous[0].group(1), "LOCAL_VAR")
+        if (len(verified_sections) != 1 or
+                containers.normalized(verified_sections[0].group(1)) != containers.normalized(variables)):
+            raise FileTransformError("Candidate local-variable readback differs from the requested section.")
+        if output_path.strip():
+            target = Path(output_path).expanduser().absolute()
+            if not target.parent.is_dir():
+                raise FileTransformError("Output parent directory must already exist.")
+        else:
+            target = _artifact_path(f"{source_path.stem}-{pou_name}-local-vars-candidate", ".isp")
+        target, backup_path, companion_path = _write_project_candidate_and_backup(
+            source_path, target, original, candidate_bytes)
+        return _json({"status": "GENERATED_UNCOMPILED", "candidate": str(target),
+                      "backup": str(backup_path),
+                      "candidate_companion": str(companion_path) if companion_path else None,
+                      "model": canonical, "pou_name": pou_name,
+                      "source_sha256": _sha(verified.source),
+                      "readback_verified": True, "vendor_compile": "NOT_RUN",
+                      "plc_download": "NOT_RUN"})
+    except (OSError, FileTransformError, UnicodeError, ValueError) as exc:
         return _json({"status": "CANDIDATE_FAILED", "error": str(exc)})
 
 
