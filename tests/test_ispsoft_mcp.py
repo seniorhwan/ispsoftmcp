@@ -393,6 +393,7 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             "ispsoft_get_ld_program_structure", "ispsoft_write_ld_network_candidate",
             "ispsoft_start_background_session", "ispsoft_get_background_sessions",
             "ispsoft_stop_background_session", "ispsoft_compile_and_check",
+            "ispsoft_list_commgr_drivers",
         }.issubset(names))
 
     def test_native_compile_ocr_summary_accepts_vendor_zero_as_letter_o(self) -> None:
@@ -760,6 +761,35 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         self.assertEqual(invalid_read["status"], "TRANSPORT_NOT_QUALIFIED")
         invalid_syntax = json.loads(server.ispsoft_runtime_read("ES2", ["Y bad"]))
         self.assertEqual(invalid_syntax["status"], "REJECTED_BEFORE_IO")
+
+    def test_commgr_driver_discovery_reads_config_without_contacting_device(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "DriverInfo.dri"
+            config.write_text(
+                '<DriverInfo><Driver DriverID="162" DriverName="DVP-serial" '
+                'CommInterface="1" DriverStatus="1"><ComInfo PortNumber="1" '
+                'PLCStationNum="2"/></Driver><Driver DriverID="7" DriverName="DVP-net" '
+                'CommInterface="3" DriverStatus="2"><NetInfo StationID="0">'
+                '<RemoteIP RemoteIPAddr="127.0.0.1" RemotePort="502" '
+                'RemoteDeviceTypeStr="DVP-ES2"/></NetInfo></Driver></DriverInfo>',
+                encoding="utf-8")
+            result = server._read_commgr_driver_catalog(config)
+        self.assertEqual(result["status"], "OK")
+        self.assertFalse(result["device_contacted"])
+        self.assertEqual(result["driver_count"], 2)
+        self.assertEqual(result["drivers"][0]["targets"][0]["port_number"], "1")
+        self.assertEqual(result["drivers"][1]["targets"][0]["configured_model"], "DVP-ES2")
+
+    def test_commgr_driver_discovery_fails_closed_on_duplicate_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "DriverInfo.dri"
+            config.write_text(
+                '<DriverInfo><Driver DriverID="1" DriverName="same"/>'
+                '<Driver DriverID="2" DriverName="SAME"/></DriverInfo>',
+                encoding="utf-8")
+            result = server._read_commgr_driver_catalog(config)
+        self.assertEqual(result["status"], "CONFIG_AMBIGUOUS")
+        self.assertFalse(result["device_contacted"])
 
     def test_simulator_presence_is_discovered_but_never_means_connected(self) -> None:
         sim = Path(r"C:\Delta\DVPSimulator_ES2.exe")

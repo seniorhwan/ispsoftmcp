@@ -241,6 +241,79 @@ def _installed(candidates: tuple[Path, ...]) -> Path | None:
     return next((path for path in candidates if path.is_file()), None)
 
 
+def _commgr_driver_config_path() -> Path | None:
+    commgr = _installed(COMMGR_CANDIDATES)
+    if commgr is None:
+        return None
+    candidate = commgr.parent / "DriverInfo.dri"
+    return candidate if candidate.is_file() else None
+
+
+def _read_commgr_driver_catalog(path: Path | None = None) -> dict[str, Any]:
+    """Read COMMGR's saved driver catalog without starting COMMGR or contacting a device."""
+    config_path = path or _commgr_driver_config_path()
+    if config_path is None:
+        return {"status": "CONFIG_NOT_FOUND", "drivers": [], "device_contacted": False}
+    try:
+        if config_path.stat().st_size > 4 * 1024 * 1024:
+            return {"status": "CONFIG_TOO_LARGE", "path": str(config_path),
+                    "drivers": [], "device_contacted": False}
+        root = ET.parse(config_path).getroot()
+    except (OSError, ET.ParseError) as exc:
+        return {"status": "CONFIG_UNREADABLE", "path": str(config_path),
+                "drivers": [], "device_contacted": False, "error": str(exc)}
+    if root.tag != "DriverInfo":
+        return {"status": "CONFIG_UNRECOGNIZED", "path": str(config_path),
+                "drivers": [], "device_contacted": False}
+
+    interface_names = {"1": "serial", "2": "vendor_specific", "3": "ethernet"}
+    drivers: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    seen_ids: set[str] = set()
+    for driver in root.findall("Driver"):
+        name = (driver.get("DriverName") or "").strip()
+        driver_id = (driver.get("DriverID") or "").strip()
+        if (not name or not driver_id or name.casefold() in seen
+                or driver_id in seen_ids):
+            return {"status": "CONFIG_AMBIGUOUS", "path": str(config_path),
+                    "drivers": [], "device_contacted": False,
+                    "error": "COMMGR driver names and IDs must be present and names unique."}
+        seen.add(name.casefold())
+        seen_ids.add(driver_id)
+        interface = (driver.get("CommInterface") or "").strip()
+        entry: dict[str, Any] = {
+            "name": name, "driver_id": driver_id,
+            "interface_code": interface,
+            "interface": interface_names.get(interface, "unknown"),
+            "vendor_status_code": (driver.get("DriverStatus") or "").strip(),
+            "targets": [],
+        }
+        com = driver.find("ComInfo")
+        if com is not None:
+            entry["targets"].append({
+                "transport": "serial",
+                "port_number": com.get("PortNumber"),
+                "station": com.get("PLCStationNum"),
+            })
+        net = driver.find("NetInfo")
+        if net is not None:
+            for remote in net.findall("RemoteIP"):
+                entry["targets"].append({
+                    "transport": "ethernet",
+                    "address": remote.get("RemoteIPAddr"),
+                    "port": remote.get("RemotePort"),
+                    "station": net.get("StationID"),
+                    "configured_model": remote.get("RemoteDeviceTypeStr"),
+                    "comment": remote.get("RemoteComment"),
+                })
+        if not entry["targets"]:
+            entry["targets"].append({"transport": entry["interface"]})
+        drivers.append(entry)
+    return {"status": "OK", "path": str(config_path), "drivers": drivers,
+            "driver_count": len(drivers), "device_contacted": False,
+            "warning": "This is saved COMMGR configuration only. Driver status and target identity have not been verified live."}
+
+
 def _process_running(name: str) -> bool:
     return bool(_process_ids(name))
 
@@ -2253,6 +2326,12 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
                     _release_native_compile_mutex(native_mutex_handle)
             finally:
                 _NATIVE_COMPILE_LOCK.release()
+
+
+@mcp.tool()
+def ispsoft_list_commgr_drivers() -> str:
+    """List saved COMMGR driver targets without starting COMMGR or contacting a PLC."""
+    return _json(_read_commgr_driver_catalog())
 
 
 @mcp.tool()

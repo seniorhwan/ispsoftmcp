@@ -92,6 +92,7 @@ the detected Delta installation path.
 | Tool | Purpose |
 |---|---|
 | `ispsoft_get_status` | Detect installed/running ISPSoft, COMMGR, and the DVP ES2 simulator. Presence is not a connection check. |
+| `ispsoft_list_commgr_drivers` | Read the saved COMMGR driver/endpoint catalog without starting COMMGR or contacting a device. Returned targets describe configuration only; they are not proof of identity or reachability. |
 | `ispsoft_get_ide_session` | Report ISPSoft process IDs and visible top-level window metadata. Does not identify the open project. |
 | `ispsoft_start_ide` | Interactive-only: open an explicit project or ISPSoft's configured previous project. Does not start blank. Background agents should not call this tool. |
 | `ispsoft_start_background_session` | Open the requested project, or ISPSoft's configured previous project when `project_path` is omitted, on a private Windows desktop using a disposable copy and private settings profile. It refuses to start blank. |
@@ -120,7 +121,7 @@ the detected Delta installation path.
 | `ispsoft_analyze_source` | Build a best-effort text cross-reference. |
 | `ispsoft_validate_device_comments` | Validate DVP-style addresses and optionally emit a JSON map. |
 | `ispsoft_compile_and_check` | Run ISPSoft 3.24 Compile or Check on an ES2 project copy in a private desktop; OCR the Compile Message pane and save compiler sidecars plus screenshot evidence. Set `action` to `"check"` to run Check, or `timeout_seconds` to wait up to five minutes. |
-| `ispsoft_online_status`, `ispsoft_connect`, `ispsoft_upload_from_plc`, `ispsoft_start_monitor`, `ispsoft_runtime_read` | Explicitly report that no PLC transport is qualified; no device is contacted. |
+| `ispsoft_online_status`, `ispsoft_connect`, `ispsoft_upload_from_plc`, `ispsoft_start_monitor`, `ispsoft_runtime_read` | Explicitly report that no PLC transport is qualified; no device is contacted. `ispsoft_list_commgr_drivers` is configuration-only discovery. |
 | `ispsoft_runtime_write` / `ispsoft_download` | Require a call-level confirmation and `ISPSOFT_WRITES_ENABLED=1`; even then they remain disabled until transport qualification is implemented. |
 | `ispsoft_stop_monitor` | Report that this server has no active monitor session. |
 
