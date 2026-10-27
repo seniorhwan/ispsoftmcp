@@ -888,12 +888,25 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         driver = {"name": "DVP_COM1", "targets": [{"transport": "serial",
                     "port_number": "1", "station": "2"}]}
         with patch.object(server, "_read_commgr_driver_catalog", return_value={
-                "status": "OK", "drivers": [driver], "target_conflicts": []}):
+                "status": "OK", "drivers": [driver], "target_conflicts": []}), \
+             patch.object(server, "_enumerate_windows_serial_ports", return_value=[{
+                 "port": "COM1", "friendly_name": "USB Serial Port (COM1)"}]):
             exact = server._resolve_commgr_target("DVP_COM1")
             mismatched_case = server._resolve_commgr_target("dvp_com1")
         self.assertEqual(exact["status"], "SAVED_TARGET_FOUND")
         self.assertFalse(exact["identity_verified"])
         self.assertEqual(mismatched_case["status"], "DRIVER_NOT_FOUND")
+
+    def test_commgr_target_resolution_rejects_missing_serial_port_without_opening_it(self) -> None:
+        driver = {"name": "DVP_COM1", "targets": [{"transport": "serial",
+                    "port_number": "1", "station": "2"}]}
+        with patch.object(server, "_read_commgr_driver_catalog", return_value={
+                "status": "OK", "drivers": [driver], "target_conflicts": []}), \
+             patch.object(server, "_enumerate_windows_serial_ports", return_value=[]):
+            result = server._resolve_commgr_target("DVP_COM1")
+        self.assertEqual(result["status"], "TARGET_PORT_NOT_PRESENT")
+        self.assertFalse(result["device_contacted"])
+        self.assertFalse(result["serial_port_opened"])
 
     def test_commgr_driver_discovery_reads_config_without_contacting_device(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

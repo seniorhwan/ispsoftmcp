@@ -2622,6 +2622,25 @@ def _resolve_commgr_target(commgr_driver: str) -> dict[str, Any]:
         return {"status": "TARGET_ENDPOINT_CONFLICT", "driver": driver,
                 "conflict": conflict,
                 "error": "This saved driver shares its endpoint with another COMMGR driver; no connection was attempted."}
+    serial_targets = [target for target in driver.get("targets", [])
+                      if target.get("transport") == "serial"]
+    if serial_targets:
+        try:
+            ports = _enumerate_windows_serial_ports()
+        except (OSError, ctypes.ArgumentError) as exc:
+            return {"status": "SERIAL_PORT_ENUMERATION_FAILED", "driver": driver,
+                    "device_contacted": False, "serial_port_opened": False,
+                    "error": str(exc)}
+        present = {port["port"].removeprefix("COM") for port in ports}
+        missing = [target for target in serial_targets
+                   if str(target.get("port_number", "")) not in present]
+        if missing:
+            return {"status": "TARGET_PORT_NOT_PRESENT", "driver": driver,
+                    "configured_targets": serial_targets,
+                    "missing_targets": missing,
+                    "present_serial_ports": ports,
+                    "device_contacted": False, "serial_port_opened": False,
+                    "error": "The configured serial port is not currently present in Windows; no port was opened."}
     return {"status": "SAVED_TARGET_FOUND", "driver": driver,
             "identity_verified": False,
             "warning": "Saved configuration does not prove the live device identity or reachability."}
