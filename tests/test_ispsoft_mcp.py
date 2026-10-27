@@ -486,7 +486,8 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             source = root / "station project.isp"
             original = es2_v8_container()
             source.write_bytes(original)
-            window = {"handle": 42, "pid": 123, "title": "station project - Delta ISPSoft",
+            window = {"handle": 42, "pid": 123,
+                      "title": "station project__MCP_123456789abc - Delta ISPSoft",
                       "class_name": "TMainFrm", "visible": False, "minimized": False}
             process = Mock()
             process.pid = 123
@@ -496,12 +497,16 @@ class AnalysisAndSafetyTests(unittest.TestCase):
                  patch.object(server, "_exe", return_value=Path("C:/Delta/NewISPSoft.exe")), \
                  patch.object(server, "_ide_windows", return_value=[window]), \
                  patch.object(server, "_hide_ide_windows") as hide, \
+                 patch.object(server.uuid, "uuid4", return_value=Mock(hex="123456789abc00000000000000000000")), \
                  patch.object(server.subprocess, "Popen", return_value=process) as popen, \
                  patch.object(server.sys, "platform", "win32"):
                 result = json.loads(server.ispsoft_start_background_session(str(source), 1))
             self.assertEqual(result["status"], "BACKGROUND_PROJECT_OPEN_TITLE_MATCH")
+            self.assertTrue(result["success"])
             self.assertTrue(result["hidden"])
             self.assertTrue(result["readback_verified"])
+            self.assertEqual(result["priority_class"], "BELOW_NORMAL")
+            self.assertTrue(popen.call_args.kwargs["creationflags"] & 0x00004000)
             self.assertEqual(Path(result["worker_project_path"]).read_bytes(), original)
             self.assertEqual(source.read_bytes(), original)
             self.assertEqual(popen.call_args.args[0], [str(Path("C:/Delta/NewISPSoft.exe")),

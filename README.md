@@ -42,7 +42,10 @@ that an MCP operation works on it.
   tools for agent work; GUI start/open tools are interactive-only. A session is
   usable only when its result confirms the requested project title. If ISPSoft
   cannot initialize its settings or open that project, the server reports the
-  failure and stops that worker; it does not claim the project was loaded.
+  failure and stops that worker; it does not claim the project was loaded. The
+  MCP process must have the same Windows account's normal access to ISPSoft's
+  AppData files; sandboxed launches that cannot update ISPSoft's folder-history
+  file fail closed, while a normal-permission run has been verified on a copy.
 - Installed PLC family/model catalog and installed simulator executables are
   discovered from ISPSoft 3.24's own device configuration. This catalog is
   informational; MCP capability status remains per operation.

@@ -612,7 +612,7 @@ def ispsoft_start_ide(project_path: str = "", wait_seconds: int = 15) -> str:
 
 
 @mcp.tool()
-def ispsoft_start_background_session(project_path: str, wait_seconds: int = 20) -> str:
+def ispsoft_start_background_session(project_path: str, wait_seconds: int = 30) -> str:
     """Start an isolated, hidden ISPSoft worker on a disposable project copy; never focus the user's IDE."""
     if sys.platform != "win32":
         return _json({"success": False, "status": "WINDOWS_REQUIRED"})
@@ -637,7 +637,10 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 20) 
         project_info = containers.inspect(container)
         project_dir = session_root / "project"
         project_dir.mkdir(parents=True, exist_ok=False)
-        project_copy = project_dir / source.name
+        # Give the isolated worker a unique filename so its IDE title can prove
+        # it loaded this copy instead of silently reopening the user's project.
+        worker_name = f"{source.stem}__MCP_{session_id[:12]}{source.suffix}"
+        project_copy = project_dir / worker_name
         _write_new(project_copy, original, (source,))
         companion = source.with_suffix(".ini")
         copied_companion: Path | None = None
@@ -650,7 +653,9 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 20) 
         startup_info = subprocess.STARTUPINFO()
         startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startup_info.wShowWindow = 0  # SW_HIDE: create the worker without showing or focusing it.
-        creation_flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        creation_flags = (getattr(subprocess, "DETACHED_PROCESS", 0) |
+                          getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) |
+                          getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000))
         process = subprocess.Popen([str(executable), str(project_copy)], cwd=str(executable.parent), env=worker_env,
                                    startupinfo=startup_info, creationflags=creation_flags)
         record: dict[str, Any] = {
@@ -661,10 +666,10 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 20) 
             "readback_verified": read_bytes(project_copy) == original,
             "companion_path": str(copied_companion) if copied_companion else None,
             "profile_path": str(profile), "launch_mode": "PROJECT_FILE_ARGUMENT_WITH_ISOLATED_PROFILE",
-            "created_by_server": True,
+            "created_by_server": True, "priority_class": "BELOW_NORMAL",
         }
         _BACKGROUND_IDE_SESSIONS[session_id] = record
-        expected = source.stem.casefold()
+        expected = f"__mcp_{session_id[:12]}".casefold()
         deadline = time.monotonic() + wait_seconds
         matching: list[dict[str, Any]] = []
         worker_windows: list[dict[str, Any]] = []
@@ -675,8 +680,10 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 20) 
                         if expected in str(window.get("title", "")).casefold()]
             if matching:
                 hidden = all(not window["visible"] for window in worker_windows)
-                record.update(status="BACKGROUND_PROJECT_OPEN_TITLE_MATCH", windows=worker_windows,
-                              title_match=True, hidden=hidden)
+                record.update(success=hidden, status="BACKGROUND_PROJECT_OPEN_TITLE_MATCH", windows=worker_windows,
+                              title_match=True, hidden=hidden,
+                              message=None if hidden else
+                              "The requested project loaded, but at least one worker window could not be hidden.")
                 return _json({key: value for key, value in record.items() if key != "process"})
             if process.poll() is not None:
                 record.update(status="BACKGROUND_PROCESS_EXITED", windows=worker_windows,
@@ -685,6 +692,9 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 20) 
             if time.monotonic() >= deadline:
                 diagnostic_windows = [window for window in worker_windows
                                       if window.get("title") or window.get("class_name") in {"#32770", "TWaitFrm", "TWaitForm_C"}]
+                diagnostic_windows.sort(key=lambda window: (
+                    0 if window.get("class_name") == "#32770" else
+                    1 if window.get("class_name") in {"TWaitFrm", "TWaitForm_C"} else 2))
                 diagnostics = [{"title": window.get("title", ""),
                                 "class_name": window.get("class_name", ""),
                                 "controls": _window_child_texts(window["handle"])}
@@ -692,7 +702,10 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 20) 
                 dialog_text = " ".join(control["text"] for window in diagnostics
                                         for control in window["controls"]).casefold()
                 failure_reason = ("PROFILE_WRITE_DENIED" if "cannot create file" in dialog_text or
-                                  "access is denied" in dialog_text else "PROJECT_TITLE_NOT_CONFIRMED")
+                                  "access is denied" in dialog_text else
+                                  "STARTUP_DIALOG_UNRESOLVED" if any(
+                                      window.get("class_name") == "#32770" for window in diagnostics)
+                                  else "PROJECT_TITLE_NOT_CONFIRMED")
                 process_stopped = False
                 try:
                     process.terminate()
@@ -714,6 +727,9 @@ def ispsoft_start_background_session(project_path: str, wait_seconds: int = 20) 
                               message=("ISPSoft could not create a settings file in its resolved AppData folder; "
                                        "the project did not load in this worker. The worker was stopped."
                                        if failure_reason == "PROFILE_WRITE_DENIED" else
+                                       "ISPSoft left a hidden startup dialog open, so the project was not confirmed loaded. "
+                                       "The worker was stopped; inspect dialog_details for the exact message."
+                                       if failure_reason == "STARTUP_DIALOG_UNRESOLVED" else
                                        "The worker was launched hidden, but no worker window title confirmed the requested project."))
                 break
             time.sleep(0.25)
