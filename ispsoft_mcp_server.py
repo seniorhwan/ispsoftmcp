@@ -1872,7 +1872,10 @@ def ispsoft_get_project_overview(project_path: str) -> str:
 
 @mcp.tool()
 def ispsoft_read_pou(project_path: str, pou_name: str) -> str:
-    """Read one POU's native source sections without interpreting opaque LD nodes."""
+    """Read one POU's source, raw local symbols and a limited parsed symbol view.
+
+    Opaque LD nodes remain raw; unfamiliar local-variable forms are not guessed.
+    """
     try:
         container = containers.read_container(project_path)
         source = container.source.decode(container.encoding)
@@ -1887,11 +1890,15 @@ def ispsoft_read_pou(project_path: str, pou_name: str) -> str:
             sections[tag] = [match.group(1) for match in containers.sections(body, tag)]
         networks = containers.ld_networks(body)
         sections['LD_NETWORKS'] = networks
+        local_var_text = sections["LOCAL_VAR"][0] if len(sections["LOCAL_VAR"]) == 1 else ""
+        local_symbols = containers.parse_local_variables(local_var_text)
+        local_symbols.pop("raw", None)
         return _json({"success": True, "name": pou_name,
                       "language": containers.property_value(body, 'P_Lang'),
                       "type": containers.property_value(body, 'P_type'),
                       "network_count": len(networks),
                       "sections": sections,
+                      "local_variable_symbols": local_symbols,
                       "note": "LD_NETWORKS contains raw network bodies in project order; network marker keys are legacy and no semantic rung decode is claimed."})
     except (OSError, FileTransformError, ValueError) as exc:
         return _json({"success": False, "error": str(exc), "pou_name": pou_name})

@@ -239,6 +239,70 @@ def inspect(container: Container) -> dict:
                            pou_type=property_value(m.group(1), 'P_type')) for m in sections(text, 'POU')])
 
 
+def parse_local_variables(section_text: str) -> dict:
+    """Return a best-effort structured view of block-form local VAR sections.
+
+    ISPSoft's source dialect contains other local-variable encodings. Those
+    remain available in ``raw`` and are marked unparsed rather than inferred.
+    """
+    if not isinstance(section_text, str):
+        return {"status": "UNPARSED", "entries": [], "errors": ["section is not text"], "raw": ""}
+    wrappers = sections(section_text, "VAR")
+    if len(wrappers) != 1:
+        return {"status": "UNPARSED", "entries": [],
+                "errors": [f"expected one VAR wrapper; found {len(wrappers)}"], "raw": section_text}
+    body = wrappers[0].group(1)
+    blocks: list[str] = []
+    current: list[str] | None = None
+    errors: list[str] = []
+    for line_number, line in enumerate(body.splitlines(), 1):
+        token = line.strip()
+        if token == "{":
+            if current is not None:
+                errors.append(f"nested record opening at line {line_number}")
+            else:
+                current = []
+        elif token == "}":
+            if current is None:
+                errors.append(f"unmatched record closing at line {line_number}")
+            else:
+                blocks.append("\n".join(current))
+                current = None
+        elif current is not None:
+            current.append(line)
+        elif token:
+            errors.append(f"text outside a symbol record at line {line_number}")
+    if current is not None:
+        errors.append("unterminated symbol record")
+
+    entries: list[dict[str, str | None]] = []
+    declaration_re = re.compile(
+        r"^\s*(?P<identifier>[A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*(?P<type>.+?)"
+        r"\s*:=\s*(?P<initial>.*?)\s+\{(?P<class>[A-Za-z_][A-Za-z0-9_]*)\}\s*$"
+    )
+    for index, block in enumerate(blocks, 1):
+        lines = [line for line in block.splitlines() if line.strip()]
+        declaration = declaration_re.fullmatch(lines[0]) if lines else None
+        if declaration is None:
+            errors.append(f"symbol record {index} has an unrecognized declaration")
+            continue
+        initial = declaration.group("initial").strip()
+        address_match = re.search(r"\[@([A-Za-z][A-Za-z0-9]*\d+)@\]", initial)
+        comment_match = re.search(r"\(\*(.*?)\*\)", block, re.S)
+        entries.append({
+            "identifier": declaration.group("identifier"),
+            "type": declaration.group("type").strip(),
+            "address": address_match.group(1).upper() if address_match else None,
+            "class": declaration.group("class"),
+            "initial_value": initial,
+            "comment": comment_match.group(1).strip() if comment_match else None,
+        })
+    if not blocks and not errors:
+        errors.append("VAR wrapper contains no recognized symbol records")
+    status = "PARSED_LIMITED" if not errors else ("PARTIAL" if entries else "UNPARSED")
+    return {"status": status, "entries": entries, "errors": errors, "raw": section_text}
+
+
 def patch_st(container: Container, pou_name: str, code: str | None, variables: str | None) -> bytes:
     if code is None and variables is None:
         raise FileTransformError('Provide code_path and/or variables_path')

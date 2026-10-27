@@ -115,7 +115,7 @@ the detected Delta installation path.
 | `ispsoft_inspect_project` | Inspect a recognized `.isp` or `.bak` file. |
 | `ispsoft_get_project_overview` | Summarize model, POUs, tasks, and device-comment count. |
 | `ispsoft_read_project_source` | Return project source and POU metadata. |
-| `ispsoft_read_pou` | Read a single POU's source sections. |
+| `ispsoft_read_pou` | Read a single POU's raw source sections plus a limited structured local-symbol view; unrecognized declarations remain in raw form and are marked. |
 | `ispsoft_read_ld_network` | Read one raw LD network by one-based POU order without modifying the project. |
 | `ispsoft_get_ld_program_structure` | Return all LD networks as ordered node fields and raw type-code counts, without guessing type semantics. |
 | `ispsoft_read_device_comments` | Read device comments from a project. |

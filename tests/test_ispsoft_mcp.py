@@ -257,10 +257,22 @@ class ContainerTests(unittest.TestCase):
             self.assertEqual(overview['device_comment_count'], 1)
             self.assertIn('Value := 1;', pou['sections']['IL_ST_CODE'][0])
             self.assertEqual(comments['device_comments'], {'M0': 'Start request'})
+            self.assertEqual(pou['local_variable_symbols']['status'], 'UNPARSED')
             refs = {item['address']: item for item in xrefs['references']}
             self.assertTrue(refs['X0']['reads'])
             self.assertTrue(refs['Y0']['writes'])
             self.assertTrue(any(row['area'] == 'M' and row['end'] == 999 for row in memory['ranges']))
+
+    def test_local_variable_parser_extracts_known_block_form_and_keeps_partial_rows(self) -> None:
+        raw = "<VAR>\n{\nH87 : WORD :=  [@D7000@] {VAR}\n(*\nStart request\n*)\n}\n{\nnot a recognized row\n}\n</VAR>\n"
+        parsed = containers.parse_local_variables(raw)
+        self.assertEqual(parsed['status'], 'PARTIAL')
+        self.assertEqual(parsed['entries'], [{
+            'identifier': 'H87', 'type': 'WORD', 'address': 'D7000',
+            'class': 'VAR', 'initial_value': '[@D7000@]', 'comment': 'Start request',
+        }])
+        self.assertTrue(any('unrecognized declaration' in error for error in parsed['errors']))
+        self.assertEqual(parsed['raw'], raw)
 
     def test_ld_pou_networks_are_read_as_raw_blocks(self) -> None:
         network = """<NETWORK_START>
@@ -348,6 +360,9 @@ DEV_NAME=Y0
         xrefs = json.loads(server.ispsoft_get_cross_references(str(project), "Prog0"))
         self.assertEqual(overview["model"], "ES2")
         self.assertGreater(pou["network_count"], 0)
+        self.assertEqual(pou["local_variable_symbols"]["status"], "PARSED_LIMITED")
+        self.assertEqual([item["identifier"] for item in pou["local_variable_symbols"]["entries"]],
+                         ["H87", "K1", "k4"])
         self.assertTrue(any("VAR_NODE_S" in network for network in pou["sections"]["LD_NETWORKS"]))
         self.assertEqual(first_network["structure"]["properties"]["NET_ID"], "1")
         self.assertEqual(first_network["structure"]["root_nodes"][0]["fields"]["DEV_NAME"], "M1002")
