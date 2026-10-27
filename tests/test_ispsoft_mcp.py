@@ -497,6 +497,13 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         self.assertEqual(session["minimized_window_count"], 1)
         self.assertEqual(session["windows"], [])
 
+    def test_private_desktop_enumeration_treats_no_more_files_as_normal_end(self) -> None:
+        user32 = Mock()
+        user32.EnumDesktopWindows.return_value = False
+        with patch.object(server.ctypes, "WinDLL", return_value=user32), \
+             patch.object(server.ctypes, "get_last_error", return_value=18):
+            self.assertEqual(server._ide_windows_on_desktop(555, 123), [])
+
     def test_start_ide_refuses_to_start_without_a_project(self) -> None:
         with patch.object(server, "_ide_session") as observe, \
              patch.object(server, "_configured_previous_project", return_value=None), \

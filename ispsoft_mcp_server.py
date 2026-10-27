@@ -461,7 +461,10 @@ def _ide_windows_on_desktop(desktop_handle: int, process_id: int) -> list[dict[s
     callback = callback_type(inspect)
     if not user32.EnumDesktopWindows(desktop_handle, callback, 0):
         error = ctypes.get_last_error()
-        if error:
+        # EnumDesktopWindows may report ERROR_NO_MORE_FILES (18) after it
+        # finishes walking the desktop. That is a normal end condition, not
+        # evidence that ISPSoft failed to launch.
+        if error not in (0, 18):
             raise ctypes.WinError(error)
     return windows
 
