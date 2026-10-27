@@ -454,7 +454,7 @@ class AnalysisAndSafetyTests(unittest.TestCase):
                                     "visible": True, "minimized": False}]}
             with patch.dict(server.os.environ, {"APPDATA": str(root)}), \
                  patch.object(server, "_exe", return_value=Path("C:/Delta/NewISPSoft.exe")), \
-                 patch.object(server, "_ide_session", return_value=session), \
+                 patch.object(server, "_ide_session", side_effect=[{"windows": []}, session]), \
                  patch.object(server.subprocess, "Popen") as popen, \
                  patch.object(server.sys, "platform", "win32"):
                 result = json.loads(server.ispsoft_start_ide())
@@ -463,13 +463,28 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             self.assertEqual(result["launch_mode"], "ISPSoft_PREVIOUS_PROJECT_SETTING")
             self.assertEqual(popen.call_args.args[0], [str(Path("C:/Delta/NewISPSoft.exe"))])
 
+    def test_open_project_reuses_matching_visible_ispsoft_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "station project.isp"
+            project.write_bytes(es2_v8_container())
+            session = {"process_running": True, "windows": [{
+                "handle": 42, "title": "station project - Delta ISPSoft",
+                "visible": True, "minimized": False}]}
+            with patch.object(server, "_ide_session", return_value=session), \
+                 patch.object(server.subprocess, "Popen") as popen, \
+                 patch.object(server.sys, "platform", "win32"):
+                result = json.loads(server.ispsoft_open_project(str(project)))
+            self.assertEqual(result["status"], "PROJECT_ALREADY_VISIBLE")
+            self.assertTrue(result["already_open"])
+            popen.assert_not_called()
+
     def test_open_project_reports_visible_filename_title_match(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp) / "station project.isp"
             project.write_bytes(es2_v8_container())
             session = {"windows": [{"handle": 42, "title": "station project - Delta ISPSoft",
                                     "visible": True, "minimized": False}]}
-            with patch.object(server, "_ide_session", return_value=session), \
+            with patch.object(server, "_ide_session", side_effect=[{"windows": []}, session]), \
                  patch.object(server, "_exe", return_value=Path("C:/Delta/NewISPSoft.exe")), \
                  patch.object(server.subprocess, "Popen") as popen, \
                  patch.object(server.sys, "platform", "win32"):

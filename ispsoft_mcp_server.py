@@ -294,6 +294,24 @@ def _configured_previous_project() -> Path | None:
         return None
 
 
+def _configured_previous_project_summary() -> dict[str, Any]:
+    path = _configured_previous_project()
+    if path is None:
+        return {"configured": False, "active_state": "UNKNOWN"}
+    result: dict[str, Any] = {"configured": True, "path": str(path), "active_state": "UNKNOWN"}
+    try:
+        resolved = path.resolve(strict=True)
+        data = read_bytes(resolved)
+        container = containers.read_container(resolved)
+        info = containers.inspect(container)
+        result.update(path=str(resolved), exists=True, readable=True,
+                      project_model=info.get("project_model"), pou_count=len(info.get("pous", [])),
+                      sha256=_sha(data))
+    except (OSError, FileTransformError, ValueError) as exc:
+        result.update(exists=path.exists(), readable=False, error=str(exc))
+    return result
+
+
 def _artifact_path(prefix: str, suffix: str) -> Path:
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -394,7 +412,8 @@ def ispsoft_get_status() -> str:
         "dvp_es2_simulator_running": _process_running(simulator.name) if simulator else False,
         "installed_simulators": simulators,
         "device_catalog_available": _installed_device_catalog()["available"],
-        "active_ide_project": "not observable; window metadata does not identify the open project",
+        "configured_previous_project": _configured_previous_project_summary(),
+        "active_ide_project": "not observable; a configured previous project is not proof of the project currently open",
         "ide_automation": "process/window detection and startup only; native build/check remains not qualified",
         "online_transport": "not qualified; no device I/O is enabled",
         "live_writes_enabled": os.environ.get(LIVE_WRITES_ENV, "").strip().lower() in {"1", "true", "yes"},
@@ -437,6 +456,17 @@ def _open_project_and_observe(project_path: str, wait_seconds: int) -> dict[str,
         return {"success": False, "status": "PROJECT_REJECTED", "error": str(exc),
                 "project_path": project_path}
 
+    expected = path.stem.casefold()
+    current_session = _ide_session()
+    already_open = [window for window in current_session.get("windows", [])
+                    if window.get("visible") and not window.get("minimized")
+                    and expected in str(window.get("title", "")).casefold()]
+    if already_open:
+        return {"success": True, "status": "PROJECT_ALREADY_VISIBLE",
+                "project_path": str(path), "model": project_info.get("project_model"),
+                "windows": already_open, "title_match": True, "already_open": True,
+                "verification": "visible ISPSoft top-level window title contains the exact project filename stem"}
+
     # ISPSoft's saved previous-project setting is the only supported no-argument
     # launch path. Use it only if it identifies this exact project; otherwise
     # follow the registered .isp command NewISPSoft.exe "%1".
@@ -461,7 +491,6 @@ def _open_project_and_observe(project_path: str, wait_seconds: int) -> dict[str,
                 "project_path": str(path), "model": project_info.get("project_model"),
                 "executable": str(executable)}
 
-    expected = path.stem.casefold()
     deadline = time.monotonic() + wait_seconds
     session = _ide_session()
     while True:
