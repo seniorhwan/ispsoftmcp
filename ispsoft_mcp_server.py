@@ -27,7 +27,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from ispsoft_mcp import containers, dvp, packages
+from ispsoft_mcp import containers, dvp, dvp_modbus, packages
 from ispsoft_mcp.limits import FileTransformError, atomic_write, read_bytes
 
 
@@ -1697,6 +1697,9 @@ def _capability_matrix() -> dict[str, Any]:
         "per_profile": per_profile,
         "project_inspection": {"status": "QUALIFIED_LIMITED", "formats": ["ISPSoft 3.24 v8 DVP pointer/footer", "legacy 0xAA/0xAC", "AS v3010"]},
         "source_candidate_generation": {"status": "QUALIFIED_LIMITED", "models": list(MODEL_PROFILES), "never_compiles": True},
+        "dvp_modbus_address_mapping": {"status": "QUALIFIED_LIMITED", "models": ["ES2"],
+                                       "operation": "offline device address translation only",
+                                       "device_io": "NOT_RUN"},
         "local_variable_candidate_generation": {"status": "QUALIFIED_LIMITED", "models": ["ES2"],
                                                 "input": "complete native LOCAL_VAR inner text",
                                                 "readback": "exact decoded section match",
@@ -1725,6 +1728,40 @@ def ispsoft_get_capabilities() -> str:
                   "qualified_profiles": MODEL_PROFILES,
                   "model_aliases": {"DVP32ES2T": "ES2", "DVP32ES2": "ES2"},
                   "operations": _capability_matrix()})
+
+
+@mcp.tool()
+def ispsoft_map_dvp_modbus_addresses(model: str, addresses: list[str]) -> str:
+    """Translate documented DVP devices to Modbus function/PDU addresses offline.
+
+    This is address planning only: it never opens a port, starts COMMGR, or
+    contacts a controller. The returned map does not qualify a live transport.
+    """
+    canonical, model_error = _model(model)
+    if model_error:
+        return _json({"status": "UNSUPPORTED_MODEL", "model": model,
+                      "device_contacted": False, "serial_port_opened": False,
+                      "error": model_error})
+    if canonical != "ES2":
+        return _json({"status": "MODEL_NOT_QUALIFIED", "model": canonical,
+                      "device_contacted": False, "serial_port_opened": False,
+                      "error": "Offline Modbus address mapping is currently qualified only for the DVP ES2 profile."})
+    if not isinstance(addresses, list) or not 1 <= len(addresses) <= 200:
+        return _json({"status": "REJECTED_BEFORE_IO", "model": canonical,
+                      "device_contacted": False, "serial_port_opened": False,
+                      "error": "addresses must contain 1-200 DVP device strings."})
+    mappings: list[dict[str, Any]] = []
+    for address in addresses:
+        try:
+            mappings.append({"success": True, **dvp_modbus.map_device(address)})
+        except ValueError as exc:
+            mappings.append({"success": False, "device": address, "error": str(exc)})
+    errors = sum(not item["success"] for item in mappings)
+    return _json({"status": "MAPPED_OFFLINE_ONLY" if not errors else "PARTIAL_MAPPING",
+                  "model": canonical, "address_basis": "zero-based Modbus PDU addresses",
+                  "mappings": mappings, "mapped_count": len(mappings) - errors,
+                  "error_count": errors, "device_contacted": False,
+                  "serial_port_opened": False, "live_transport": "NOT_QUALIFIED"})
 
 
 @mcp.tool()

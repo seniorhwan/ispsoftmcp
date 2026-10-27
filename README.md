@@ -35,6 +35,11 @@ that an MCP operation works on it.
   are deliberately limited by the serializer; unsupported or lossy logic is
   rejected.
 - Textual cross-reference analysis and DVP-style comment-map validation.
+- Offline DVP ES2 device-to-Modbus PDU address translation. It reports standard
+  function codes and zero-based PDU addresses for documented X/Y/M/S/T/C/D
+  regions. It is address planning only; it neither opens a port nor qualifies
+  a live connection. The mapping follows Delta's [DVP-PLC Application Manual,
+  section 2.12](https://filecenter.deltaww.com/Products/download/06/060301/Manual/DELTA_IA-PLC_DVP-PLC_PM_EN_20220407.pdf). In particular, the later manual lists D4096 at communication address `0x9000`; an older application note has an inconsistent decimal reference for this range.
 - Native ISPSoft 3.24 Check/Compile for ES2 projects uses a private desktop,
   disposable project copy, and Windows OCR of the Compile Message pane. Other
   project models remain unqualified. PLC connection, upload, download, monitor
@@ -109,6 +114,7 @@ the detected Delta installation path.
 | `ispsoft_get_background_sessions` | Report private-desktop workers created by this MCP process, including worker windows and project-copy paths. |
 | `ispsoft_stop_background_session` | Stop only a private-desktop worker created by this MCP process; retains its disposable project folder for inspection. |
 | `ispsoft_get_capabilities` | Separate detected ISPSoft models from MCP-qualified operation profiles. |
+| `ispsoft_map_dvp_modbus_addresses` | Translate documented ES2 device addresses to Modbus function codes and zero-based PDU addresses; offline only, with no serial I/O. |
 | `ispsoft_list_supported_plc_types` | Show the installed model catalog and exact MCP operation profiles. |
 | `ispsoft_list_projects` | Find and inspect ISPSoft project files in a requested folder. |
 | `ispsoft_create_project_from_template` | Create a new offline project copy with verified readback; does not compile. |

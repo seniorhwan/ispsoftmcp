@@ -78,6 +78,7 @@ class McpStdioIntegrationTests(unittest.TestCase):
             listed = receive(2)
             tool_names = {tool["name"] for tool in listed["result"]["tools"]}
             self.assertIn("ispsoft_write_local_variables_candidate", tool_names)
+            self.assertIn("ispsoft_map_dvp_modbus_addresses", tool_names)
             self.assertIn("ispsoft_online_status", tool_names)
 
             send({
@@ -90,6 +91,20 @@ class McpStdioIntegrationTests(unittest.TestCase):
             result = json.loads(called["result"]["content"][0]["text"])
             self.assertEqual(result["status"], "TRANSPORT_NOT_QUALIFIED")
             self.assertIs(result["device_contacted"], False)
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "ispsoft_map_dvp_modbus_addresses",
+                           "arguments": {"model": "DVP32ES2T", "addresses": ["X0", "D7000"]}},
+            })
+            mapped = receive(4)
+            mapping_result = json.loads(mapped["result"]["content"][0]["text"])
+            self.assertEqual(mapping_result["status"], "MAPPED_OFFLINE_ONLY")
+            self.assertEqual(mapping_result["mappings"][1]["accesses"][0]["pdu_address"], 0x9B58)
+            self.assertIs(mapping_result["device_contacted"], False)
+            self.assertIs(mapping_result["serial_port_opened"], False)
         finally:
             if process.stdin is not None:
                 process.stdin.close()

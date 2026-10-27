@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import ispsoft_mcp_server as server
-from ispsoft_mcp import containers, dvp, limits
+from ispsoft_mcp import containers, dvp, dvp_modbus, limits
 
 
 AS_SOURCE = """<PROJECT>
@@ -452,6 +452,7 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             "ispsoft_stop_background_session", "ispsoft_compile_and_check",
             "ispsoft_list_commgr_drivers", "ispsoft_list_serial_ports",
             "ispsoft_write_local_variables_candidate",
+            "ispsoft_map_dvp_modbus_addresses",
         }.issubset(names))
 
     def test_serial_port_inventory_does_not_claim_device_identity_or_contact(self) -> None:
@@ -482,7 +483,29 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         self.assertEqual(matrix["local_variable_candidate_generation"]["models"], ["ES2"])
         self.assertEqual(matrix["per_profile"]["ES2"]["local_variable_candidate_generation"],
                          "QUALIFIED_LIMITED")
+        self.assertEqual(matrix["dvp_modbus_address_mapping"]["models"], ["ES2"])
         self.assertEqual(matrix["plc_connection"]["status"], "NOT_QUALIFIED")
+
+    def test_dvp_modbus_mapping_is_documented_offline_translation_only(self) -> None:
+        x_last = dvp_modbus.map_device("X377")
+        self.assertEqual(x_last["accesses"][0], {
+            "data_type": "bit", "function_code": 2, "pdu_address": 0x4FF})
+        self.assertEqual(dvp_modbus.map_device("Y10")["accesses"][0]["pdu_address"], 0x508)
+        self.assertEqual(dvp_modbus.map_device("M1536")["accesses"][0]["pdu_address"], 0xB000)
+        self.assertEqual(dvp_modbus.map_device("D7000")["accesses"][0]["pdu_address"], 0x9B58)
+        self.assertEqual(dvp_modbus.map_device("S0")["accesses"][0]["pdu_address"], 0x0000)
+        self.assertEqual(dvp_modbus.map_device("T0")["accesses"][1]["pdu_address"], 0x0600)
+        counter = dvp_modbus.map_device("C200")["accesses"]
+        self.assertEqual(counter[0]["pdu_address"], 0xEC8)
+        self.assertEqual(counter[1]["pdu_address"], 0x700)
+        with self.assertRaisesRegex(ValueError, "octal"):
+            dvp_modbus.map_device("X8")
+        result = json.loads(server.ispsoft_map_dvp_modbus_addresses(
+            "DVP32ES2T", ["X0", "D7000", "X8", "V0"]))
+        self.assertEqual(result["status"], "PARTIAL_MAPPING")
+        self.assertFalse(result["device_contacted"])
+        self.assertFalse(result["serial_port_opened"])
+        self.assertEqual(result["mapped_count"], 2)
 
     def test_native_compile_ocr_summary_reports_errors_and_missing_counts(self) -> None:
         errors = server._parse_native_compile_diagnostics(
