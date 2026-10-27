@@ -6,7 +6,6 @@ never reports a transformed file as compiled, downloaded, or PLC-verified.
 from __future__ import annotations
 
 import datetime as dt
-import csv
 import ctypes
 import ctypes.wintypes as wintypes
 import hashlib
@@ -171,22 +170,42 @@ def _installed(candidates: tuple[Path, ...]) -> Path | None:
 
 
 def _process_running(name: str) -> bool:
-    if sys.platform != "win32":
-        return False
+    return bool(_process_ids(name))
 
 
 def _process_ids(name: str) -> list[int]:
     if sys.platform != "win32":
         return []
-    try:
-        result = subprocess.run(["tasklist", "/fo", "csv", "/nh", "/fi", f"IMAGENAME eq {name}"],
-                                capture_output=True, text=True, timeout=5, check=False)
-    except (OSError, subprocess.SubprocessError):
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
         return []
     pids: list[int] = []
-    for row in csv.reader(result.stdout.splitlines()):
-        if len(row) >= 2 and row[0].casefold() == name.casefold() and row[1].isdigit():
-            pids.append(int(row[1]))
+    entry = PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(entry)
+    try:
+        has_entry = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while has_entry:
+            if entry.szExeFile.casefold() == name.casefold():
+                pids.append(int(entry.th32ProcessID))
+            has_entry = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
     return pids
 
 
@@ -231,7 +250,8 @@ def _ide_windows() -> list[dict[str, Any]]:
 
 
 def _ide_session() -> dict[str, Any]:
-    running = _process_running("NewISPSoft.exe")
+    process_ids = _process_ids("NewISPSoft.exe")
+    running = bool(process_ids)
     windows = _ide_windows() if running else []
     visible = [window for window in windows if window["visible"] and not window["minimized"]]
     if visible:
@@ -242,14 +262,13 @@ def _ide_session() -> dict[str, Any]:
         diagnosis = "PROCESS_WITHOUT_TOP_LEVEL_WINDOW"
     else:
         diagnosis = "PROCESS_NOT_RUNNING"
-    return {"process_running": running, "process_ids": _process_ids("NewISPSoft.exe"),
-            "windows": windows, "visible_window_count": len(visible), "diagnosis": diagnosis}
-    try:
-        result = subprocess.run(["tasklist", "/fo", "csv", "/nh"], capture_output=True,
-                                text=True, timeout=5, check=False)
-        return any(line.lower().startswith('"' + name.lower() + '"') for line in result.stdout.splitlines())
-    except (OSError, subprocess.SubprocessError):
-        return False
+    visible_windows = [window for window in windows if window["visible"] and not window["minimized"]]
+    minimized_windows = [window for window in windows if window["visible"] and window["minimized"]]
+    return {"process_running": running, "process_ids": process_ids,
+            "windows": visible_windows, "window_count": len(windows),
+            "minimized_window_count": len(minimized_windows),
+            "hidden_window_count": len(windows) - len(visible_windows) - len(minimized_windows),
+            "visible_window_count": len(visible), "diagnosis": diagnosis}
 
 
 def _artifact_path(prefix: str, suffix: str) -> Path:
@@ -352,11 +371,68 @@ def ispsoft_get_status() -> str:
         "dvp_es2_simulator_running": _process_running(simulator.name) if simulator else False,
         "installed_simulators": simulators,
         "device_catalog_available": _installed_device_catalog()["available"],
-        "active_ide_project": "not observable; no ISPSoft window/session integration is qualified",
-        "ide_automation": "not qualified; MCP will not claim build/check results",
+        "active_ide_project": "not observable; window metadata does not identify the open project",
+        "ide_automation": "process/window detection and startup only; native build/check remains not qualified",
         "online_transport": "not qualified; no device I/O is enabled",
         "live_writes_enabled": os.environ.get(LIVE_WRITES_ENV, "").strip().lower() in {"1", "true", "yes"},
     })
+
+
+@mcp.tool()
+def ispsoft_get_ide_session() -> str:
+    """Report the ISPSoft process and top-level windows observable to this server."""
+    if sys.platform != "win32":
+        return _json({"status": "WINDOWS_REQUIRED", "process_running": False,
+                      "windows": [], "diagnosis": "UNSUPPORTED_PLATFORM"})
+    try:
+        session = _ide_session()
+        session["status"] = "OBSERVED" if session["diagnosis"] == "VISIBLE_WINDOW" else "NOT_VISIBLE"
+        session["inspection_scope"] = "process and top-level window metadata only; active project and editor state are not inspected"
+        return _json(session)
+    except (OSError, AttributeError, ctypes.ArgumentError) as exc:
+        return _json({"status": "INSPECTION_FAILED", "error": str(exc),
+                      "diagnosis": "WINDOW_ENUMERATION_FAILED"})
+
+
+@mcp.tool()
+def ispsoft_start_ide(wait_seconds: int = 15) -> str:
+    """Start ISPSoft if stopped and verify the process/window state without opening a project."""
+    if sys.platform != "win32":
+        return _json({"success": False, "status": "WINDOWS_REQUIRED"})
+    if not isinstance(wait_seconds, int) or isinstance(wait_seconds, bool) or not 1 <= wait_seconds <= 60:
+        return _json({"success": False, "status": "REJECTED_BEFORE_START",
+                      "error": "wait_seconds must be an integer from 1 to 60."})
+    session = _ide_session()
+    if session["process_running"]:
+        status = "ALREADY_RUNNING" if session["visible_window_count"] else "RUNNING_WITHOUT_VISIBLE_WINDOW"
+        return _json({"success": session["visible_window_count"] > 0, "status": status,
+                      "session": session, "started_by_server": False})
+    executable = _exe()
+    if executable is None:
+        return _json({"success": False, "status": "NOT_INSTALLED",
+                      "error": "ISPSoft executable was not found. Set ISPSOFT_EXE to its installed path."})
+    try:
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0)
+        process = subprocess.Popen([str(executable)], cwd=str(executable.parent), creationflags=flags)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _json({"success": False, "status": "START_FAILED", "error": str(exc),
+                      "executable": str(executable)})
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        session = _ide_session()
+        if session["visible_window_count"]:
+            return _json({"success": True, "status": "VISIBLE_WINDOW",
+                          "session": session, "started_by_server": True,
+                          "launcher_pid": process.pid})
+        if process.poll() is not None:
+            return _json({"success": False, "status": "PROCESS_EXITED_BEFORE_WINDOW",
+                          "session": session, "started_by_server": True,
+                          "launcher_pid": process.pid, "exit_code": process.returncode})
+        time.sleep(0.25)
+    return _json({"success": False, "status": "WINDOW_NOT_VISIBLE",
+                  "session": session, "started_by_server": True,
+                  "launcher_pid": process.pid,
+                  "message": "ISPSoft was launched, but no visible top-level window appeared before the timeout."})
 
 
 @mcp.tool()

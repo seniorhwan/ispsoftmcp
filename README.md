@@ -29,6 +29,10 @@ that an MCP operation works on it.
 - Status and explicit “not qualified” responses for native build/check and PLC
   operations. PLC connection, upload, download, monitor mode, and live device
   I/O remain disabled until a vendor adapter is implemented and qualified.
+- ISPSoft process/window diagnostics and verified application startup are
+  available through `ispsoft_get_ide_session` and `ispsoft_start_ide`. These
+  report visible windows and startup failures; they do not inspect the active
+  project or automate compile/check.
 - Installed PLC family/model catalog and installed simulator executables are
   discovered from ISPSoft 3.24's own device configuration. This catalog is
   informational; MCP capability status remains per operation.
@@ -70,6 +74,8 @@ the detected Delta installation path.
 | Tool | Purpose |
 |---|---|
 | `ispsoft_get_status` | Detect installed/running ISPSoft, COMMGR, and the DVP ES2 simulator. Presence is not a connection check. |
+| `ispsoft_get_ide_session` | Report ISPSoft process IDs and visible top-level window metadata. Does not identify the open project. |
+| `ispsoft_start_ide` | Start ISPSoft if stopped and verify a visible window; does not open or modify a project. |
 | `ispsoft_get_capabilities` | Separate detected ISPSoft models from MCP-qualified operation profiles. |
 | `ispsoft_list_supported_plc_types` | Show the installed model catalog and exact MCP operation profiles. |
 | `ispsoft_list_projects` | Find and inspect ISPSoft project files in a requested folder. |

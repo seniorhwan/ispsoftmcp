@@ -273,7 +273,55 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             "ispsoft_get_capabilities", "ispsoft_list_projects",
             "ispsoft_create_project_from_template", "ispsoft_connect",
             "ispsoft_upload_from_plc", "ispsoft_start_monitor", "ispsoft_stop_monitor",
+            "ispsoft_get_ide_session", "ispsoft_start_ide",
         }.issubset(names))
+
+    def test_ide_session_reports_visible_window_evidence(self) -> None:
+        window = {"handle": 42, "pid": 7, "title": "ISPSoft", "class_name": "Main",
+                  "visible": True, "minimized": False}
+        with patch.object(server, "_process_running", return_value=True), \
+             patch.object(server, "_process_ids", return_value=[7]), \
+             patch.object(server, "_ide_windows", return_value=[window]):
+            session = server._ide_session()
+        self.assertEqual(session["diagnosis"], "VISIBLE_WINDOW")
+        self.assertEqual(session["visible_window_count"], 1)
+        self.assertEqual(session["process_ids"], [7])
+
+    def test_ide_session_hides_invisible_implementation_windows(self) -> None:
+        windows = [
+            {"handle": 42, "pid": 7, "title": "ISPSoft", "class_name": "Main",
+             "visible": True, "minimized": False},
+            {"handle": 43, "pid": 7, "title": "", "class_name": "Utility",
+             "visible": False, "minimized": False},
+        ]
+        with patch.object(server, "_process_running", return_value=True), \
+             patch.object(server, "_process_ids", return_value=[7]), \
+             patch.object(server, "_ide_windows", return_value=windows):
+            session = server._ide_session()
+        self.assertEqual(len(session["windows"]), 1)
+        self.assertEqual(session["window_count"], 2)
+        self.assertEqual(session["hidden_window_count"], 1)
+
+    def test_ide_session_separates_minimized_windows(self) -> None:
+        window = {"handle": 42, "pid": 7, "title": "ISPSoft", "class_name": "Main",
+                  "visible": True, "minimized": True}
+        with patch.object(server, "_process_ids", return_value=[7]), \
+             patch.object(server, "_ide_windows", return_value=[window]):
+            session = server._ide_session()
+        self.assertEqual(session["diagnosis"], "WINDOW_HIDDEN_OR_MINIMIZED")
+        self.assertEqual(session["visible_window_count"], 0)
+        self.assertEqual(session["minimized_window_count"], 1)
+        self.assertEqual(session["windows"], [])
+
+    def test_start_ide_does_not_duplicate_an_existing_instance(self) -> None:
+        session = {"process_running": True, "process_ids": [7], "windows": [],
+                   "visible_window_count": 0, "diagnosis": "PROCESS_WITHOUT_TOP_LEVEL_WINDOW"}
+        with patch.object(server, "_ide_session", return_value=session), \
+             patch.object(server.subprocess, "Popen") as popen:
+            result = json.loads(server.ispsoft_start_ide())
+        self.assertEqual(result["status"], "RUNNING_WITHOUT_VISIBLE_WINDOW")
+        self.assertFalse(result["success"])
+        popen.assert_not_called()
 
     def test_windows_safe_atomic_artifact_write_refuses_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
