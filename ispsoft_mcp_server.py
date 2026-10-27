@@ -746,6 +746,17 @@ def _restore_compiler_sidecars(root: Path, before: dict[str, bytes | None],
             "concurrent_change_files": conflicts}
 
 
+def _verify_compiler_sidecars_unchanged(root: Path,
+                                        before: dict[str, bytes | None]) -> dict[str, Any]:
+    """Verify shared compiler state without writing when user activity occurred."""
+    changed = [name for name, original in before.items()
+               if (read_bytes(root / name) if (root / name).is_file() else None) != original]
+    return {"success": not changed, "restored_files": [],
+            "concurrent_change_files": changed,
+            "status": "UNCHANGED_DURING_USER_ACTIVITY" if not changed
+            else "SKIPPED_DURING_USER_ACTIVITY"}
+
+
 def _last_user_input_tick() -> int | None:
     """Read the desktop's last physical-input tick to avoid blaming user activity on the worker."""
     if sys.platform != "win32":
@@ -1408,7 +1419,7 @@ def ispsoft_start_ide(project_path: str = "", wait_seconds: int = 15) -> str:
 
 
 @mcp.tool()
-def ispsoft_start_background_session(project_path: str = "", wait_seconds: int = 30) -> str:
+def ispsoft_start_background_session(project_path: str = "", wait_seconds: int = 60) -> str:
     """Open the requested or configured previous project on a private desktop using a disposable copy."""
     if sys.platform != "win32":
         return _json({"success": False, "status": "WINDOWS_REQUIRED"})
@@ -2424,7 +2435,10 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
         appdata = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
         compiler_root = appdata / "Delta Industrial Automation" / "ISPSoft_New"
         compiler_sidecars_before = _snapshot_compiler_sidecars(compiler_root)
-        launch = json.loads(ispsoft_start_background_session(str(source), 30))
+        # ISPSoft 3.24 cold-starts slowly on a private desktop. A 30-second
+        # limit can expire while its splash screen is still loading, so use
+        # the full qualified startup window before declaring the project lost.
+        launch = json.loads(ispsoft_start_background_session(str(source), 60))
         if not launch.get("success"):
             return _json({"success": False, "status": "BACKGROUND_WORKER_FAILED",
                     "vendor_compile": "NOT_RUN", "project_path": str(source),
@@ -2516,9 +2530,13 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
                                  and input_tick_before != input_tick_after)
         foreground_change_attributable_to_worker = (not foreground_unchanged and not user_input_during_run)
         if user_ide_active_during_run or user_input_during_run:
-            sidecar_restore = {"success": False, "restored_files": [],
-                               "concurrent_change_files": [],
-                               "status": "SKIPPED_DURING_USER_ACTIVITY"}
+            # Private-desktop menu messages can advance GetLastInputInfo even
+            # though the user's foreground window is unchanged. When any user
+            # activity is detected, never restore/write shared files; only
+            # report safe success if every file still exactly matches its
+            # pre-run bytes. Any difference remains an unverified conflict.
+            sidecar_restore = _verify_compiler_sidecars_unchanged(
+                compiler_root, compiler_sidecars_before)
         else:
             try:
                 sidecar_restore = _restore_compiler_sidecars(

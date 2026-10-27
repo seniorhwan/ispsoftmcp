@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import inspect
 import json
 import os
 import struct
@@ -568,6 +569,33 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         self.assertEqual(result["concurrent_change_files"], ["CompiledCode.txt"])
         self.assertEqual(current, b"concurrent user compile state")
 
+    def test_user_activity_verifies_unchanged_compiler_sidecars_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sidecar = root / "CompiledCode.txt"
+            sidecar.write_bytes(b"before")
+            before = server._snapshot_compiler_sidecars(root)
+            result = server._verify_compiler_sidecars_unchanged(root, before)
+            current = sidecar.read_bytes()
+        self.assertTrue(result["success"])
+        self.assertEqual(result["status"], "UNCHANGED_DURING_USER_ACTIVITY")
+        self.assertEqual(result["restored_files"], [])
+        self.assertEqual(current, b"before")
+
+    def test_user_activity_rejects_changed_compiler_sidecars_without_restoring(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sidecar = root / "CompiledCode.txt"
+            sidecar.write_bytes(b"before")
+            before = server._snapshot_compiler_sidecars(root)
+            sidecar.write_bytes(b"concurrent change")
+            result = server._verify_compiler_sidecars_unchanged(root, before)
+            current = sidecar.read_bytes()
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], "SKIPPED_DURING_USER_ACTIVITY")
+        self.assertEqual(result["concurrent_change_files"], ["CompiledCode.txt"])
+        self.assertEqual(current, b"concurrent change")
+
     def test_native_check_removes_worker_sidecars_that_did_not_exist_before(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -709,6 +737,10 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         self.assertEqual(result["status"], "PREVIOUS_PROJECT_NOT_CONFIGURED")
         self.assertFalse(result["success"])
         executable.assert_not_called()
+
+    def test_background_session_default_wait_allows_ispsoft_cold_start(self) -> None:
+        self.assertEqual(inspect.signature(server.ispsoft_start_background_session)
+                         .parameters["wait_seconds"].default, 60)
 
     def test_background_session_reports_private_desktop_access_denial_without_visible_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
