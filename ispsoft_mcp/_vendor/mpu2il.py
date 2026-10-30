@@ -42,7 +42,7 @@ def parse_networks(text):
 
 def parse_nodes(seg):
     nodes = []
-    for blk in re.findall(r"\[LD_NODE\](.*?)\r?\n\[END_LD_NODE\]", seg, re.S):
+    for blk in re.findall(r"\[LD_NODE\](.*?)\r*\n\[END_LD_NODE\]", seg, re.S):
         t = re.search(r"TYPE=(\d+)", blk)
         n = {
             "type": int(t.group(1)) if t else -1,
@@ -54,7 +54,7 @@ def parse_nodes(seg):
         }
         n["dev"] = n["dev"].group(1) if n["dev"] else None
         n["symb"] = n["symb"].group(1) if n["symb"] else None
-        m = re.search(r"LNK_C=(\d+)\r?\nLNK_L=(\d+)", blk)
+        m = re.search(r"LNK_C=(\d+)\r*\nLNK_L=(\d+)", blk)
         if m:
             n["lnk"] = (int(m.group(1)), int(m.group(2)))
         nodes.append(n)

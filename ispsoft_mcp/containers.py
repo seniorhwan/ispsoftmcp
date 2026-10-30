@@ -153,6 +153,57 @@ def ld_network_matches(text: str) -> list[re.Match[str]]:
     return list(re.finditer(r'(?is)<NETWORK_START>\r*\n(.*?)\r*\n<NETWORK_END>', text))
 
 
+def replace_ld_pou_networks(source: str, pou_name: str,
+                            replacement_networks: list[str], newline: str = "\r\n") -> str:
+    """Replace every network in one LD POU while preserving the rest of the project.
+
+    ``replacement_networks`` contains complete NETWORK_START/NETWORK_END blocks.
+    Each body is structurally checked before the source is changed.
+    """
+    if not replacement_networks:
+        raise FileTransformError("An LD program must contain at least one network.")
+    if any(not isinstance(network, str) for network in replacement_networks):
+        raise FileTransformError("Every replacement LD network must be text.")
+    if any(not re.match(r"(?is)^<NETWORK_START>\r*\n.*?\r*\n<NETWORK_END>$", network.strip())
+           for network in replacement_networks):
+        raise FileTransformError("Each replacement must be one complete network block.")
+    if sum(len(network.encode("utf-8")) for network in replacement_networks) > 4_000_000:
+        raise FileTransformError("Replacement LD program exceeds 4 MB.")
+
+    matches = [match for match in sections(source, "POU")
+               if property_value(match.group(1), "P_Name") == pou_name]
+    if len(matches) != 1:
+        raise FileTransformError(f"Expected one POU named {pou_name!r}; found {len(matches)}.")
+    pou_match = matches[0]
+    pou_body = pou_match.group(1)
+    if property_value(pou_body, "P_Lang") != "1":
+        raise FileTransformError("The named POU is not a Ladder Diagram POU.")
+    old_networks = list(re.finditer(
+        r"(?is)<NETWORK_START>\r*\n.*?\r*\n<NETWORK_END>", pou_body))
+    if not old_networks:
+        raise FileTransformError("The target LD POU has no replaceable networks.")
+    bodies = [re.search(r"(?is)^<NETWORK_START>\r*\n(.*?)\r*\n<NETWORK_END>$", item.strip()).group(1)
+              for item in replacement_networks]
+    for body in bodies:
+        errors = validate_ld_network(body)
+        if errors:
+            raise FileTransformError("Invalid generated LD network: " + "; ".join(errors))
+    blocks = (newline + newline).join(item.strip().replace("\r\n", "\n").replace("\r", "\n").replace("\n", newline)
+                                       for item in replacement_networks)
+    updated_pou = (pou_body[:old_networks[0].start()] + blocks +
+                   pou_body[old_networks[-1].end():])
+    updated_source = (source[:pou_match.start(1)] + updated_pou +
+                      source[pou_match.end(1):])
+    readback = [match.group(0) for match in re.finditer(
+        r"(?is)<NETWORK_START>\r*\n.*?\r*\n<NETWORK_END>", updated_pou)]
+    if len(readback) != len(replacement_networks):
+        raise FileTransformError("LD network replacement readback count does not match.")
+    if [normalized(item) for item in readback] != [normalized(item.strip())
+                                                    for item in replacement_networks]:
+        raise FileTransformError("LD network replacement readback differs from the requested program.")
+    return updated_source
+
+
 def parse_ld_network(network_text: str) -> dict:
     """Extract marker-delimited properties and raw LD nodes without assigning semantics."""
     def marker_region(start: str, end: str) -> str:

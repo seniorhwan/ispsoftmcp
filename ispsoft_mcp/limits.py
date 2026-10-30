@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import tempfile
+from typing import Any
 import zlib
 
 MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_SOURCE_BYTES = 16 * 1024 * 1024
 MAX_MEMBERS = 512
+MAX_ITEM_CHARS = 60_000
+MAX_RESPONSE_CHARS = 180_000
 
 
 class FileTransformError(ValueError):
@@ -108,3 +112,62 @@ def atomic_write(path: str | Path, data: bytes, inputs: tuple[Path, ...] = ()) -
     finally:
         if temp is not None:
             temp.unlink(missing_ok=True)
+
+
+def compute_content_hash(format_prefix: str, content: str | bytes) -> str:
+    """Compute standard SHA-256 content hash with format prefix."""
+    raw = content.encode("utf-8") if isinstance(content, str) else content
+    digest = hashlib.sha256(raw).hexdigest()
+    prefix = format_prefix.strip().rstrip(":")
+    if not prefix:
+        return f"sha256:{digest}"
+    if prefix.endswith("sha256"):
+        return f"{prefix}:{digest}"
+    return f"{prefix}:sha256:{digest}"
+
+
+def enforce_value_budget(
+    text: str,
+    name: str = "payload",
+    max_chars: int = MAX_ITEM_CHARS,
+    narrowing_hint: str = "",
+) -> dict[str, Any] | str:
+    """Enforce whole-value omission if a string payload exceeds max_chars."""
+    if len(text) <= max_chars:
+        return text
+    return {
+        "_omitted": True,
+        "field": name,
+        "character_count": len(text),
+        "budget_limit": max_chars,
+        "reason": f"Value for '{name}' ({len(text)} chars) exceeds item budget ({max_chars} chars). Whole value omitted to preserve client token window.",
+        "narrowing_guidance": narrowing_hint or f"Query individual sections or elements of '{name}' using dedicated read tools.",
+    }
+
+
+def budget_payload(
+    payload: dict[str, Any],
+    max_item_chars: int = MAX_ITEM_CHARS,
+    max_response_chars: int = MAX_RESPONSE_CHARS,
+) -> dict[str, Any]:
+    """Apply value budgeting across dict items and ensure overall JSON response fits budget."""
+    result = dict(payload)
+    for k, v in list(result.items()):
+        if isinstance(v, str) and len(v) > max_item_chars:
+            result[k] = enforce_value_budget(v, name=k, max_chars=max_item_chars)
+    serialized = json.dumps(result, default=str)
+    if len(serialized) > max_response_chars:
+        largest_field = None
+        largest_len = 0
+        for k, v in result.items():
+            if isinstance(v, str) and len(v) > largest_len:
+                largest_field = k
+                largest_len = len(v)
+        if largest_field and largest_len > 1000:
+            result[largest_field] = enforce_value_budget(
+                result[largest_field],
+                name=largest_field,
+                max_chars=1000,
+                narrowing_hint="Response size exceeded total response budget limit (180k chars).",
+            )
+    return result

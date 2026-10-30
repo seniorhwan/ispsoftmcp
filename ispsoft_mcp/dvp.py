@@ -20,13 +20,13 @@ def parse_il(text: str) -> list:
         line = line.strip()
         if not line or line.startswith(('#', ';', '//')):
             continue
-        pieces = [x.strip() for x in line.split(',')]
+        pieces = [x for x in re.split(r'[,\s]+', line) if x]
         op, operands = pieces[0].upper(), pieces[1:]
         if op not in arity or len(operands) != arity[op] or any(not p for p in operands):
             raise FileTransformError(f'Unsupported opcode or operand count on IL line {number}: {op}')
         if ended:
             raise FileTransformError('Instructions after END would be discarded')
-        if any(not re.fullmatch(r'(?:[A-Za-z_][A-Za-z_0-9]*|-?\d+)', p) for p in operands):
+        if any(not re.fullmatch(r'(?:[A-Za-z_][A-Za-z_0-9]*|-?\d+|[Kk]-?\d+)', p) for p in operands):
             raise FileTransformError(f'Unsupported operand syntax on IL line {number}')
         ended = op == 'END'
         instructions.append((op, operands))
@@ -77,7 +77,7 @@ def mpu_to_il(data: bytes, encoding: str) -> tuple[str, dict]:
         raise FileTransformError('Expected exactly one POU in the package')
     if re.search(r'(?m)^P_Security=([^\r\n]+)', source):
         raise FileTransformError('Protected POU is unsupported')
-    if re.search(r'(?m)^NET_ACTIVE=(?!TRUE\r?$)', source):
+    if re.search(r'(?m)^NET_ACTIVE=(?!TRUE\r*(?:\n|$))', source):
         raise FileTransformError('Inactive or unknown network state cannot be represented in flat IL')
     nets = mpu2il.parse_networks(source)
     if not nets or source.count('<NETWORK_START>') != len(nets) or source.count('<NETWORK_END>') != len(nets):

@@ -61,7 +61,7 @@ def map_device(address: str) -> dict[str, str | int | list[dict[str, str | int]]
         if number > 255:
             raise ValueError(f"{original} is outside the documented C0-C255 range")
         bit_address = 0xE00 + number if number <= 199 else 0xEC8 + number - 200
-        word_address = 0xE00 + number if number <= 199 else 0x700 + number - 200
+        word_address = 0xE00 + number if number <= 199 else 0x700 + (number - 200) * 2
         return {"device": original, "accesses": [
             {"data_type": "bit", "function_code": 1, "pdu_address": bit_address},
             {"data_type": "word", "function_code": 3, "pdu_address": word_address},

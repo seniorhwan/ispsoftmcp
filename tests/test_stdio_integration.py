@@ -78,6 +78,7 @@ class McpStdioIntegrationTests(unittest.TestCase):
             listed = receive(2)
             tool_names = {tool["name"] for tool in listed["result"]["tools"]}
             self.assertIn("ispsoft_write_local_variables_candidate", tool_names)
+            self.assertIn("ispsoft_write_ld_program", tool_names)
             self.assertIn("ispsoft_map_dvp_modbus_addresses", tool_names)
             self.assertIn("ispsoft_online_status", tool_names)
 

@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import ispsoft_mcp_server as server
-from ispsoft_mcp import containers, dvp, dvp_modbus, limits
+from ispsoft_mcp import containers, dvp, dvp_modbus, limits, packages
 
 
 AS_SOURCE = """<PROJECT>
@@ -417,6 +417,14 @@ class DvpTests(unittest.TestCase):
         self.assertIn("OUT,Y0", back)
         self.assertGreater(detail["network_count"], 0)
 
+    def test_il_to_mpu_or_branch_roundtrip_accepts_ispsoft_double_crlf(self) -> None:
+        data, _ = dvp.il_to_mpu("LD,X0\nOR,X1\nOUT,Y0\n", "MainProgram", "cp1252")
+        prefix, members = packages.unpack(data)
+        members["Unzipped.src"] = members["Unzipped.src"].replace(b"\r\n", b"\r\r\n")
+        encoded = packages.pack(prefix, members)
+        back, _ = dvp.mpu_to_il(encoded, "cp1252")
+        self.assertEqual(back, "LD,X0\nOR,X1\nOUT,Y0\n")
+
     def test_unsupported_instruction_is_rejected(self) -> None:
         with self.assertRaises(dvp.FileTransformError):
             dvp.parse_il("LD,X0\nTON,T0,K5\nOUT,Y0")
@@ -438,6 +446,89 @@ class DvpTests(unittest.TestCase):
             self.assertTrue(result["roundtrip_verified"])
             self.assertEqual(json.loads(server.ispsoft_read_mpu(str(output), "DVP12SE11T"))["success"], True)
 
+    @staticmethod
+    def _ld_project() -> bytes:
+        network = """<NETWORK_START>
+<PROPERTIES_START>
+NetworkID=1
+<PROPERTIES_END>
+<ROOTLINK_START>
+[LD_NODE]
+TYPE=1
+DEV_NAME=X0
+[END_LD_NODE]
+<ROOTLINK_END>
+<OUTLINK_START>
+[LD_NODE]
+TYPE=13
+DEV_NAME=Y0
+[END_LD_NODE]
+<OUTLINK_END>
+<NETWORK_END>
+"""
+        source = ES2_SOURCE.replace("P_Lang=2", "P_Lang=1").replace(
+            "</POU>", network + "</POU>")
+        return es2_v8_container(source)
+
+    def test_write_ld_program_compiles_reads_back_and_supports_recursive_candidate_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            original = root / "original.isp"
+            original_bytes = self._ld_project()
+            original.write_bytes(original_bytes)
+            compile_calls: list[str] = []
+
+            def fake_compile(path: str, action: str = "compile", timeout_seconds: int = 120,
+                             idle_wait_seconds: int = 15) -> str:
+                compile_calls.append(path)
+                return json.dumps({"success": True, "status": "NATIVE_COMPILE_PASSED",
+                                   "vendor_compile": "PASSED", "diagnostic_counts": {
+                                       "errors": 0, "warnings": 0}})
+
+            candidate_one = root / "candidate-one.isp"
+            with patch.object(server, "ispsoft_compile_and_check", side_effect=fake_compile):
+                first = json.loads(server.ispsoft_write_ld_program(
+                    str(original), "MainProgram", "LD,X0\nAND,X1\nOUT,Y0\n",
+                    "ES2", str(candidate_one)))
+            self.assertTrue(first["success"], first)
+            self.assertEqual(first["status"], "LD_PROGRAM_COMPILED_READBACK_VERIFIED")
+            self.assertTrue(first["readback_verified"])
+            self.assertTrue(first["original_project_untouched"])
+            self.assertEqual(first["semantic_readback_il"], "LD,X0\nAND,X1\nOUT,Y0\n")
+            self.assertEqual(original.read_bytes(), original_bytes)
+            self.assertEqual(Path(first["backup"]).read_bytes(), original_bytes)
+            first_source = containers.read_container(candidate_one).source.decode("cp1252")
+            first_pou = next(match.group(1) for match in containers.sections(first_source, "POU")
+                             if containers.property_value(match.group(1), "P_Name") == "MainProgram")
+            self.assertEqual(len(containers.ld_networks(first_pou)), 1)
+
+            candidate_two = root / "candidate-two.isp"
+            with patch.object(server, "ispsoft_compile_and_check", side_effect=fake_compile):
+                second = json.loads(server.ispsoft_write_ld_program(
+                    str(candidate_one), "MainProgram", "LD,X2\nOUT,M10\nLD,M10\nSET,Y1\n",
+                    "DVP32ES2T", str(candidate_two)))
+            self.assertTrue(second["success"], second)
+            self.assertEqual(second["iteration_input_project"], str(candidate_one.resolve()))
+            self.assertEqual(second["semantic_readback_il"],
+                             "LD,X2\nOUT,M10\nLD,M10\nSET,Y1\n")
+            self.assertEqual(Path(second["backup"]).read_bytes(), candidate_one.read_bytes())
+            self.assertEqual(len(compile_calls), 2)
+
+    def test_write_ld_program_rejects_unsupported_program_before_candidate_or_compile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "input.isp"
+            project.write_bytes(self._ld_project())
+            target = Path(temp) / "must-not-exist.isp"
+            with patch.object(server, "ispsoft_compile_and_check") as compile_check:
+                result = json.loads(server.ispsoft_write_ld_program(
+                    str(project), "MainProgram", "LD,X0\nTON,T0,K5\nOUT,Y0\n",
+                    "ES2", str(target)))
+            self.assertFalse(result["success"])
+            self.assertEqual(result["status"], "CANDIDATE_FAILED")
+            self.assertEqual(result["compile_status"], "NOT_RUN")
+            self.assertFalse(target.exists())
+            compile_check.assert_not_called()
+
 
 class AnalysisAndSafetyTests(unittest.TestCase):
     def test_mcp_registry_exposes_new_agent_workflow_tools(self) -> None:
@@ -453,6 +544,7 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             "ispsoft_list_commgr_drivers", "ispsoft_list_serial_ports",
             "ispsoft_write_local_variables_candidate",
             "ispsoft_map_dvp_modbus_addresses",
+            "ispsoft_write_ld_program",
         }.issubset(names))
 
     def test_serial_port_inventory_does_not_claim_device_identity_or_contact(self) -> None:
@@ -484,6 +576,7 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         self.assertEqual(matrix["per_profile"]["ES2"]["local_variable_candidate_generation"],
                          "QUALIFIED_LIMITED")
         self.assertEqual(matrix["dvp_modbus_address_mapping"]["models"], ["ES2"])
+        self.assertEqual(matrix["ld_program_authoring"]["models"], ["ES2"])
         self.assertEqual(matrix["plc_connection"]["status"], "NOT_QUALIFIED")
 
     def test_dvp_modbus_mapping_is_documented_offline_translation_only(self) -> None:
@@ -651,7 +744,7 @@ class AnalysisAndSafetyTests(unittest.TestCase):
         self.assertEqual(result["concurrent_change_files"], ["CompiledCode.txt"])
         self.assertEqual(current, b"concurrent user compile state")
 
-    def test_user_activity_verifies_unchanged_compiler_sidecars_without_writing(self) -> None:
+    def test_visible_ispsoft_verifies_unchanged_compiler_sidecars_without_writing(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             sidecar = root / "CompiledCode.txt"
@@ -660,11 +753,11 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             result = server._verify_compiler_sidecars_unchanged(root, before)
             current = sidecar.read_bytes()
         self.assertTrue(result["success"])
-        self.assertEqual(result["status"], "UNCHANGED_DURING_USER_ACTIVITY")
+        self.assertEqual(result["status"], "UNCHANGED_WHILE_VISIBLE_ISPSOFT_INACTIVE")
         self.assertEqual(result["restored_files"], [])
         self.assertEqual(current, b"before")
 
-    def test_user_activity_rejects_changed_compiler_sidecars_without_restoring(self) -> None:
+    def test_visible_ispsoft_rejects_changed_compiler_sidecars_without_restoring(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             sidecar = root / "CompiledCode.txt"
@@ -674,9 +767,39 @@ class AnalysisAndSafetyTests(unittest.TestCase):
             result = server._verify_compiler_sidecars_unchanged(root, before)
             current = sidecar.read_bytes()
         self.assertFalse(result["success"])
-        self.assertEqual(result["status"], "SKIPPED_DURING_USER_ACTIVITY")
+        self.assertEqual(result["status"], "SKIPPED_WHILE_VISIBLE_ISPSOFT_ACTIVE")
         self.assertEqual(result["concurrent_change_files"], ["CompiledCode.txt"])
         self.assertEqual(current, b"concurrent change")
+
+    def test_private_desktop_input_does_not_block_worker_owned_sidecar_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sidecar = root / "CompiledCode.txt"
+            sidecar.write_bytes(b"before")
+            before = server._snapshot_compiler_sidecars(root)
+            sidecar.write_bytes(b"worker-output")
+            result = server._finish_compiler_sidecars(
+                root, before, {"CompiledCode.txt": server._sha(b"worker-output")},
+                visible_ide_active=False)
+            current = sidecar.read_bytes()
+        self.assertTrue(result["success"])
+        self.assertEqual(result["restored_files"], ["CompiledCode.txt"])
+        self.assertEqual(current, b"before")
+
+    def test_visible_ispsoft_activity_never_restores_shared_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sidecar = root / "CompiledCode.txt"
+            sidecar.write_bytes(b"before")
+            before = server._snapshot_compiler_sidecars(root)
+            sidecar.write_bytes(b"user-change")
+            result = server._finish_compiler_sidecars(
+                root, before, {"CompiledCode.txt": server._sha(b"worker-output")},
+                visible_ide_active=True)
+            current = sidecar.read_bytes()
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], "SKIPPED_WHILE_VISIBLE_ISPSOFT_ACTIVE")
+        self.assertEqual(current, b"user-change")
 
     def test_native_check_removes_worker_sidecars_that_did_not_exist_before(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

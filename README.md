@@ -34,6 +34,14 @@ that an MCP operation works on it.
   DVP12SE11R, and DVP12SE11T profiles. Supported mnemonics and network shapes
   are deliberately limited by the serializer; unsupported or lossy logic is
   rejected.
+- End-to-end LD authoring for existing ISPSoft 3.24 ES2 Ladder Diagram POUs from
+  the supported IL subset. `ispsoft_write_ld_program` replaces all networks in
+  a new project candidate while retaining POU metadata and symbols, makes a
+  byte-identical backup, runs native Compile on an isolated copy, and compares
+  semantic IL plus exact network readback before it reports success. Agents can
+  iterate by using the returned candidate as the next input; every iteration
+  creates another candidate and backup. Unsupported instructions, project
+  types, POUs, or layouts fail closed. This is not PLC download qualification.
 - Textual cross-reference analysis and DVP-style comment-map validation.
 - Offline DVP ES2 device-to-Modbus PDU address translation. It reports standard
   function codes and zero-based PDU addresses for documented X/Y/M/S/T/C/D
@@ -131,6 +139,7 @@ the detected Delta installation path.
 | `ispsoft_write_st_candidate` | Patch an existing ST POU into a new `.isp` candidate with a backup. |
 | `ispsoft_write_local_variables_candidate` | Replace one ES2 POU's native `LOCAL_VAR` symbol section in a new backed-up candidate, with exact decoded readback verification. |
 | `ispsoft_write_ld_network_candidate` | Replace one raw ES2 LD network into a backed-up `.isp` candidate; structural checks only, never compile or download. |
+| `ispsoft_write_ld_program` | Convert supported IL into native LD networks, replace an existing ES2 LD POU in a new backed-up candidate, native-compile a disposable copy, and require semantic readback before reporting success. Pass the returned candidate into the next call for an agent edit/compile/readback loop. |
 | `ispsoft_write_device_comment_candidate` | Merge comments into a new ES2 project candidate. |
 | `ispsoft_validate_il` | Validate supported DVP IL and prove MPU serialization/readback. |
 | `ispsoft_generate_mpu` | Generate a `.mpu` POU artifact; it does not import it into a project. |
@@ -152,6 +161,9 @@ the detected Delta installation path.
    private desktop, leaves the user's foreground session alone, and reports a
    pass only when Windows OCR reads the Compile Message pane's error and warning
    counts. Inspect the retained screenshot and compiler sidecars when OCR fails.
+   For supported ES2 LD authoring, `ispsoft_write_ld_program` performs candidate
+   creation, Compile, and semantic readback as one operation; use its returned
+   candidate as the next iteration's input to continue the agent review loop.
 5. Transfer to hardware only through ISPSoft after engineering approval. MCP
    downloads and runtime writes are not yet available. Never treat the
    installed model catalog or COMMGR process presence as proof of connectivity.
@@ -169,9 +181,9 @@ ISPSoft sample smoke test is read-only. Real project and hardware qualification
 remains model- and version-specific. Native compile/check writes fixed-name
 compiler sidecars beneath the Windows roaming profile despite the worker's
 private `APPDATA`. The MCP snapshots those files and restores their previous
-contents after the check only if no user activity occurred and each current
-file still matches the worker's captured output. A concurrent change is
-preserved and makes the result unverified. MCP instances serialize their
+  contents only when the visible user's ISPSoft process did not become foreground
+and each current file still matches this worker's captured output. A concurrent
+change is preserved and makes the result unverified. MCP instances serialize their
 builds within the current Windows logon session. A build waits briefly for the
 visible ISPSoft window to leave the foreground; if it remains active, the tool
 returns without starting a worker. It is marked unverified if the user

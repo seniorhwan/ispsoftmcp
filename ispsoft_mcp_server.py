@@ -28,7 +28,16 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from ispsoft_mcp import containers, dvp, dvp_modbus, packages
-from ispsoft_mcp.limits import FileTransformError, atomic_write, read_bytes
+from ispsoft_mcp.limits import (
+    FileTransformError,
+    atomic_write,
+    read_bytes,
+    compute_content_hash,
+    enforce_value_budget,
+    budget_payload,
+    MAX_ITEM_CHARS,
+    MAX_RESPONSE_CHARS,
+)
 
 
 SERVER_NAME = "ispsoft"
@@ -59,6 +68,7 @@ WRITE_OPS = {"OUT", "SET", "RST", "MOV", "DMOV", "DADD", "DSUB", "DMUL", "INC", 
 
 mcp = FastMCP(SERVER_NAME)
 _BACKGROUND_IDE_SESSIONS: dict[str, dict[str, Any]] = {}
+_SESSIONS_LOCK = threading.Lock()
 _NATIVE_COMPILE_LOCK = threading.Lock()
 
 
@@ -128,6 +138,8 @@ class _PrivateDesktopProcess:
 
 
 def _json(value: Any) -> str:
+    if isinstance(value, dict):
+        value = budget_payload(value, max_item_chars=MAX_ITEM_CHARS, max_response_chars=MAX_RESPONSE_CHARS)
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
 
 
@@ -753,8 +765,17 @@ def _verify_compiler_sidecars_unchanged(root: Path,
                if (read_bytes(root / name) if (root / name).is_file() else None) != original]
     return {"success": not changed, "restored_files": [],
             "concurrent_change_files": changed,
-            "status": "UNCHANGED_DURING_USER_ACTIVITY" if not changed
-            else "SKIPPED_DURING_USER_ACTIVITY"}
+            "status": "UNCHANGED_WHILE_VISIBLE_ISPSOFT_INACTIVE" if not changed
+            else "SKIPPED_WHILE_VISIBLE_ISPSOFT_ACTIVE"}
+
+
+def _finish_compiler_sidecars(root: Path, before: dict[str, bytes | None],
+                              worker_hashes: dict[str, str],
+                              visible_ide_active: bool) -> dict[str, Any]:
+    """Restore only when visible ISPSoft stayed inactive and outputs still match this worker."""
+    if visible_ide_active:
+        return _verify_compiler_sidecars_unchanged(root, before)
+    return _restore_compiler_sidecars(root, before, worker_hashes)
 
 
 def _last_user_input_tick() -> int | None:
@@ -1067,12 +1088,17 @@ def _capture_private_window_bmp(process: _PrivateDesktopProcess, window_handle: 
     if width <= 0 or height <= 0 or width * height > 80_000_000:
         raise OSError(f"Invalid private window dimensions: {width}x{height}.")
     screen_dc = user32.GetDC(None)
-    memory_dc = gdi32.CreateCompatibleDC(screen_dc)
-    bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
-    if not screen_dc or not memory_dc or not bitmap:
+    if not screen_dc:
         raise ctypes.WinError(ctypes.get_last_error())
-    previous = gdi32.SelectObject(memory_dc, bitmap)
+    memory_dc = None
+    bitmap = None
+    previous = None
     try:
+        memory_dc = gdi32.CreateCompatibleDC(screen_dc)
+        bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+        if not memory_dc or not bitmap:
+            raise ctypes.WinError(ctypes.get_last_error())
+        previous = gdi32.SelectObject(memory_dc, bitmap)
         if not user32.PrintWindow(window_handle, memory_dc, 2):
             raise OSError("PrintWindow could not capture the private ISPSoft window.")
         header = BitmapInfoHeader(ctypes.sizeof(BitmapInfoHeader), width, -height,
@@ -1092,9 +1118,12 @@ def _capture_private_window_bmp(process: _PrivateDesktopProcess, window_handle: 
         return {"path": str(target), "width": width, "height": height,
                 "sha256": _sha(read_bytes(target)), "private_desktop": process.desktop_name}
     finally:
-        gdi32.SelectObject(memory_dc, previous)
-        gdi32.DeleteObject(bitmap)
-        gdi32.DeleteDC(memory_dc)
+        if memory_dc and previous:
+            gdi32.SelectObject(memory_dc, previous)
+        if bitmap:
+            gdi32.DeleteObject(bitmap)
+        if memory_dc:
+            gdi32.DeleteDC(memory_dc)
         user32.ReleaseDC(None, screen_dc)
 
 
@@ -1487,7 +1516,8 @@ def ispsoft_start_background_session(project_path: str = "", wait_seconds: int =
             "created_by_server": True, "priority_class": "BELOW_NORMAL",
             "isolated_desktop": True, "visible_to_user": False,
         }
-        _BACKGROUND_IDE_SESSIONS[session_id] = record
+        with _SESSIONS_LOCK:
+            _BACKGROUND_IDE_SESSIONS[session_id] = record
         expected = f"__mcp_{session_id[:12]}".casefold()
         deadline = time.monotonic() + wait_seconds
         matching: list[dict[str, Any]] = []
@@ -1599,7 +1629,9 @@ def ispsoft_start_background_session(project_path: str = "", wait_seconds: int =
 def ispsoft_get_background_sessions() -> str:
     """List private-desktop ISPSoft workers created by this MCP server."""
     sessions: list[dict[str, Any]] = []
-    for session_id, record in list(_BACKGROUND_IDE_SESSIONS.items()):
+    with _SESSIONS_LOCK:
+        items = list(_BACKGROUND_IDE_SESSIONS.items())
+    for session_id, record in items:
         process = record.get("process")
         process_running = process is not None and process.poll() is None
         windows = process.windows() if process is not None and process_running else []
@@ -1616,7 +1648,8 @@ def ispsoft_get_background_sessions() -> str:
 @mcp.tool()
 def ispsoft_stop_background_session(session_id: str) -> str:
     """Stop only the hidden ISPSoft process started by this MCP session."""
-    record = _BACKGROUND_IDE_SESSIONS.get(session_id)
+    with _SESSIONS_LOCK:
+        record = _BACKGROUND_IDE_SESSIONS.get(session_id)
     if record is None:
         return _json({"success": False, "status": "UNKNOWN_SESSION",
                       "error": "No background worker with that session_id was started by this MCP process."})
@@ -1687,6 +1720,7 @@ def _capability_matrix() -> dict[str, Any]:
             "st_candidate_generation": "QUALIFIED_LIMITED" if "ST" in profile.get("languages", []) else "NOT_QUALIFIED",
             "local_variable_candidate_generation": "QUALIFIED_LIMITED" if name == "ES2" else "NOT_QUALIFIED",
             "ld_network_candidate_generation": "QUALIFIED_LIMITED" if name == "ES2" else "NOT_QUALIFIED",
+            "ld_program_authoring": "QUALIFIED_LIMITED" if name == "ES2" else "NOT_QUALIFIED",
             "il_mpu_generation": "QUALIFIED_LIMITED" if profile.get("pou_exchange") == "MPU" else "NOT_QUALIFIED",
             "native_compile_check": "QUALIFIED_LIMITED_ISPSOFT_3_24_ES2" if name == "ES2" else "NOT_QUALIFIED",
             "plc_connection_upload_download": "NOT_QUALIFIED",
@@ -1705,6 +1739,11 @@ def _capability_matrix() -> dict[str, Any]:
                                                 "readback": "exact decoded section match",
                                                 "native_compile": "separate ISPSoft 3.24 Check/Compile"},
         "ld_network_candidate_generation": {"status": "QUALIFIED_LIMITED", "models": ["ES2"], "raw_network_replacement_only": True, "native_compile": "NOT_QUALIFIED"},
+        "ld_program_authoring": {"status": "QUALIFIED_LIMITED", "models": ["ES2"],
+                                 "input_format": "supported DVP IL subset",
+                                 "output": "new ISPSoft LD project candidate",
+                                 "native_compile": "ISPSoft 3.24",
+                                 "semantic_readback": "required before success"},
         "project_template_clone": {"status": "QUALIFIED_LIMITED", "same_model_only": True, "native_compile": "NOT_QUALIFIED"},
         "native_blank_project_creation": {"status": "NOT_QUALIFIED"},
         "native_compile_check": {"status": "QUALIFIED_LIMITED", "ispsoft_versions": ["3.24"],
@@ -1861,11 +1900,13 @@ def ispsoft_inspect_project(project_path: str) -> str:
     try:
         container = containers.read_container(project_path)
         result = containers.inspect(container)
+        raw_bytes = read_bytes(project_path)
         result.update(success=True, path=str(Path(project_path).expanduser().resolve()),
-                      project_sha256=_sha(read_bytes(project_path)))
+                      project_sha256=_sha(raw_bytes),
+                      content_hash=compute_content_hash("isp", raw_bytes))
         return _json(result)
     except (OSError, FileTransformError, ValueError) as exc:
-        return _json({"success": False, "error": str(exc),
+        return _json({"success": False, "failure_category": "validation_error", "error": str(exc),
                       "supported_formats": "known unprotected ISPSoft streams 0xAA/0xAC and qualified AS228 v3010",
                       "path": project_path})
 
@@ -1877,11 +1918,18 @@ def ispsoft_read_project_source(project_path: str) -> str:
         container = containers.read_container(project_path)
         source = container.source.decode(container.encoding)
         info = containers.inspect(container)
+        content_hash = compute_content_hash("isp", container.source)
+        budgeted_source = enforce_value_budget(
+            source,
+            name="source",
+            narrowing_hint="Query individual POUs via ispsoft_read_pou or summarize via ispsoft_get_project_overview.",
+        )
         return _json({"success": True, "path": str(Path(project_path).resolve()),
                       "encoding": container.encoding, "newline": repr(container.newline),
-                      "project": info, "source": source})
+                      "project": info, "source": budgeted_source,
+                      "content_hash": content_hash})
     except (OSError, FileTransformError, ValueError) as exc:
-        return _json({"success": False, "error": str(exc), "path": project_path})
+        return _json({"success": False, "failure_category": "validation_error", "error": str(exc), "path": project_path})
 
 
 @mcp.tool()
@@ -1899,12 +1947,14 @@ def ispsoft_get_project_overview(project_path: str) -> str:
             tasks.append({"id": int(task_id.group(1)) if task_id else None,
                           "program": program.group(1).strip() if program else None})
         comments = _project_comment_map(source)
+        raw_bytes = read_bytes(project_path)
         return _json({"success": True, "path": str(Path(project_path).resolve()),
                       "model": info.get("project_model"), "pous": info.get("pous", []),
                       "tasks": tasks, "device_comment_count": len(comments),
-                      "project_sha256": _sha(read_bytes(project_path))})
+                      "project_sha256": _sha(raw_bytes),
+                      "content_hash": compute_content_hash("isp", raw_bytes)})
     except (OSError, FileTransformError, ValueError) as exc:
-        return _json({"success": False, "error": str(exc), "path": project_path})
+        return _json({"success": False, "failure_category": "validation_error", "error": str(exc), "path": project_path})
 
 
 @mcp.tool()
@@ -1936,9 +1986,11 @@ def ispsoft_read_pou(project_path: str, pou_name: str) -> str:
                       "network_count": len(networks),
                       "sections": sections,
                       "local_variable_symbols": local_symbols,
+                      "content_hash": compute_content_hash("pou", body),
+                      "project_content_hash": compute_content_hash("isp", container.source),
                       "note": "LD_NETWORKS contains raw network bodies in project order; network marker keys are legacy and no semantic rung decode is claimed."})
     except (OSError, FileTransformError, ValueError) as exc:
-        return _json({"success": False, "error": str(exc), "pou_name": pou_name})
+        return _json({"success": False, "failure_category": "validation_error", "error": str(exc), "pou_name": pou_name})
 
 
 @mcp.tool()
@@ -1946,6 +1998,7 @@ def ispsoft_read_ld_network(project_path: str, pou_name: str, network_index: int
     """Read one raw LD network body by its one-based order within a named POU."""
     if not isinstance(network_index, int) or isinstance(network_index, bool) or network_index < 1:
         return _json({"success": False, "status": "REJECTED_BEFORE_READ",
+                      "failure_category": "validation_error",
                       "error": "network_index must be a positive one-based integer."})
     try:
         container = containers.read_container(project_path)
@@ -1958,10 +2011,12 @@ def ispsoft_read_ld_network(project_path: str, pou_name: str, network_index: int
         networks = containers.ld_networks(body)
         if not networks:
             return _json({"success": False, "status": "NO_LD_NETWORKS",
+                          "failure_category": "validation_error",
                           "project_path": str(Path(project_path).expanduser().resolve()),
                           "pou_name": pou_name, "network_count": 0})
         if network_index > len(networks):
             return _json({"success": False, "status": "NETWORK_INDEX_OUT_OF_RANGE",
+                          "failure_category": "validation_error",
                           "pou_name": pou_name, "network_index": network_index,
                           "network_count": len(networks)})
         network_text = networks[network_index - 1]
@@ -1971,9 +2026,11 @@ def ispsoft_read_ld_network(project_path: str, pou_name: str, network_index: int
                       "pou_name": pou_name, "language": containers.property_value(body, 'P_Lang'),
                       "network_index": network_index, "network_count": len(networks),
                       "network_text": network_text, "structure": structure,
+                      "content_hash": compute_content_hash("network", network_text),
+                      "pou_content_hash": compute_content_hash("pou", body),
                       "interpretation": "Raw marker fields and ordered node records only; node type semantics, rung topology, and compilation are not inferred."})
     except (OSError, FileTransformError, ValueError) as exc:
-        return _json({"success": False, "status": "READ_FAILED", "error": str(exc),
+        return _json({"success": False, "status": "READ_FAILED", "failure_category": "validation_error", "error": str(exc),
                       "pou_name": pou_name})
 
 
@@ -1991,6 +2048,7 @@ def ispsoft_get_ld_program_structure(project_path: str, pou_name: str) -> str:
         raw_networks = containers.ld_networks(body)
         if not raw_networks:
             return _json({"success": False, "status": "NO_LD_NETWORKS",
+                          "failure_category": "validation_error",
                           "project_path": str(Path(project_path).expanduser().resolve()),
                           "pou_name": pou_name, "network_count": 0})
         networks: list[dict[str, Any]] = []
@@ -2014,9 +2072,10 @@ def ispsoft_get_ld_program_structure(project_path: str, pou_name: str) -> str:
                       "language": containers.property_value(body, 'P_Lang'),
                       "network_count": len(networks), "node_type_counts": totals,
                       "networks": networks,
+                      "content_hash": compute_content_hash("pou", body),
                       "interpretation": "Ordered raw fields only; type-code meaning, rung topology, execution behavior, and compile status are not inferred."})
     except (OSError, FileTransformError, ValueError) as exc:
-        return _json({"success": False, "status": "READ_FAILED", "error": str(exc),
+        return _json({"success": False, "status": "READ_FAILED", "failure_category": "validation_error", "error": str(exc),
                       "pou_name": pou_name})
 
 
@@ -2075,9 +2134,11 @@ def ispsoft_read_device_comments(project_path: str) -> str:
         container = containers.read_container(project_path)
         comments = _project_comment_map(container.source.decode(container.encoding))
         return _json({"success": True, "path": str(Path(project_path).resolve()),
-                      "count": len(comments), "device_comments": comments})
+                      "count": len(comments), "device_comments": comments,
+                      "content_hash": compute_content_hash("comments", json.dumps(comments, sort_keys=True)),
+                      "project_content_hash": compute_content_hash("isp", container.source)})
     except (OSError, FileTransformError, ValueError) as exc:
-        return _json({"success": False, "error": str(exc), "path": project_path})
+        return _json({"success": False, "failure_category": "validation_error", "error": str(exc), "path": project_path})
 
 
 @mcp.tool()
@@ -2088,18 +2149,32 @@ def ispsoft_open_project(project_path: str) -> str:
 
 @mcp.tool()
 def ispsoft_write_st_candidate(project_path: str, pou_name: str, code: str,
-                               model: str, output_path: str = "") -> str:
+                               model: str, output_path: str = "",
+                               expected_content_hash: str = "",
+                               dry_run: bool = False) -> str:
     """Create a new ST-patched .isp candidate and original backup; never edits input."""
     canonical, model_error = _model(model)
     if model_error:
-        return _json({"status": "REJECTED_BEFORE_WRITE", "error": model_error})
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "validation_error", "error": model_error})
     if "ST" not in MODEL_PROFILES[canonical]["languages"]:
-        return _json({"status": "REJECTED_BEFORE_WRITE", "error": "ST project patching is not qualified for this model."})
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "validation_error", "error": "ST project patching is not qualified for this model."})
     if not isinstance(code, str) or not code.strip() or len(code.encode("utf-8")) > 1_000_000:
-        return _json({"status": "REJECTED_BEFORE_WRITE", "error": "code must be non-empty and no larger than 1 MB."})
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "validation_error", "error": "code must be non-empty and no larger than 1 MB."})
     try:
         source_path = Path(project_path).expanduser().resolve(strict=True)
         original = read_bytes(source_path)
+        current_hash = compute_content_hash("isp", original)
+
+        if expected_content_hash and not expected_content_hash.startswith("pou:"):
+            if expected_content_hash != current_hash:
+                return _json({
+                    "success": False,
+                    "status": "REJECTED_BEFORE_WRITE",
+                    "failure_category": "state_changed",
+                    "error": f"Target was modified concurrently. Expected '{expected_content_hash}' does not match current state.",
+                    "current_content_hash": current_hash,
+                })
+
         container = containers.read_container(source_path)
         info = containers.inspect(container)
         metadata = str(info.get("project_model") or "").upper()
@@ -2111,12 +2186,48 @@ def ispsoft_write_st_candidate(project_path: str, pou_name: str, code: str,
         pou_info = [p for p in info["pous"] if p["name"] == pou_name]
         if len(pou_info) != 1 or pou_info[0].get("language") != "2":
             raise FileTransformError("The named POU is not an ST POU in the supported source representation.")
+
+        source_text = container.source.decode(container.encoding)
+        pou_candidates = [match for match in containers.sections(source_text, 'POU')
+                          if containers.property_value(match.group(1), 'P_Name') == pou_name]
+        pou_body = pou_candidates[0].group(1) if pou_candidates else ""
+        pou_hash = compute_content_hash("pou", pou_body) if pou_body else ""
+
+        if expected_content_hash and expected_content_hash.startswith("pou:"):
+            if expected_content_hash != pou_hash:
+                return _json({
+                    "success": False,
+                    "status": "REJECTED_BEFORE_WRITE",
+                    "failure_category": "state_changed",
+                    "error": f"Target POU was modified concurrently. Expected '{expected_content_hash}' does not match current state.",
+                    "current_content_hash": current_hash,
+                    "pou_content_hash": pou_hash,
+                })
+
         patched = containers.patch_st(container, pou_name, code, None)
         verified = containers.decode(patched)
         verified_info = containers.inspect(verified)
         matches = [p for p in verified_info["pous"] if p["name"] == pou_name]
         if len(matches) != 1 or code.strip() not in verified.source.decode(verified.encoding):
             raise FileTransformError("Candidate readback does not contain the requested POU source.")
+
+        if dry_run:
+            return _json({
+                "success": True,
+                "status": "DRY_RUN_PASSED",
+                "dry_run": True,
+                "model": canonical,
+                "pou_name": pou_name,
+                "source_sha256": _sha(verified.source),
+                "current_content_hash": current_hash,
+                "preview": {
+                    "pou_name": pou_name,
+                    "code_length": len(code),
+                    "verified_pous": [p["name"] for p in verified_info["pous"]],
+                },
+                "note": "Dry run succeeded; syntax validated and container patched in memory without writing to disk."
+            })
+
         if output_path.strip():
             target = Path(output_path).expanduser().absolute()
             if not target.parent.is_dir():
@@ -2125,20 +2236,23 @@ def ispsoft_write_st_candidate(project_path: str, pou_name: str, code: str,
             target = _artifact_path(f"{source_path.stem}-{pou_name}-candidate", ".isp")
         target, backup_path, companion_path = _write_project_candidate_and_backup(
             source_path, target, original, patched)
-        return _json({"status": "GENERATED_UNCOMPILED", "candidate": str(target),
+        return _json({"success": True, "status": "GENERATED_UNCOMPILED", "candidate": str(target),
                       "backup": str(backup_path), "candidate_companion": str(companion_path) if companion_path else None,
                       "model": canonical, "pou_name": pou_name,
                       "source_sha256": _sha(verified.source),
+                      "content_hash": compute_content_hash("isp", patched),
                       "vendor_compile": "NOT_RUN: ISPSoft native build/check automation is not qualified",
                       "plc_download": "NOT_RUN"})
     except (OSError, FileTransformError, ValueError) as exc:
-        return _json({"status": "CANDIDATE_FAILED", "error": str(exc)})
+        return _json({"success": False, "status": "CANDIDATE_FAILED", "failure_category": "validation_error", "error": str(exc)})
 
 
 @mcp.tool()
 def ispsoft_write_local_variables_candidate(project_path: str, pou_name: str,
                                              variables: str, model: str,
-                                             output_path: str = "") -> str:
+                                             output_path: str = "",
+                                             expected_content_hash: str = "",
+                                             dry_run: bool = False) -> str:
     """Replace one POU's native local-symbol declaration section in a backed-up candidate.
 
     ``variables`` is the complete inner text of the section returned by
@@ -2147,27 +2261,28 @@ def ispsoft_write_local_variables_candidate(project_path: str, pou_name: str,
     """
     canonical, model_error = _model(model)
     if model_error:
-        return _json({"status": "REJECTED_BEFORE_WRITE", "error": model_error})
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "validation_error", "error": model_error})
     if canonical != "ES2":
-        return _json({"status": "REJECTED_BEFORE_WRITE",
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "binding_conflict",
                       "error": "Local-variable candidate generation is currently qualified only for the DVP ES2 project container."})
     if not isinstance(project_path, str) or not project_path.strip():
-        return _json({"status": "REJECTED_BEFORE_READ", "error": "project_path must be a non-empty path."})
+        return _json({"success": False, "status": "REJECTED_BEFORE_READ", "failure_category": "validation_error", "error": "project_path must be a non-empty path."})
     if not isinstance(pou_name, str) or not pou_name.strip() or len(pou_name) > 128:
-        return _json({"status": "REJECTED_BEFORE_READ", "error": "pou_name must be 1-128 characters."})
+        return _json({"success": False, "status": "REJECTED_BEFORE_READ", "failure_category": "validation_error", "error": "pou_name must be 1-128 characters."})
     if not isinstance(variables, str) or not variables.strip():
-        return _json({"status": "REJECTED_BEFORE_WRITE",
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "validation_error",
                       "error": "variables must be non-empty text."})
     try:
         if len(variables.encode("utf-8")) > 1_000_000:
-            return _json({"status": "REJECTED_BEFORE_WRITE",
+            return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "validation_error",
                           "error": "variables must be no larger than 1 MB."})
     except UnicodeEncodeError:
-        return _json({"status": "REJECTED_BEFORE_WRITE",
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "validation_error",
                       "error": "variables contains invalid Unicode."})
     try:
         source_path = Path(project_path).expanduser().resolve(strict=True)
         original = read_bytes(source_path)
+        current_hash = compute_content_hash("isp", original)
         container = containers.read_container(source_path)
         project_info = containers.inspect(container)
         if project_info.get("project_model") != "ES2":
@@ -2177,11 +2292,23 @@ def ispsoft_write_local_variables_candidate(project_path: str, pou_name: str,
                          if containers.property_value(match.group(1), "P_Name") == pou_name]
         if len(matching_pous) != 1:
             raise FileTransformError(f"Expected one POU named {pou_name!r}; found {len(matching_pous)}.")
-        local_sections = containers.sections(matching_pous[0].group(1), "LOCAL_VAR")
+        pou_body = matching_pous[0].group(1)
+        pou_hash = compute_content_hash("pou", pou_body)
+
+        if expected_content_hash:
+            if expected_content_hash != current_hash and expected_content_hash != pou_hash:
+                return _json({
+                    "success": False,
+                    "status": "REJECTED_BEFORE_WRITE",
+                    "failure_category": "state_changed",
+                    "error": f"Target was modified concurrently. Expected '{expected_content_hash}' does not match current state.",
+                    "current_content_hash": current_hash,
+                    "pou_content_hash": pou_hash,
+                })
+
+        local_sections = containers.sections(pou_body, "LOCAL_VAR")
         if len(local_sections) != 1:
             raise FileTransformError("Expected exactly one LOCAL_VAR section in the named POU.")
-        # Only the observed VAR wrapper is valid markup in this ES2 table;
-        # other tags could escape the POU section or corrupt project structure.
         variable_tags = re.findall(r"<(/?)([A-Za-z_][A-Za-z0-9_]*)\b[^>]*>", variables)
         if any(tag.upper() != "VAR" for _, tag in variable_tags):
             raise FileTransformError("Replacement contains markup outside the supported VAR wrapper.")
@@ -2199,6 +2326,20 @@ def ispsoft_write_local_variables_candidate(project_path: str, pou_name: str,
         if (len(verified_sections) != 1 or
                 containers.normalized(verified_sections[0].group(1)) != containers.normalized(variables)):
             raise FileTransformError("Candidate local-variable readback differs from the requested section.")
+
+        if dry_run:
+            return _json({
+                "success": True,
+                "status": "DRY_RUN_PASSED",
+                "dry_run": True,
+                "model": canonical,
+                "pou_name": pou_name,
+                "source_sha256": _sha(verified.source),
+                "current_content_hash": current_hash,
+                "readback_verified": True,
+                "note": "Dry run succeeded; local variables validated in memory without writing to disk."
+            })
+
         if output_path.strip():
             target = Path(output_path).expanduser().absolute()
             if not target.parent.is_dir():
@@ -2207,39 +2348,43 @@ def ispsoft_write_local_variables_candidate(project_path: str, pou_name: str,
             target = _artifact_path(f"{source_path.stem}-{pou_name}-local-vars-candidate", ".isp")
         target, backup_path, companion_path = _write_project_candidate_and_backup(
             source_path, target, original, candidate_bytes)
-        return _json({"status": "GENERATED_UNCOMPILED", "candidate": str(target),
+        return _json({"success": True, "status": "GENERATED_UNCOMPILED", "candidate": str(target),
                       "backup": str(backup_path),
                       "candidate_companion": str(companion_path) if companion_path else None,
                       "model": canonical, "pou_name": pou_name,
                       "source_sha256": _sha(verified.source),
+                      "content_hash": compute_content_hash("isp", candidate_bytes),
                       "readback_verified": True, "vendor_compile": "NOT_RUN",
                       "plc_download": "NOT_RUN"})
     except (OSError, FileTransformError, UnicodeError, ValueError) as exc:
-        return _json({"status": "CANDIDATE_FAILED", "error": str(exc)})
+        return _json({"success": False, "status": "CANDIDATE_FAILED", "failure_category": "validation_error", "error": str(exc)})
 
 
 @mcp.tool()
 def ispsoft_write_ld_network_candidate(project_path: str, pou_name: str, network_index: int,
                                        replacement_network: str, model: str,
-                                       output_path: str = "") -> str:
+                                       output_path: str = "",
+                                       expected_content_hash: str = "",
+                                       dry_run: bool = False) -> str:
     """Replace one raw ES2 LD network in a new candidate; never alter or compile the source."""
     canonical, model_error = _model(model)
     if model_error:
-        return _json({"status": "REJECTED_BEFORE_WRITE", "error": model_error})
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "validation_error", "error": model_error})
     if canonical != "ES2":
-        return _json({"status": "REJECTED_BEFORE_WRITE",
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "binding_conflict",
                       "error": "Raw LD network candidate editing is qualified only for ISPSoft 3.24 DVP ES2 projects."})
     if not isinstance(network_index, int) or isinstance(network_index, bool) or network_index < 1:
-        return _json({"status": "REJECTED_BEFORE_WRITE",
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "validation_error",
                       "error": "network_index must be a positive one-based integer."})
     validation_errors = containers.validate_ld_network(replacement_network)
     if validation_errors:
-        return _json({"status": "REJECTED_BEFORE_WRITE", "validation_errors": validation_errors})
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "validation_error", "validation_errors": validation_errors})
     try:
         source_path = Path(project_path).expanduser().resolve(strict=True)
         if source_path.suffix.lower() not in {".isp", ".bak"}:
             raise FileTransformError("Source project must use .isp or .bak extension.")
         original = read_bytes(source_path)
+        current_hash = compute_content_hash("isp", original)
         container = containers.read_container(source_path)
         info = containers.inspect(container)
         if str(info.get("project_model") or "").upper() != "ES2":
@@ -2252,10 +2397,26 @@ def ispsoft_write_ld_network_candidate(project_path: str, pou_name: str, network
         source = container.source.decode(container.encoding)
         pou_match = pou_matches[0]
         pou_body = pou_match.group(1)
+        pou_hash = compute_content_hash("pou", pou_body)
         network_matches = containers.ld_network_matches(pou_body)
         if network_index > len(network_matches):
             raise FileTransformError(f"POU {pou_name!r} has {len(network_matches)} LD networks; index {network_index} is out of range.")
         old_match = network_matches[network_index - 1]
+        target_network_text = old_match.group(0)
+        net_hash = compute_content_hash("network", target_network_text)
+
+        if expected_content_hash:
+            if expected_content_hash not in (current_hash, pou_hash, net_hash):
+                return _json({
+                    "success": False,
+                    "status": "REJECTED_BEFORE_WRITE",
+                    "failure_category": "state_changed",
+                    "error": f"Target was modified concurrently. Expected '{expected_content_hash}' does not match current state.",
+                    "current_content_hash": current_hash,
+                    "pou_content_hash": pou_hash,
+                    "network_content_hash": net_hash,
+                })
+
         normalized_network = containers.normalized(replacement_network).replace("\n", container.newline)
         new_source = (source[:pou_match.start(1) + old_match.start(1)] + normalized_network +
                       source[pou_match.start(1) + old_match.end(1):])
@@ -2271,6 +2432,23 @@ def ispsoft_write_ld_network_candidate(project_path: str, pou_name: str, network
             raise FileTransformError("Candidate readback changed the POU network count.")
         if verified_networks[network_index - 1] != normalized_network:
             raise FileTransformError("Candidate network readback differs from the requested replacement.")
+
+        if dry_run:
+            return _json({
+                "success": True,
+                "status": "DRY_RUN_PASSED",
+                "dry_run": True,
+                "model": canonical,
+                "pou_name": pou_name,
+                "network_index": network_index,
+                "network_count": len(verified_networks),
+                "source_sha256": _sha(container.source),
+                "candidate_sha256": _sha(verified.source),
+                "current_content_hash": current_hash,
+                "readback_verified": True,
+                "note": "Dry run succeeded; network validated in memory without writing to disk."
+            })
+
         if output_path.strip():
             target = Path(output_path).expanduser().absolute()
             if target.suffix.lower() != ".isp":
@@ -2281,18 +2459,237 @@ def ispsoft_write_ld_network_candidate(project_path: str, pou_name: str, network
             target = _artifact_path(f"{source_path.stem}-{pou_name}-network-{network_index}-candidate", ".isp")
         target, backup, companion = _write_project_candidate_and_backup(
             source_path, target, original, candidate_bytes)
-        return _json({"status": "GENERATED_UNCOMPILED", "candidate": str(target),
+        return _json({"success": True, "status": "GENERATED_UNCOMPILED", "candidate": str(target),
                       "backup": str(backup), "candidate_companion": str(companion) if companion else None,
                       "model": canonical, "pou_name": pou_name,
                       "network_index": network_index, "network_count": len(verified_networks),
                       "source_sha256": _sha(container.source),
                       "candidate_sha256": _sha(verified.source),
+                      "content_hash": compute_content_hash("isp", candidate_bytes),
                       "readback_verified": True, "vendor_compile": "NOT_RUN",
                       "plc_download": "NOT_RUN"})
     except (OSError, FileTransformError, ValueError, UnicodeError) as exc:
-        return _json({"status": "CANDIDATE_FAILED", "error": str(exc),
+        return _json({"success": False, "status": "CANDIDATE_FAILED", "failure_category": "validation_error", "error": str(exc),
                       "project_path": project_path, "pou_name": pou_name,
                       "network_index": network_index})
+
+
+@mcp.tool()
+def ispsoft_write_ld_program(project_path: str, pou_name: str, program: str,
+                             model: str, output_path: str = "",
+                             timeout_seconds: int = 120,
+                             idle_wait_seconds: int = 15,
+                             expected_content_hash: str = "",
+                             dry_run: bool = False) -> str:
+    """Author an LD POU from supported IL, compile it in ISPSoft, and verify readback.
+
+    This always writes a new backed-up project candidate. The input is the
+    documented subset accepted by ``ispsoft_validate_il``; the target POU's
+    metadata and symbol declarations are retained. PLC download is never run.
+    """
+    canonical, model_error = _model(model)
+    if model_error:
+        return _json({"success": False, "status": "UNSUPPORTED_MODEL",
+                      "failure_category": "validation_error",
+                      "compile_status": "NOT_RUN", "error": model_error})
+    if canonical != "ES2":
+        return _json({"success": False, "status": "MODEL_NOT_QUALIFIED",
+                      "failure_category": "binding_conflict",
+                      "compile_status": "NOT_RUN", "model": canonical,
+                      "error": "End-to-end LD authoring is currently qualified only for ISPSoft 3.24 DVP ES2 projects."})
+    if not isinstance(project_path, str) or not project_path.strip():
+        return _json({"success": False, "status": "PROJECT_PATH_REQUIRED",
+                      "failure_category": "validation_error",
+                      "compile_status": "NOT_RUN"})
+    if not isinstance(pou_name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", pou_name):
+        return _json({"success": False, "status": "REJECTED_BEFORE_READ",
+                      "failure_category": "validation_error",
+                      "compile_status": "NOT_RUN",
+                      "error": "pou_name must be an ASCII IEC identifier of 1-64 characters."})
+    if not isinstance(program, str) or not program.strip():
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE",
+                      "failure_category": "validation_error",
+                      "compile_status": "NOT_RUN",
+                      "error": "program must be non-empty IL text no larger than 2 MB."})
+    try:
+        program_size = len(program.encode("utf-8"))
+    except UnicodeEncodeError:
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE",
+                      "failure_category": "validation_error",
+                      "compile_status": "NOT_RUN", "error": "program contains invalid Unicode."})
+    if program_size > 2_000_000:
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE",
+                      "failure_category": "validation_error",
+                      "compile_status": "NOT_RUN", "error": "program must be no larger than 2 MB."})
+    if not isinstance(output_path, str):
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE",
+                      "failure_category": "validation_error",
+                      "compile_status": "NOT_RUN",
+                      "error": "output_path must be text."})
+    if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 10 <= timeout_seconds <= 300:
+        return _json({"success": False, "status": "REJECTED_BEFORE_OPEN",
+                      "failure_category": "validation_error",
+                      "compile_status": "NOT_RUN",
+                      "error": "timeout_seconds must be an integer from 10 to 300."})
+    if not isinstance(idle_wait_seconds, int) or isinstance(idle_wait_seconds, bool) or not 0 <= idle_wait_seconds <= 300:
+        return _json({"success": False, "status": "REJECTED_BEFORE_OPEN",
+                      "failure_category": "validation_error",
+                      "compile_status": "NOT_RUN",
+                      "error": "idle_wait_seconds must be an integer from 0 to 300."})
+
+    try:
+        source_path = Path(project_path).expanduser().resolve(strict=True)
+        if source_path.suffix.lower() not in {".isp", ".bak"}:
+            raise FileTransformError("Project path must use .isp or .bak extension.")
+        original = read_bytes(source_path)
+        current_hash = compute_content_hash("isp", original)
+        container = containers.read_container(source_path)
+        info = containers.inspect(container)
+        if info.get("project_model") != "ES2":
+            raise FileTransformError("Project metadata does not match the DVP ES2 profile.")
+        pou_matches = [match for match in containers.sections(
+            container.source.decode(container.encoding), "POU")
+                       if containers.property_value(match.group(1), "P_Name") == pou_name]
+        if len(pou_matches) != 1:
+            raise FileTransformError(f"Expected one POU named {pou_name!r}; found {len(pou_matches)}.")
+        if containers.property_value(pou_matches[0].group(1), "P_Lang") != "1":
+            raise FileTransformError("Target POU must be an existing Ladder Diagram POU.")
+        pou_body = pou_matches[0].group(1)
+        pou_hash = compute_content_hash("pou", pou_body)
+
+        if expected_content_hash:
+            if expected_content_hash not in (current_hash, pou_hash):
+                return _json({
+                    "success": False,
+                    "status": "REJECTED_BEFORE_WRITE",
+                    "failure_category": "state_changed",
+                    "compile_status": "NOT_RUN",
+                    "error": f"Target was modified concurrently. Expected '{expected_content_hash}' does not match current state.",
+                    "current_content_hash": current_hash,
+                    "pou_content_hash": pou_hash,
+                })
+
+        package_data, generation = dvp.il_to_mpu(program, pou_name, container.encoding)
+        prefix, package_members = packages.unpack(package_data)
+        generated_source = package_members.get("Unzipped.src")
+        if generated_source is None:
+            raise FileTransformError("Generated package is missing its native POU source member.")
+        generated_text = generated_source.decode(container.encoding)
+        generated_networks = [match.group(0) for match in re.finditer(
+            r"(?is)<NETWORK_START>\r*\n.*?\r*\n<NETWORK_END>", generated_text)]
+        if len(generated_networks) != generation.get("network_count"):
+            raise FileTransformError("Generated LD network count does not match its validated instruction list.")
+        updated_text = containers.replace_ld_pou_networks(
+            container.source.decode(container.encoding), pou_name,
+            generated_networks, container.newline)
+        candidate_bytes = container.rebuild(updated_text.encode(container.encoding))
+        verified_container = containers.decode(candidate_bytes)
+        verified_text = verified_container.source.decode(verified_container.encoding)
+        verified_pous = [match for match in containers.sections(verified_text, "POU")
+                         if containers.property_value(match.group(1), "P_Name") == pou_name]
+        if len(verified_pous) != 1:
+            raise FileTransformError("Candidate readback lost or duplicated the target POU.")
+        actual_networks = [match.group(0) for match in re.finditer(
+            r"(?is)<NETWORK_START>\r*\n.*?\r*\n<NETWORK_END>", verified_pous[0].group(1))]
+        if ([containers.normalized(item) for item in actual_networks] !=
+                [containers.normalized(item) for item in generated_networks]):
+            raise FileTransformError("Candidate LD readback differs from the generated program.")
+        candidate_readback_package = packages.pack(prefix, {
+            "Unzipped.src": ("<POU>" + container.newline + verified_pous[0].group(1) +
+                            container.newline + "</POU>").encode(container.encoding)})
+        readback_il, readback_detail = dvp.mpu_to_il(candidate_readback_package, container.encoding)
+        expected_il, _ = dvp.mpu_to_il(package_data, container.encoding)
+        if containers.normalized(readback_il) != containers.normalized(expected_il):
+            raise FileTransformError("Semantic IL readback differs from the requested LD program.")
+
+        if dry_run:
+            return _json({
+                "success": True,
+                "status": "DRY_RUN_PASSED",
+                "dry_run": True,
+                "compile_status": "NOT_RUN",
+                "model": canonical,
+                "pou_name": pou_name,
+                "generated_networks": len(generated_networks),
+                "semantic_il_valid": True,
+                "current_content_hash": current_hash,
+                "preview": {
+                    "network_count": len(generated_networks),
+                    "readback_il": readback_il,
+                },
+                "note": "Dry run succeeded; syntax validated and container packaged in memory without writing to disk or compiling.",
+            })
+
+        if output_path.strip():
+            target = Path(output_path).expanduser().absolute()
+            if target.suffix.lower() != ".isp":
+                raise FileTransformError("Candidate output must use .isp extension.")
+            if not target.parent.is_dir():
+                raise FileTransformError("Output parent directory must already exist.")
+        else:
+            target = _artifact_path(f"{source_path.stem}-{pou_name}-ld-candidate", ".isp")
+        target, backup_path, companion_path = _write_project_candidate_and_backup(
+            source_path, target, original, candidate_bytes)
+    except (OSError, FileTransformError, UnicodeError, ValueError) as exc:
+        return _json({"success": False, "status": "CANDIDATE_FAILED",
+                      "failure_category": "validation_error",
+                      "compile_status": "NOT_RUN", "error": str(exc),
+                      "project_path": project_path, "pou_name": pou_name})
+
+    compile_result = json.loads(ispsoft_compile_and_check(
+        str(target), "compile", timeout_seconds, idle_wait_seconds))
+    try:
+        source_after = read_bytes(source_path)
+        candidate_after = read_bytes(target)
+        readback_container = containers.read_container(target)
+        readback_text = readback_container.source.decode(readback_container.encoding)
+        readback_pou = next(match.group(1) for match in containers.sections(readback_text, "POU")
+                            if containers.property_value(match.group(1), "P_Name") == pou_name)
+        readback_networks = [match.group(0) for match in re.finditer(
+            r"(?is)<NETWORK_START>\r*\n.*?\r*\n<NETWORK_END>", readback_pou)]
+        candidate_readback_package = packages.pack(prefix, {
+            "Unzipped.src": ("<POU>" + readback_container.newline + readback_pou +
+                            readback_container.newline + "</POU>").encode(readback_container.encoding)})
+        readback_il, readback_detail = dvp.mpu_to_il(candidate_readback_package,
+                                                     readback_container.encoding)
+        readback_verified = (
+            [_ for _ in map(containers.normalized, readback_networks)] ==
+            [_ for _ in map(containers.normalized, generated_networks)] and
+            containers.normalized(readback_il) == containers.normalized(expected_il))
+    except (OSError, FileTransformError, UnicodeError, ValueError, StopIteration) as exc:
+        source_after = read_bytes(source_path) if source_path.exists() else b""
+        candidate_after = b""
+        readback_verified = False
+        readback_error = str(exc)
+        readback_il = ""
+        readback_detail = {"warnings": []}
+    else:
+        readback_error = None
+    original_untouched = _sha(source_after) == _sha(original)
+    compile_passed = compile_result.get("success") is True and compile_result.get("vendor_compile") == "PASSED"
+    success = bool(compile_passed and readback_verified and original_untouched)
+    status = ("LD_PROGRAM_COMPILED_READBACK_VERIFIED" if success else
+              "LD_PROGRAM_COMPILE_FAILED" if not compile_passed else
+              "LD_PROGRAM_READBACK_FAILED" if not readback_verified else
+              "SOURCE_PROJECT_CHANGED_UNEXPECTEDLY")
+    return _json({"success": success, "status": status,
+                  "model": canonical, "pou_name": pou_name,
+                  "candidate": str(target), "backup": str(backup_path),
+                  "candidate_companion": str(companion_path) if companion_path else None,
+                  "source_sha256_before": _sha(original),
+                  "source_sha256_after": _sha(source_after),
+                  "candidate_sha256": _sha(candidate_after) if candidate_after else None,
+                  "original_project_untouched": original_untouched,
+                  "network_count": generation.get("network_count"),
+                  "compile_status": compile_result.get("status"),
+                  "compile": compile_result,
+                  "readback_verified": readback_verified,
+                  "semantic_readback_il": readback_il,
+                  "readback_warnings": readback_detail.get("warnings", []),
+                  "readback_error": readback_error,
+                  "plc_download": "NOT_RUN",
+                  "iteration_input_project": str(source_path),
+                  "next_iteration_project": str(target) if success else None})
 
 
 @mcp.tool()
@@ -2416,19 +2813,22 @@ def ispsoft_validate_device_comments(device_comments: dict[str, str], model: str
 
 @mcp.tool()
 def ispsoft_write_device_comment_candidate(project_path: str, device_comments: dict[str, str],
-                                           model: str, output_path: str = "") -> str:
+                                           model: str, output_path: str = "",
+                                           expected_content_hash: str = "",
+                                           dry_run: bool = False) -> str:
     """Merge comments into an ES2 project and emit a verified, uncompiled candidate."""
     canonical, model_error = _model(model)
     if model_error:
-        return _json({"status": "REJECTED_BEFORE_WRITE", "error": model_error})
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "validation_error", "error": model_error})
     if canonical != 'ES2':
-        return _json({"status": "REJECTED_BEFORE_WRITE", "error": "Project comment editing is qualified only for the DVP ES2 source layout."})
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "binding_conflict", "error": "Project comment editing is qualified only for the DVP ES2 source layout."})
     validation = json.loads(ispsoft_validate_device_comments(device_comments, canonical))
     if not validation.get('valid'):
-        return _json({"status": "REJECTED_BEFORE_WRITE", "errors": validation.get('errors')})
+        return _json({"success": False, "status": "REJECTED_BEFORE_WRITE", "failure_category": "validation_error", "errors": validation.get('errors')})
     try:
         source_path = Path(project_path).expanduser().resolve(strict=True)
         original = read_bytes(source_path)
+        current_hash = compute_content_hash("isp", original)
         container = containers.read_container(source_path)
         source = container.source.decode(container.encoding)
         if containers.inspect(container).get('project_model') != 'ES2':
@@ -2439,6 +2839,19 @@ def ispsoft_write_device_comment_candidate(project_path: str, device_comments: d
         if len(comment_sections) != 1:
             raise FileTransformError('Expected exactly one supported DEVICE_CMT_START section.')
         comments = _project_comment_map(source)
+        comments_hash = compute_content_hash("comments", json.dumps(comments, sort_keys=True))
+
+        if expected_content_hash:
+            if expected_content_hash not in (current_hash, comments_hash):
+                return _json({
+                    "success": False,
+                    "status": "REJECTED_BEFORE_WRITE",
+                    "failure_category": "state_changed",
+                    "error": f"Target was modified concurrently. Expected '{expected_content_hash}' does not match current state.",
+                    "current_content_hash": current_hash,
+                    "comments_content_hash": comments_hash,
+                })
+
         comments.update({key.upper(): value.strip() for key, value in device_comments.items()})
         ordered = sorted(comments.items(), key=lambda pair: (pair[0][0], int(re.search(r'\d+', pair[0]).group())))
         body = container.newline.join(f'{address}::{comment}' for address, comment in ordered)
@@ -2449,6 +2862,19 @@ def ispsoft_write_device_comment_candidate(project_path: str, device_comments: d
         actual_comments = _project_comment_map(check.source.decode(check.encoding))
         if actual_comments != comments:
             raise FileTransformError('Candidate comment readback differs from the requested map.')
+
+        if dry_run:
+            return _json({
+                "success": True,
+                "status": "DRY_RUN_PASSED",
+                "dry_run": True,
+                "model": canonical,
+                "comment_count": len(comments),
+                "current_content_hash": current_hash,
+                "readback_verified": True,
+                "note": "Dry run succeeded; comments merged and verified in memory without writing to disk."
+            })
+
         if output_path.strip():
             target = Path(output_path).expanduser().absolute()
             if not target.parent.is_dir():
@@ -2457,39 +2883,42 @@ def ispsoft_write_device_comment_candidate(project_path: str, device_comments: d
             target = _artifact_path(f'{source_path.stem}-comments-candidate', '.isp')
         target, backup, companion_path = _write_project_candidate_and_backup(
             source_path, target, original, candidate_bytes)
-        return _json({"status": "GENERATED_UNCOMPILED", "candidate": str(target),
+        return _json({"success": True, "status": "GENERATED_UNCOMPILED", "candidate": str(target),
                       "backup": str(backup), "candidate_companion": str(companion_path) if companion_path else None,
                       "model": canonical, "comment_count": len(comments),
+                      "content_hash": compute_content_hash("isp", candidate_bytes),
                       "readback_verified": True, "vendor_compile": "NOT_RUN", "plc_download": "NOT_RUN"})
     except (OSError, FileTransformError, ValueError) as exc:
-        return _json({"status": "CANDIDATE_FAILED", "error": str(exc)})
+        return _json({"success": False, "status": "CANDIDATE_FAILED", "failure_category": "validation_error", "error": str(exc)})
 
 
 @mcp.tool()
 def ispsoft_compile_and_check(project_path: str, action: str = "compile",
                               timeout_seconds: int = 120,
-                              idle_wait_seconds: int = 15) -> str:
+                              idle_wait_seconds: int = 15,
+                              expected_content_hash: str = "",
+                              dry_run: bool = False) -> str:
     """Run ISPSoft 3.24 Check or Compile on a private worker and disposable copy.
 
     The visible user's ISPSoft session is never activated. Compile output and
     the untouched-source hash are saved under the background session folder.
     """
     if sys.platform != "win32":
-        return _json({"success": False, "status": "WINDOWS_REQUIRED",
+        return _json({"success": False, "status": "WINDOWS_REQUIRED", "failure_category": "native_tool_error",
                       "vendor_compile": "NOT_RUN", "project_path": project_path})
     if not isinstance(project_path, str) or not project_path.strip():
-        return _json({"success": False, "status": "PROJECT_PATH_REQUIRED",
+        return _json({"success": False, "status": "PROJECT_PATH_REQUIRED", "failure_category": "validation_error",
                       "vendor_compile": "NOT_RUN"})
     if not isinstance(action, str) or action not in {"check", "compile"}:
-        return _json({"success": False, "status": "REJECTED_BEFORE_OPEN",
+        return _json({"success": False, "status": "REJECTED_BEFORE_OPEN", "failure_category": "validation_error",
                       "vendor_compile": "NOT_RUN",
                       "error": "action must be exactly 'check' or 'compile'."})
     if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 10 <= timeout_seconds <= 300:
-        return _json({"success": False, "status": "REJECTED_BEFORE_OPEN",
+        return _json({"success": False, "status": "REJECTED_BEFORE_OPEN", "failure_category": "validation_error",
                       "vendor_compile": "NOT_RUN",
                       "error": "timeout_seconds must be an integer from 10 to 300."})
     if not isinstance(idle_wait_seconds, int) or isinstance(idle_wait_seconds, bool) or not 0 <= idle_wait_seconds <= 300:
-        return _json({"success": False, "status": "REJECTED_BEFORE_OPEN",
+        return _json({"success": False, "status": "REJECTED_BEFORE_OPEN", "failure_category": "validation_error",
                       "vendor_compile": "NOT_RUN",
                       "error": "idle_wait_seconds must be an integer from 0 to 300."})
     try:
@@ -2497,20 +2926,46 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
         if source.suffix.lower() not in {".isp", ".bak"}:
             raise FileTransformError("Project path must refer to an .isp or .bak file.")
         original = read_bytes(source)
+        current_hash = compute_content_hash("isp", original)
+        if expected_content_hash and expected_content_hash != current_hash:
+            return _json({
+                "success": False,
+                "status": "REJECTED_BEFORE_WRITE",
+                "failure_category": "state_changed",
+                "vendor_compile": "NOT_RUN",
+                "error": f"Target project was modified concurrently. Expected '{expected_content_hash}' does not match current state.",
+                "current_content_hash": current_hash,
+            })
         container = containers.read_container(source)
         project_info = containers.inspect(container)
     except (OSError, FileTransformError, ValueError) as exc:
-        return _json({"success": False, "status": "PROJECT_REJECTED",
+        return _json({"success": False, "status": "PROJECT_REJECTED", "failure_category": "validation_error",
                       "vendor_compile": "NOT_RUN", "project_path": project_path,
                       "error": str(exc)})
     if project_info.get("project_model") != "ES2":
-        return _json({"success": False, "status": "MODEL_NOT_QUALIFIED",
+        return _json({"success": False, "status": "MODEL_NOT_QUALIFIED", "failure_category": "binding_conflict",
                       "vendor_compile": "NOT_RUN", "project_path": str(source),
                       "model": project_info.get("project_model"),
                       "qualified_models": ["ES2"],
                       "error": "Native menu automation is currently qualified only against ISPSoft 3.24 ES2 projects."})
-    owned_process_ids = {int(record.get("process_id", -1))
-                         for record in _BACKGROUND_IDE_SESSIONS.values()}
+
+    if dry_run:
+        return _json({
+            "success": True,
+            "status": "DRY_RUN_PASSED",
+            "dry_run": True,
+            "action": action,
+            "model": project_info.get("project_model"),
+            "pou_count": len(project_info.get("pous", [])),
+            "source_sha256": _sha(original),
+            "current_content_hash": current_hash,
+            "vendor_compile": "DRY_RUN: Project structure and model compatibility validated; desktop compilation bypassed.",
+            "note": "Dry run succeeded; no processes spawned or sidecars modified."
+        })
+
+    with _SESSIONS_LOCK:
+        owned_process_ids = {int(record.get("process_id", -1))
+                             for record in _BACKGROUND_IDE_SESSIONS.values()}
     try:
         user_ide_process_ids = set(_process_ids("NewISPSoft.exe")) - owned_process_ids
         initial_foreground_pid = _foreground_process_id()
@@ -2658,25 +3113,18 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
         foreground_after = int(after_handle) if after_handle else None
         input_tick_after = _last_user_input_tick()
         foreground_unchanged = (foreground_before is None or foreground_after == foreground_before)
-        user_input_during_run = (input_tick_before is not None and input_tick_after is not None
-                                 and input_tick_before != input_tick_after)
-        foreground_change_attributable_to_worker = (not foreground_unchanged and not user_input_during_run)
-        if user_ide_active_during_run or user_input_during_run:
-            # Private-desktop menu messages can advance GetLastInputInfo even
-            # though the user's foreground window is unchanged. When any user
-            # activity is detected, never restore/write shared files; only
-            # report safe success if every file still exactly matches its
-            # pre-run bytes. Any difference remains an unverified conflict.
-            sidecar_restore = _verify_compiler_sidecars_unchanged(
-                compiler_root, compiler_sidecars_before)
-        else:
-            try:
-                sidecar_restore = _restore_compiler_sidecars(
-                    compiler_root, compiler_sidecars_before,
-                    {item["name"]: item["sha256"] for item in changed_outputs})
-            except OSError as exc:
-                sidecar_restore = {"success": False, "restored_files": [],
-                                   "concurrent_change_files": [], "error": str(exc)}
+        global_input_tick_changed = (input_tick_before is not None and input_tick_after is not None
+                                     and input_tick_before != input_tick_after)
+        foreground_change_attributable_to_worker = (not foreground_unchanged and
+                                                    not global_input_tick_changed)
+        try:
+            sidecar_restore = _finish_compiler_sidecars(
+                compiler_root, compiler_sidecars_before,
+                {item["name"]: item["sha256"] for item in changed_outputs},
+                user_ide_active_during_run)
+        except OSError as exc:
+            sidecar_restore = {"success": False, "restored_files": [],
+                               "concurrent_change_files": [], "error": str(exc)}
         if pane_seen and error_count == 0 and warning_count is not None:
             status = "NATIVE_CHECK_PASSED" if action == "check" else "NATIVE_COMPILE_PASSED"
             success = True
@@ -2711,7 +3159,8 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
                 "user_foreground_unchanged": foreground_unchanged,
                 "foreground_handle_before": foreground_before,
                 "foreground_handle_after": foreground_after,
-                "user_input_during_run": user_input_during_run,
+                "user_input_during_run": user_ide_active_during_run,
+                "global_input_tick_changed": global_input_tick_changed,
                 "visible_ispsoft_became_active": user_ide_active_during_run,
                 "idle_wait_seconds": idle_wait_seconds,
                 "waited_for_user_ide_idle_seconds": idle_wait["waited_seconds"],
@@ -2725,7 +3174,7 @@ def ispsoft_compile_and_check(project_path: str, action: str = "compile",
                 "compiler_outputs_use_shared_windows_profile": True,
                 "compiler_sidecar_restore": sidecar_restore,
                 "verification": "Native ISPSoft menu command was invoked on a private desktop; a pass requires OCR of the worker's Compile Message pane with readable error and warning counts.",
-                "warning": "ISPSoft 3.24 writes fixed-name compiler sidecars beneath the Windows roaming profile even when the worker receives a private APPDATA. The MCP restores their previous contents only when they still match this worker's captured output and no user activity occurred. Any conflict fails verification and is preserved. MCP compile calls serialize within this Windows logon session."})
+                "warning": "ISPSoft 3.24 writes fixed-name compiler sidecars beneath the Windows roaming profile even when the worker receives a private APPDATA. The MCP restores previous contents only when visible ISPSoft did not become active and each file still matches this worker's captured output. Any conflict is preserved and makes restoration unverified. MCP compile calls serialize within this Windows logon session."})
     except (OSError, FileTransformError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         return _json({"success": False, "status": "NATIVE_COMPILE_FAILED",
                       "vendor_compile": "FAILED_OR_UNVERIFIED",
@@ -2923,5 +3372,103 @@ def ispsoft_download(project_path: str, model: str, confirm_download: bool = Fal
                   "project_path": project_path, "error": "PLC download is not implemented; no device was contacted."})
 
 
+@mcp.tool()
+def ispsoft_doctor() -> str:
+    """Run comprehensive environmental and dependency diagnostics for ISPSoft MCP."""
+    is_win = sys.platform == "win32"
+    session_id = None
+    desktop_heap_ok = False
+    if is_win:
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            sess = wintypes.DWORD()
+            if kernel32.ProcessIdToSessionId(kernel32.GetCurrentProcessId(), ctypes.byref(sess)):
+                session_id = sess.value
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            desk = user32.GetThreadDesktop(kernel32.GetCurrentThreadId())
+            desktop_heap_ok = bool(desk)
+        except Exception:
+            pass
+
+    exe = _exe()
+    commgr_exe = _installed(COMMGR_CANDIDATES)
+    simulator = _installed(DVP_ES2_SIMULATOR_CANDIDATES)
+    simulators = _installed_simulators()
+    commgr_catalog = _read_commgr_driver_catalog()
+    serial_ports: list[dict[str, str]] = []
+    if is_win:
+        try:
+            serial_ports = _enumerate_windows_serial_ports()
+        except Exception:
+            pass
+    powershell_path = shutil.which("powershell")
+    ocr_script = (Path(__file__).parent / "ispsoft_native_ocr.ps1").resolve()
+    ocr_script_exists = ocr_script.is_file()
+
+    issues: list[str] = []
+    if not is_win:
+        issues.append("Non-Windows OS: Desktop automation and OCR are disabled; only offline container transforms available.")
+    if session_id == 0:
+        issues.append("Running in Windows Session 0 (service/daemon mode): Interactive desktop automation will fail.")
+    if not exe:
+        issues.append("ISPSoft 3.24 executable not detected at standard candidate paths.")
+    if not commgr_exe:
+        issues.append("COMMGR executable not detected at standard candidate paths.")
+
+    health = "HEALTHY" if is_win and exe and session_id != 0 else "LIMITED_CAPABILITY"
+
+    report = {
+        "success": True,
+        "health": health,
+        "platform": {
+            "os": sys.platform,
+            "python_version": sys.version.split()[0],
+            "is_windows": is_win,
+            "session_id": session_id,
+            "desktop_heap_available": desktop_heap_ok,
+        },
+        "installations": {
+            "ispsoft_installed": exe is not None,
+            "ispsoft_executable": str(exe) if exe else None,
+            "ispsoft_version": "3.24" if exe and "3.24" in str(exe.parent) else None,
+            "commgr_installed": commgr_exe is not None,
+            "commgr_executable": str(commgr_exe) if commgr_exe else None,
+            "dvp_es2_simulator_installed": simulator is not None,
+            "installed_simulators": simulators,
+        },
+        "runtime_services": {
+            "ispsoft_process_running": _process_running("NewISPSoft.exe") if is_win else False,
+            "commgr_process_running": _process_running("COMMGR.exe") if is_win else False,
+            "commgr_driver_count": len(commgr_catalog.get("drivers", [])) if isinstance(commgr_catalog, dict) else 0,
+            "hardware_serial_ports": len(serial_ports),
+            "powershell_available": powershell_path is not None,
+            "ocr_script_available": ocr_script_exists,
+        },
+        "storage": {
+            "work_dir": str(WORK_DIR),
+            "work_dir_exists": WORK_DIR.exists(),
+        },
+        "limits": {
+            "max_file_bytes": 32 * 1024 * 1024,
+            "max_item_chars": MAX_ITEM_CHARS,
+            "max_response_chars": MAX_RESPONSE_CHARS,
+        },
+        "qualified_workflows": [
+            "offline_isp_inspect_and_read",
+            "offline_pou_read_and_patch",
+            "offline_il_mpu_bidirectional_transpile",
+            "offline_device_comment_merge",
+            "offline_dvp_modbus_translation",
+            "optimistic_concurrency_control",
+            "dry_run_validation",
+        ] + (["native_es2_compile_and_check"] if is_win and exe else []),
+        "diagnostics_summary": issues or ["All subsystem dependencies and runtime environment checks passed."],
+    }
+    return _json(report)
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ("doctor", "--doctor", "-d"):
+        print(ispsoft_doctor())
+        sys.exit(0)
     mcp.run(transport="stdio")
