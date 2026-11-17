@@ -1,11 +1,21 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { buildAsV3010Container, buildEs2V8Container, decodeContainer } from './containers.js';
 import { ilToMpu } from './dvp.js';
 import { FileTransformError, MAX_FILE_BYTES, computeContentHash, sha256 } from './limits.js';
 
 export const DEFAULT_WORK_DIR = '/workspace';
+export const MAX_WORKSPACE_FILES = 256;
+export const MAX_WORKSPACE_TOTAL_BYTES = 256 * 1024 * 1024;
 
 const files = new Map<string, Buffer>();
+const metaCache = new Map<string, { sha: string; summary: Record<string, unknown> }>();
+let diskLoaded = false;
+
+export function getDiskWorkspaceRoot(): string {
+  const custom = process.env.ISPSOFT_WORK_DIR?.trim();
+  return custom ? path.resolve(custom) : path.join(process.cwd(), 'workspace');
+}
 
 export function normalizeVirtualPath(inputPath: string): string {
   const raw = (inputPath || '').trim();
@@ -13,11 +23,116 @@ export function normalizeVirtualPath(inputPath: string): string {
     throw new FileTransformError('Path must be non-empty');
   }
   const posix = raw.replace(/\\/g, '/');
-  const resolved = posix.startsWith('/') ? path.posix.normalize(posix) : path.posix.normalize(`${DEFAULT_WORK_DIR}/${posix}`);
-  if (resolved.includes('..')) {
-    throw new FileTransformError('Invalid path traversal');
+  if (posix.includes('\0')) {
+    throw new FileTransformError('Invalid null byte in path');
+  }
+  const resolved = posix.startsWith('/')
+    ? path.posix.normalize(posix)
+    : path.posix.normalize(`${DEFAULT_WORK_DIR}/${posix}`);
+  if (resolved.includes('..') || (resolved !== DEFAULT_WORK_DIR && !resolved.startsWith(`${DEFAULT_WORK_DIR}/`))) {
+    throw new FileTransformError(`Path must reside inside ${DEFAULT_WORK_DIR} (${resolved})`);
   }
   return resolved;
+}
+
+function virtualToDiskPath(virtualKey: string): string {
+  const root = getDiskWorkspaceRoot();
+  const rel = virtualKey === DEFAULT_WORK_DIR ? '' : virtualKey.slice(DEFAULT_WORK_DIR.length + 1);
+  const resolved = path.resolve(root, rel);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    throw new FileTransformError('Resolved disk path escapes workspace root');
+  }
+  return resolved;
+}
+
+function persistFileAtomic(virtualKey: string, data: Buffer): void {
+  const diskPath = virtualToDiskPath(virtualKey);
+  const dir = path.dirname(diskPath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmpPath = path.join(dir, `.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  fs.writeFileSync(tmpPath, data);
+  fs.renameSync(tmpPath, diskPath);
+}
+
+function removeFileFromDisk(virtualKey: string): void {
+  try {
+    const diskPath = virtualToDiskPath(virtualKey);
+    if (fs.existsSync(diskPath) && fs.statSync(diskPath).isFile()) {
+      fs.unlinkSync(diskPath);
+    }
+  } catch {
+    // ignore cleanup errors if already removed
+  }
+}
+
+function totalWorkspaceBytes(excludeKey?: string): number {
+  let sum = 0;
+  for (const [k, v] of files.entries()) {
+    if (k !== excludeKey) sum += v.length;
+  }
+  return sum;
+}
+
+function assertWorkspaceQuota(targetKey: string, nextBytes: number): void {
+  const isNew = !files.has(targetKey);
+  if (isNew && files.size >= MAX_WORKSPACE_FILES) {
+    throw new FileTransformError(`Workspace file limit reached (${MAX_WORKSPACE_FILES} files); delete or clean up old files first.`);
+  }
+  if (totalWorkspaceBytes(targetKey) + nextBytes > MAX_WORKSPACE_TOTAL_BYTES) {
+    throw new FileTransformError(`Workspace storage quota exceeded (${MAX_WORKSPACE_TOTAL_BYTES} bytes max).`);
+  }
+}
+
+function setWorkspaceFile(virtualKey: string, data: Buffer): void {
+  assertWorkspaceQuota(virtualKey, data.length);
+  const copy = Buffer.from(data);
+  persistFileAtomic(virtualKey, copy);
+  files.set(virtualKey, copy);
+  metaCache.delete(virtualKey);
+}
+
+function deleteWorkspaceFileInternal(virtualKey: string): boolean {
+  metaCache.delete(virtualKey);
+  const existed = files.delete(virtualKey);
+  removeFileFromDisk(virtualKey);
+  return existed;
+}
+
+function scanDiskWorkspace(dir: string, root: string): void {
+  if (!fs.existsSync(dir)) return;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith('.tmp-')) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      scanDiskWorkspace(full, root);
+    } else if (entry.isFile()) {
+      const relPosix = path.relative(root, full).split(path.sep).join('/');
+      const vKey = `${DEFAULT_WORK_DIR}/${relPosix}`;
+      const stat = fs.statSync(full);
+      if (stat.size <= MAX_FILE_BYTES && files.size < MAX_WORKSPACE_FILES) {
+        files.set(vKey, fs.readFileSync(full));
+      }
+    }
+  }
+}
+
+export function resetWorkspaceMemoryCacheForTests(): void {
+  files.clear();
+  metaCache.clear();
+  diskLoaded = false;
+}
+
+export function getWorkspaceStorageStats() {
+  const totalBytes = totalWorkspaceBytes();
+  return {
+    work_dir: DEFAULT_WORK_DIR,
+    disk_dir: getDiskWorkspaceRoot(),
+    file_count: files.size,
+    max_files: MAX_WORKSPACE_FILES,
+    total_bytes: totalBytes,
+    max_total_bytes: MAX_WORKSPACE_TOTAL_BYTES,
+    utilization_pct: Math.round((totalBytes / MAX_WORKSPACE_TOTAL_BYTES) * 10000) / 100,
+  };
 }
 
 export function hasFile(filePath: string): boolean {
@@ -44,8 +159,45 @@ export function writeFileBuffer(filePath: string, data: Buffer, allowOverwrite =
   if (!allowOverwrite && files.has(key)) {
     throw new FileTransformError(`Output must be a new path; overwrites are not supported (${key})`);
   }
-  files.set(key, Buffer.from(data));
+  setWorkspaceFile(key, data);
   return key;
+}
+
+export function deleteWorkspaceFile(filePath: string): boolean {
+  const key = normalizeVirtualPath(filePath);
+  return deleteWorkspaceFileInternal(key);
+}
+
+export function copyOrMoveWorkspaceFile(srcPath: string, dstPath: string, move = false, overwrite = false) {
+  const srcKey = normalizeVirtualPath(srcPath);
+  const dstKey = normalizeVirtualPath(dstPath);
+  if (srcKey === dstKey) {
+    throw new FileTransformError('Source and destination paths must differ');
+  }
+  const data = readFileBuffer(srcKey);
+  writeFileBuffer(dstKey, data, overwrite);
+  const srcIni = srcKey.replace(/\.[^.]+$/, '.ini');
+  if (files.has(srcIni)) {
+    const dstIni = dstKey.replace(/\.[^.]+$/, '.ini');
+    writeFileBuffer(dstIni, readFileBuffer(srcIni), overwrite);
+    if (move) deleteWorkspaceFileInternal(srcIni);
+  }
+  if (move) {
+    deleteWorkspaceFileInternal(srcKey);
+  }
+  return { source: srcKey, destination: dstKey, moved: move, bytes: data.length, content_hash: computeContentHash('isp', data) };
+}
+
+export function cleanupWorkspaceBackups(prefix = ''): { removed: string[]; remaining_count: number } {
+  const all = listAllFiles(prefix);
+  const removed: string[] = [];
+  for (const p of all) {
+    if (/\.before\.(isp|bak|ini)$/i.test(p) || /\.latest\.before\.(isp|bak|ini)$/i.test(p)) {
+      deleteWorkspaceFileInternal(p);
+      removed.push(p);
+    }
+  }
+  return { removed, remaining_count: listAllFiles(prefix).length };
 }
 
 export function listAllFiles(prefix = ''): string[] {
@@ -53,6 +205,19 @@ export function listAllFiles(prefix = ''): string[] {
   return [...files.keys()]
     .filter((k) => !normPrefix || k === normPrefix || k.startsWith(`${normPrefix}/`))
     .sort((a, b) => a.localeCompare(b));
+}
+
+export function getCachedMeta(filePath: string, buf: Buffer): Record<string, unknown> | null {
+  const digest = sha256(buf);
+  const entry = metaCache.get(filePath);
+  if (entry && entry.sha === digest) {
+    return entry.summary;
+  }
+  return null;
+}
+
+export function setCachedMeta(filePath: string, buf: Buffer, summary: Record<string, unknown>): void {
+  metaCache.set(filePath, { sha: sha256(buf), summary });
 }
 
 export function artifactPath(stem: string, suffix: string): string {
@@ -72,15 +237,29 @@ export function writeProjectCandidateAndBackup(
   targetPath: string,
   originalBytes: Buffer,
   candidateBytes: Buffer,
+  inPlace = false,
 ): {
   target: string;
   backup: string;
   candidateCompanion: string | null;
 } {
   const srcKey = normalizeVirtualPath(sourcePath);
+  if (inPlace) {
+    const parsedSrc = path.posix.parse(srcKey);
+    const backupKey = path.posix.join(parsedSrc.dir, `${parsedSrc.name}.latest.before${parsedSrc.ext}`);
+    setWorkspaceFile(backupKey, originalBytes);
+    setWorkspaceFile(srcKey, candidateBytes);
+    const companionSrc = srcKey.replace(/\.[^.]+$/, '.ini');
+    return {
+      target: srcKey,
+      backup: backupKey,
+      candidateCompanion: files.has(companionSrc) ? companionSrc : null,
+    };
+  }
+
   const tgtKey = normalizeVirtualPath(targetPath);
   if (srcKey === tgtKey) {
-    throw new FileTransformError('Original input cannot be overwritten');
+    throw new FileTransformError('Original input cannot be overwritten unless in_place=true');
   }
   if (files.has(tgtKey)) {
     throw new FileTransformError(`Candidate target already exists: ${tgtKey}`);
@@ -100,13 +279,13 @@ export function writeProjectCandidateAndBackup(
     if (files.has(compTarget) || files.has(compBackup)) {
       throw new FileTransformError('Companion target or backup already exists');
     }
-    files.set(compBackup, Buffer.from(companionBytes));
-    files.set(compTarget, Buffer.from(companionBytes));
+    setWorkspaceFile(compBackup, companionBytes);
+    setWorkspaceFile(compTarget, companionBytes);
     candidateCompanion = compTarget;
   }
 
-  files.set(backupKey, Buffer.from(originalBytes));
-  files.set(tgtKey, Buffer.from(candidateBytes));
+  setWorkspaceFile(backupKey, originalBytes);
+  setWorkspaceFile(tgtKey, candidateBytes);
 
   return { target: tgtKey, backup: backupKey, candidateCompanion };
 }
@@ -122,7 +301,17 @@ export function getFileMeta(filePath: string) {
 }
 
 export function seedDefaultWorkspace(): void {
-  if (files.size > 0) {
+  if (!diskLoaded) {
+    const diskRoot = getDiskWorkspaceRoot();
+    fs.mkdirSync(diskRoot, { recursive: true });
+    scanDiskWorkspace(diskRoot, diskRoot);
+    diskLoaded = true;
+  }
+
+  const hasEs2 = files.has('/workspace/sample_es2.isp');
+  const hasAs = files.has('/workspace/sample_as228t.isp');
+  const hasMpu = files.has('/workspace/sample_prog0.mpu');
+  if (hasEs2 && hasAs && hasMpu) {
     return;
   }
 
@@ -141,10 +330,11 @@ export function seedDefaultWorkspace(): void {
     'MOV K100 D20',
   ].join('\n');
 
-  const { data: sampleMpu } = ilToMpu(sampleEs2LdIl, 'Prog0', 'cp1252');
-  files.set('/workspace/sample_prog0.mpu', sampleMpu);
+  if (!hasMpu) {
+    const { data: sampleMpu } = ilToMpu(sampleEs2LdIl, 'Prog0', 'cp1252');
+    setWorkspaceFile('/workspace/sample_prog0.mpu', sampleMpu);
+  }
 
-  // Extract generated LD networks from the sample MPU for the ES2 LD+ST sample project
   const sampleEs2Source = [
     '<PROJECT>',
     'Active_CodePage=1252',
@@ -376,10 +566,12 @@ export function seedDefaultWorkspace(): void {
     '</POU>',
   ].join('\r\r\n') + '\r\r\n';
 
-  const es2Bytes = buildEs2V8Container(sampleEs2Source);
-  decodeContainer(es2Bytes); // self-verify
-  files.set('/workspace/sample_es2.isp', es2Bytes);
-  files.set('/workspace/sample_es2.ini', Buffer.from('[PRJ_DATA]\r\nDEVICE_TYPE=1\r\nCOMM_DRIVER=ES2_SIM\r\nSTATION_ADDR=1\r\n', 'ascii'));
+  if (!hasEs2) {
+    const es2Bytes = buildEs2V8Container(sampleEs2Source);
+    decodeContainer(es2Bytes);
+    setWorkspaceFile('/workspace/sample_es2.isp', es2Bytes);
+    setWorkspaceFile('/workspace/sample_es2.ini', Buffer.from('[PRJ_DATA]\r\nDEVICE_TYPE=1\r\nCOMM_DRIVER=ES2_SIM\r\nSTATION_ADDR=1\r\n', 'ascii'));
+  }
 
   const sampleAsSource = [
     '<PROJECT>',
@@ -413,7 +605,9 @@ export function seedDefaultWorkspace(): void {
     '</POU>',
   ].join('\r\n') + '\r\n';
 
-  const asBytes = buildAsV3010Container(sampleAsSource);
-  decodeContainer(asBytes); // self-verify
-  files.set('/workspace/sample_as228t.isp', asBytes);
+  if (!hasAs) {
+    const asBytes = buildAsV3010Container(sampleAsSource);
+    decodeContainer(asBytes);
+    setWorkspaceFile('/workspace/sample_as228t.isp', asBytes);
+  }
 }

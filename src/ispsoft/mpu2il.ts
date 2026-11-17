@@ -17,8 +17,10 @@ export interface ParsedLdNode {
 
 export interface ParsedNetwork {
   id: number;
+  label?: string | null;
   root: ParsedLdNode[];
   out: ParsedLdNode[];
+  metaIl?: string | null;
 }
 
 export function parseNodes(seg: string): ParsedLdNode[] {
@@ -57,12 +59,16 @@ export function parseNetworks(text: string): ParsedNetwork[] {
   while ((match = re.exec(text)) !== null) {
     const blk = match[1];
     const nid = /NET_ID=(\d+)/.exec(blk);
+    const lbl = /^NET_LABEL=([^\r\n]*)/m.exec(blk);
     const root = /<ROOTLINK_START>(.*?)<ROOTLINK_END>/s.exec(blk);
     const out = /<OUTLINK_START>(.*?)<OUTLINK_END>/s.exec(blk);
+    const meta = /^META_IL=([^\r\n]*)/m.exec(blk);
     nets.push({
       id: nid ? parseInt(nid[1], 10) : -1,
+      label: lbl ? lbl[1].trim() || null : null,
       root: parseNodes(root ? root[1] : ''),
       out: parseNodes(out ? out[1] : ''),
+      metaIl: meta ? meta[1].trim() : null,
     });
   }
   return nets;
@@ -73,62 +79,85 @@ function asK(v: string): string {
 }
 
 export function netToIl(net: ParsedNetwork): Instruction[] {
-  const { root, out } = net;
+  const { root, out, metaIl } = net;
   const lines: Instruction[] = [];
 
-  let orN = 0;
-  let body = root;
-  if (root.length > 0 && root[root.length - 1].type === 6 && root[root.length - 1].lnk) {
-    orN = root[root.length - 1].lnk![1];
-    body = root.slice(0, -1);
-  }
-  const orIdx = new Set<number>();
-  if (orN > 0) {
-    for (let k = Math.max(0, body.length - orN); k < body.length; k++) {
-      orIdx.add(k);
-    }
-  }
-
-  let first = true;
-  let i = 0;
-  while (i < body.length) {
-    const nd = body[i];
-    if (nd.type in TYPE_CONTACT) {
-      const kind = TYPE_CONTACT[nd.type];
-      const mn = orIdx.has(i) ? OR_MN[kind] : first ? LD_MN[kind] : AND_MN[kind];
-      lines.push([mn, [nd.dev ?? '']]);
-      first = false;
-    } else if (nd.type === 11) {
-      const nxt = i + 1 < body.length ? body[i + 1] : null;
-      const ops = nd.vars.map(asK);
-      if (nxt && nxt.type === 9) {
-        let j = i + 2;
-        while (j < body.length && body[j].type !== 12) {
-          j++;
-        }
-        if (j < body.length) {
-          ops.push(...body[j].vars.map(asK));
-        }
-        lines.push([nxt.symb ?? '', ops]);
-        i = j;
-      } else if (nxt && nxt.type === 10) {
-        const mn = (first ? 'LD' : 'AND') + (nxt.symb ?? '');
-        let j = i + 2;
-        while (j < body.length && body[j].type !== 12) {
-          j++;
-        }
-        if (j < body.length) {
-          ops.push(...body[j].vars.map(asK));
-        }
-        lines.push([mn, ops]);
-        first = false;
-        i = j;
+  if (metaIl) {
+    const isFull = metaIl.startsWith('FULL:');
+    const rawMeta = isFull ? metaIl.slice(5) : metaIl;
+    for (const part of rawMeta.split(';')) {
+      const pieces = part.split(',').filter(Boolean);
+      if (pieces.length) {
+        lines.push([pieces[0], pieces.slice(1)]);
       }
     }
-    i++;
+    if (isFull) {
+      return lines;
+    }
+  } else {
+    // Support both inline and trailing TYPE=6 OR-link markers
+    const orIndices = new Set<number>();
+    const skipIndices = new Set<number>();
+    const contactPositions: number[] = [];
+
+    for (let idx = 0; idx < root.length; idx++) {
+      const nd = root[idx];
+      if (nd.type in TYPE_CONTACT) {
+        contactPositions.push(idx);
+      } else if (nd.type === 6 && nd.lnk) {
+        skipIndices.add(idx);
+        const orCount = nd.lnk[1];
+        for (let k = 0; k < orCount && k < contactPositions.length; k++) {
+          orIndices.add(contactPositions[contactPositions.length - 1 - k]);
+        }
+      }
+    }
+
+    let first = true;
+    let i = 0;
+    while (i < root.length) {
+      if (skipIndices.has(i)) {
+        i++;
+        continue;
+      }
+      const nd = root[i];
+      if (nd.type in TYPE_CONTACT) {
+        const kind = TYPE_CONTACT[nd.type];
+        const mn = orIndices.has(i) ? OR_MN[kind] : first ? LD_MN[kind] : AND_MN[kind];
+        lines.push([mn, [nd.dev ?? '']]);
+        first = false;
+      } else if (nd.type === 11) {
+        const nxt = i + 1 < root.length ? root[i + 1] : null;
+        const ops = nd.vars.map(asK);
+        if (nxt && nxt.type === 9) {
+          let j = i + 2;
+          while (j < root.length && root[j].type !== 12) {
+            j++;
+          }
+          if (j < root.length) {
+            ops.push(...root[j].vars.map(asK));
+          }
+          lines.push([nxt.symb ?? '', ops]);
+          i = j;
+        } else if (nxt && nxt.type === 10) {
+          const mn = (first ? 'LD' : 'AND') + (nxt.symb ?? '');
+          let j = i + 2;
+          while (j < root.length && root[j].type !== 12) {
+            j++;
+          }
+          if (j < root.length) {
+            ops.push(...root[j].vars.map(asK));
+          }
+          lines.push([mn, ops]);
+          first = false;
+          i = j;
+        }
+      }
+      i++;
+    }
   }
 
-  i = 0;
+  let i = 0;
   while (i < out.length) {
     const nd = out[i];
     if (nd.type in COIL_MN) {

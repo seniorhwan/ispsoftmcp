@@ -4,6 +4,9 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ISPSoft MCP Agent Server</title>
+  <meta name="description" content="Full-featured AI-agent MCP server and offline/simulator workbench for Delta ISPSoft PLCs (DVP &amp; AS series)." />
+  <meta property="og:title" content="ISPSoft MCP Agent Server" />
+  <meta property="og:description" content="Full-featured AI-agent MCP server and offline/simulator workbench for Delta ISPSoft PLCs (DVP &amp; AS series)." />
   <style>
     :root { color-scheme: dark; --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --ok: #3fb950; }
     * { box-sizing: border-box; }
@@ -60,8 +63,8 @@
       </div>
 
       <div class="card">
-        <div class="muted" style="margin-bottom:6px;">Arguments JSON (<code>params.arguments</code>)</div>
-        <textarea id="argsInput">{}</textarea>
+        <label for="argsInput" class="muted" style="display:block;margin-bottom:6px;">Arguments JSON (<code>params.arguments</code>)</label>
+        <textarea id="argsInput" aria-label="MCP tool arguments JSON">{}</textarea>
         <div class="row" style="margin-top:8px;">
           <button class="primary" id="runBtn">Execute MCP Tool (POST /mcp)</button>
           <span id="statusText" class="muted"></span>
@@ -78,6 +81,19 @@
   <script>
     const SAMPLES = {
       ispsoft_list_projects: {},
+      ispsoft_server_telemetry: {},
+      ispsoft_export_project_bundle: { project_path: '/workspace/sample_es2.isp', include_ascii: true },
+      ispsoft_apply_project_transaction: {
+        project_path: '/workspace/sample_es2.isp',
+        in_place: false,
+        operations: [
+          { type: 'write_comments', device_comments: { Y1: 'Cooling Fan' } },
+          { type: 'edit_ld_rungs', pou_name: 'Prog0', operations: [{ op: 'append', il_program: 'LD M10\nOUT Y1' }] },
+        ],
+        dry_run: true,
+      },
+      ispsoft_audit_project: { project_path: '/workspace/sample_es2.isp' },
+      ispsoft_search_project: { project_path: '/workspace/sample_es2.isp', query: 'M10' },
       ispsoft_create_blank_project: { model: 'ES2', output_path: '/workspace/conveyor.isp', initial_pou_name: 'MainLD', language: 'LD' },
       ispsoft_get_project_overview: { project_path: '/workspace/sample_es2.isp' },
       ispsoft_render_ld_ascii: { project_path: '/workspace/sample_es2.isp', pou_name: 'Prog0' },
@@ -87,8 +103,19 @@
       ispsoft_sim_start: { project_path: '/workspace/sample_es2.isp', scan_interval_ms: 100 },
       ispsoft_sim_force_and_write: { session_id: 'sim-1', force_bits: { X0: true } },
       ispsoft_sim_control: { session_id: 'sim-1', command: 'STEP', cycles: 5 },
-      ispsoft_sim_monitor: { session_id: 'sim-1', addresses: ['X0', 'Y0', 'T0', 'M10', 'D10', 'D100'] },
+      ispsoft_sim_step_until: { session_id: 'sim-1', condition: 'T0.Q', max_cycles: 100 },
+      ispsoft_sim_run_sequence: {
+        session_id: 'sim-1',
+        steps: [
+          { label: 'Start motor', force_bits: { X0: true }, cycles: 1, expect: { Y0: true } },
+          { label: 'Wait timer T0', step_until: 'T0.Q', max_cycles: 60, expect: { M10: true, D10: 1 } },
+        ],
+      },
+      ispsoft_sim_memory_dump: { session_id: 'sim-1', area: 'D', start: 0, count: 25, only_non_zero: true },
+      ispsoft_sim_breakpoints: { session_id: 'sim-1', action: 'add', expr: 'D10 >= 2' },
+      ispsoft_sim_monitor: { session_id: 'sim-1', addresses: ['X0', 'Y0', 'T0', 'M10', 'D10', 'D100'], compact: true },
       ispsoft_sim_watch_table: { session_id: 'sim-1', action: 'trace', table_name: 'default' },
+      ispsoft_sim_diagnostics: { session_id: 'sim-1', sample_cycles: 25, include_recent_scans: true },
       ispsoft_validate_il: { model: 'ES2', pou_name: 'Prog0', program: 'LD X0\nOR M0\nANI X1\nOUT Y0\nLD Y0\nTMR T0 K50' },
       ispsoft_map_dvp_modbus_addresses: { model: 'DVP32ES2T', addresses: ['X0', 'Y0', 'M0', 'T0', 'C200', 'D7000'] },
     };

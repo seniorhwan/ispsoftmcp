@@ -52,7 +52,7 @@ export class IspContainer {
 }
 
 export function normalizeForEditor(text: string): string {
-  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  return text.replace(/\r+\n/g, '\n').replace(/\r/g, '\n');
 }
 
 export function normalized(text: string): string {
@@ -395,7 +395,7 @@ export function replaceLdPouNetworks(
     }
   }
   const blocks = replacementNetworks
-    .map((item) => item.trim().replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n/g, newline))
+    .map((item) => normalized(item.trim()).replace(/\n/g, newline))
     .join(newline + newline);
 
   let updatedPou: string;

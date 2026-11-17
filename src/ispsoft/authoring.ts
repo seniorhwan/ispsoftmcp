@@ -1,5 +1,6 @@
 import {
   IspContainer,
+  LocalVariableEntry,
   buildAsV3010Container,
   buildEs2V8Container,
   decodeContainer,
@@ -10,12 +11,15 @@ import {
   parseLdNetwork,
   parseLocalVariables,
   propertyValue,
+  replaceLdPouNetworks,
   sections,
 } from './containers.js';
 import { ilToMpu } from './dvp.js';
 import { API_NUM, CONTACT_AND, CONTACT_LD, CONTACT_OR, COIL, nv } from './il2mpu.js';
-import { parseNodes, parseNetworks, netToIl } from './mpu2il.js';
+import { parseNetworks, netToIl } from './mpu2il.js';
 import { FileTransformError, decodeCodepage, encodeCodepage } from './limits.js';
+import { unpackPackage } from './packages.js';
+import { ENTRY_NAME } from './mpuCodec.js';
 
 export const MODEL_PROFILES: Record<string, Record<string, unknown>> = {
   AS228T: { family: 'AS', project_model: 'AS228T', source_container: 'qualified v3010', languages: ['ST', 'LD'] },
@@ -173,6 +177,165 @@ export function createBlankProjectBytes(options: {
   return { ispBytes, iniBytes, canonicalModel: projectModel };
 }
 
+export function renderVarEntries(
+  entries: LocalVariableEntry[],
+  newline: string,
+  iecStyle = false,
+): string {
+  if (iecStyle) {
+    const byClass = new Map<string, LocalVariableEntry[]>();
+    for (const e of entries) {
+      const cls = e.class || 'VAR';
+      if (!byClass.has(cls)) byClass.set(cls, []);
+      byClass.get(cls)!.push(e);
+    }
+    if (byClass.size === 0) return `VAR${newline}END_VAR`;
+    const chunks: string[] = [];
+    for (const [cls, list] of byClass.entries()) {
+      chunks.push(cls);
+      for (const e of list) {
+        const at = e.address ? ` AT %${e.address}` : '';
+        const initClean = e.initial_value.replace(/\[@[^\]]+@\]/g, '').trim();
+        const initPart = initClean ? ` := ${initClean}` : '';
+        const cmtPart = e.comment ? ` (* ${e.comment} *)` : '';
+        chunks.push(`  ${e.identifier}${at} : ${e.type}${initPart};${cmtPart}`);
+      }
+      chunks.push('END_VAR');
+    }
+    return chunks.join(newline);
+  }
+
+  const blocks = entries.map((e) =>
+    [
+      '{',
+      `${e.identifier} : ${e.type} := ${e.initial_value} {${e.class}}`,
+      '(*',
+      e.comment ?? '',
+      '*)',
+      '}',
+    ].join(newline),
+  );
+  return ['<VAR>', ...blocks, '</VAR>'].join(newline);
+}
+
+export function applyVarMutations(
+  rawSectionInner: string,
+  options: {
+    replaceText?: string;
+    upsertVars?: Array<Record<string, unknown>>;
+    deleteVars?: string[];
+    defaultClass?: string;
+  },
+  newline: string,
+): { nextInner: string; parsed: ReturnType<typeof parseLocalVariables> } {
+  if (typeof options.replaceText === 'string' && !options.upsertVars && !options.deleteVars) {
+    const nextInner = normalized(options.replaceText).replace(/\n/g, newline);
+    return { nextInner, parsed: parseLocalVariables(nextInner) };
+  }
+
+  const existing = parseLocalVariables(rawSectionInner);
+  const map = new Map<string, LocalVariableEntry>(existing.entries.map((e) => [e.identifier, e]));
+
+  if (Array.isArray(options.deleteVars)) {
+    for (const del of options.deleteVars) {
+      const target = String(del).trim();
+      for (const key of [...map.keys()]) {
+        if (key.toUpperCase() === target.toUpperCase()) {
+          map.delete(key);
+        }
+      }
+    }
+  }
+
+  if (Array.isArray(options.upsertVars)) {
+    for (const rawItem of options.upsertVars) {
+      const name = String(rawItem.name ?? rawItem.identifier ?? '').trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name)) {
+        throw new FileTransformError(`Invalid variable identifier: ${name}`);
+      }
+      const varType = String(rawItem.type ?? 'INT').trim();
+      const addr = rawItem.address ? String(rawItem.address).trim().toUpperCase() : null;
+      const init = rawItem.initial_value !== undefined && rawItem.initial_value !== null ? String(rawItem.initial_value) : '';
+      const cls = String(rawItem.class ?? options.defaultClass ?? 'VAR').trim();
+      const cmt = rawItem.comment ? String(rawItem.comment).trim() : null;
+      const initialStr = `${init}${addr ? ` [@${addr}@]` : ''}`.trim();
+      map.set(name, {
+        identifier: name,
+        type: varType,
+        address: addr,
+        class: cls,
+        initial_value: initialStr,
+        comment: cmt,
+      });
+    }
+  }
+
+  const isIec = existing.status === 'PARSED_IEC' && !/<VAR>/i.test(rawSectionInner);
+  const nextInner = renderVarEntries([...map.values()], newline, isIec);
+  return { nextInner, parsed: parseLocalVariables(nextInner) };
+}
+
+export function editGlobalVarsInSource(
+  source: string,
+  options: {
+    replaceText?: string;
+    upsertVars?: Array<Record<string, unknown>>;
+    deleteVars?: string[];
+  },
+  newline: string,
+): { updatedSource: string; parsed: ReturnType<typeof parseLocalVariables> } {
+  const gSecs = sections(source, 'GLOBAL_VAR');
+  const currentInner = gSecs[0]?.inner ?? `<VAR>${newline}</VAR>`;
+  const { nextInner, parsed } = applyVarMutations(
+    currentInner,
+    { ...options, defaultClass: 'VAR_GLOBAL' },
+    newline,
+  );
+
+  let updatedSource: string;
+  if (gSecs.length >= 1) {
+    updatedSource = source.slice(0, gSecs[0].innerStart) + nextInner + source.slice(gSecs[0].innerEnd);
+  } else {
+    const firstPou = sections(source, 'POU')[0];
+    const block = `<GLOBAL_VAR>${newline}${nextInner}${newline}</GLOBAL_VAR>${newline}`;
+    updatedSource = firstPou ? source.slice(0, firstPou.start) + block + source.slice(firstPou.start) : source + block;
+  }
+  return { updatedSource, parsed };
+}
+
+export function editLocalVarsInSource(
+  source: string,
+  pouName: string,
+  options: {
+    replaceText?: string;
+    upsertVars?: Array<Record<string, unknown>>;
+    deleteVars?: string[];
+  },
+  newline: string,
+): { updatedSource: string; parsed: ReturnType<typeof parseLocalVariables> } {
+  const matches = sections(source, 'POU').filter((m) => propertyValue(m.inner, 'P_Name') === pouName);
+  if (matches.length !== 1) {
+    throw new FileTransformError(`Expected one POU named ${JSON.stringify(pouName)}; found ${matches.length}`);
+  }
+  const pouMatch = matches[0];
+  const localSecs = sections(pouMatch.inner, 'LOCAL_VAR');
+  if (localSecs.length !== 1) {
+    throw new FileTransformError(`Expected one LOCAL_VAR section in POU ${JSON.stringify(pouName)}`);
+  }
+  const { nextInner, parsed } = applyVarMutations(
+    localSecs[0].inner,
+    { ...options, defaultClass: 'VAR' },
+    newline,
+  );
+  if (/<\/?(?:POU|IL_ST_CODE|LOCAL_VAR)(?:>|\s)/i.test(nextInner)) {
+    throw new FileTransformError('Variable text contains structural container delimiters');
+  }
+  const newPouInner =
+    pouMatch.inner.slice(0, localSecs[0].innerStart) + nextInner + pouMatch.inner.slice(localSecs[0].innerEnd);
+  const updatedSource = source.slice(0, pouMatch.innerStart) + newPouInner + source.slice(pouMatch.innerEnd);
+  return { updatedSource, parsed };
+}
+
 export function createPouInSource(
   source: string,
   options: {
@@ -202,10 +365,6 @@ export function createPouInSource(
   let pouInnerLines: string[];
   if (language === 'LD') {
     const ilCode = options.code?.trim() || 'LD X0\nOUT Y0\n';
-    const { data } = ilToMpu(ilCode, pouName, 'cp1252');
-    const netText = decodeCodepage(data, 'latin1'); // unused directly; unpack below via sections
-    void netText;
-    // Build LD networks cleanly via buildPou-compatible strings:
     const networks = buildNetworksFromIl(ilCode, newline);
     pouInnerLines = [
       '<POU>',
@@ -289,7 +448,6 @@ export function deleteOrRenamePouInSource(
       throw new FileTransformError('Cannot delete the only remaining POU in a project');
     }
     let updated = source.slice(0, target.start) + source.slice(target.end);
-    // Remove associated TASK entries referencing the deleted POU
     const tasks = sections(updated, 'TASK').filter((t) => propertyValue(t.inner, 'T_PName')?.trim() === pouName);
     for (const t of tasks.reverse()) {
       updated = updated.slice(0, t.start) + updated.slice(t.end);
@@ -314,11 +472,8 @@ export function deleteOrRenamePouInSource(
 export function buildNetworksFromIl(ilProgram: string, newline: string): string[] {
   const { data } = ilToMpu(ilProgram, 'TempPou', 'cp1252');
   const parsed = parseNetworksFromMpuBytes(data);
-  return parsed.map((raw) => raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n/g, newline));
+  return parsed.map((raw) => normalized(raw).replace(/\n/g, newline));
 }
-
-import { unpackPackage } from './packages.js';
-import { ENTRY_NAME } from './mpuCodec.js';
 
 function parseNetworksFromMpuBytes(mpuBytes: Buffer): string[] {
   const { members } = unpackPackage(mpuBytes);
@@ -392,6 +547,99 @@ export function replaceTasksInSource(source: string, tasks: TaskConfig[], newlin
     return source.slice(0, firstPou.start) + rendered + newline + source.slice(firstPou.start);
   }
   return source + newline + rendered + newline;
+}
+
+export function readDeviceComments(source: string): Record<string, string> {
+  const comments: Record<string, string> = {};
+  const match = /(?:<DEVICE_CMT_START>\r*\n|\[DEVICE_CMT_START\]\r*\n)([\s\S]*?)(?:<\/DEVICE_CMT_START>|\[DEVICE_CMT_END\])/i.exec(
+    source,
+  );
+  if (!match) return comments;
+  for (const rawLine of match[1].split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || !line.includes('::')) continue;
+    const idx = line.indexOf('::');
+    const addr = line.slice(0, idx).trim().toUpperCase();
+    const text = line.slice(idx + 2).trim();
+    if (addr) comments[addr] = text;
+  }
+  return comments;
+}
+
+export function writeDeviceCommentsInSource(
+  source: string,
+  updates: Record<string, string>,
+  newline: string,
+  replaceAll = false,
+): { updatedSource: string; comments: Record<string, string> } {
+  const re = /(<DEVICE_CMT_START>\r*\n|\[DEVICE_CMT_START\]\r*\n)([\s\S]*?)(<\/DEVICE_CMT_START>|\[DEVICE_CMT_END\])/i;
+  const m = re.exec(source);
+  const comments = replaceAll ? {} : readDeviceComments(source);
+  for (const [k, v] of Object.entries(updates)) {
+    const key = k.trim().toUpperCase();
+    if (v === null || v === undefined || String(v).trim() === '') {
+      delete comments[key];
+    } else {
+      comments[key] = String(v).trim();
+    }
+  }
+  const body = Object.entries(comments)
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([a, txt]) => `${a}::${txt}`)
+    .join(newline);
+  let updatedSource: string;
+  if (m) {
+    updatedSource = source.replace(re, `$1${body}${body ? newline : ''}$3`);
+  } else {
+    const firstPou = sections(source, 'POU')[0];
+    const block = `[DEVICE_CMT_START]${newline}${body}${body ? newline : ''}[DEVICE_CMT_END]${newline}`;
+    updatedSource = firstPou ? source.slice(0, firstPou.start) + block + source.slice(firstPou.start) : source + block;
+  }
+  return { updatedSource, comments };
+}
+
+export function readSystemVars(source: string): Array<{ area: string; start: number; end: number; capacity: number }> {
+  const sysSec = sections(source, 'SYSTEM_VAR')[0];
+  const parsedRanges: Array<{ area: string; start: number; end: number; capacity: number }> = [];
+  if (sysSec) {
+    for (const line of sysSec.inner.split(/\r?\n/)) {
+      const m = /^\s*<([A-Z])>(\d+)-(\d+)\s*$/i.exec(line.trim());
+      if (m) {
+        const start = Number(m[2]);
+        const end = Number(m[3]);
+        parsedRanges.push({ area: m[1].toUpperCase(), start, end, capacity: end - start + 1 });
+      }
+    }
+  }
+  return parsedRanges;
+}
+
+export function writeSystemVarsInSource(
+  source: string,
+  ranges: Record<string, string>,
+  newline: string,
+): string {
+  const sysSec = sections(source, 'SYSTEM_VAR')[0];
+  let inner = sysSec?.inner ?? '';
+  for (const [areaRaw, spanRaw] of Object.entries(ranges)) {
+    const area = areaRaw.toUpperCase();
+    const m = /^(\d+)-(\d+)$/.exec(String(spanRaw).trim());
+    if (!m || Number(m[1]) > Number(m[2])) {
+      throw new FileTransformError(`Invalid range for ${area}: ${spanRaw}`);
+    }
+    const lineRe = new RegExp(`^\\s*<${area}>\\d+-\\d+\\s*$`, 'im');
+    if (lineRe.test(inner)) {
+      inner = inner.replace(lineRe, `<${area}>${m[1]}-${m[2]}`);
+    } else {
+      inner = (inner ? inner.trimEnd() + newline : '') + `<${area}>${m[1]}-${m[2]}` + newline;
+    }
+  }
+  if (sysSec) {
+    return source.slice(0, sysSec.innerStart) + inner + source.slice(sysSec.innerEnd);
+  }
+  const firstPou = sections(source, 'POU')[0];
+  const block = `<SYSTEM_VAR>${newline}${inner}</SYSTEM_VAR>${newline}`;
+  return firstPou ? source.slice(0, firstPou.start) + block + source.slice(firstPou.start) : source + block;
 }
 
 export interface DutRecord {
@@ -519,12 +767,11 @@ export function editLdRungsInSource(
     }
   }
 
-  // Renumber NET_ID sequentially
   const renumbered = nets.map((blk, i) =>
     blk.replace(/^NET_ID=\d+/m, `NET_ID=${i + 1}`).replace(/^NetworkID=\d+/m, `NetworkID=${i + 1}`),
   );
   const joined = renumbered
-    .map((item) => item.trim().replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n/g, newline))
+    .map((item) => normalized(item.trim()).replace(/\n/g, newline))
     .join(newline + newline);
 
   let updatedPou: string;
@@ -538,7 +785,7 @@ export function editLdRungsInSource(
 }
 
 export function renderLdAsciiForPou(pouBody: string, networkIndex?: number): {
-  rungs: Array<{ index: number; net_id: string; active: boolean; label: string; ascii: string; il: string[] }>;
+  rungs: Array<{ index: number; net_id: string; active: boolean; bookmark: boolean; label: string; ascii: string; il: string[] }>;
 } {
   const rawNets = ldNetworks(pouBody);
   const selected = networkIndex ? [rawNets[networkIndex - 1]].filter(Boolean) : rawNets;
@@ -548,6 +795,7 @@ export function renderLdAsciiForPou(pouBody: string, networkIndex?: number): {
     const idx = startIdx + offset;
     const parsed = parseLdNetwork(raw);
     const active = (parsed.properties.NET_ACTIVE ?? 'TRUE').toUpperCase() !== 'FALSE';
+    const bookmark = (parsed.properties.NET_BOOKMARK ?? 'FALSE').toUpperCase() === 'TRUE';
     const label = parsed.properties.NET_LABEL ?? '';
     const netId = parsed.properties.NET_ID ?? parsed.properties.NetworkID ?? String(idx);
 
@@ -594,16 +842,19 @@ export function renderLdAsciiForPou(pouBody: string, networkIndex?: number): {
     const right = outs.length ? outs.join(' ') : '(none)';
     const header = `Network ${idx} (ID=${netId}${active ? '' : ', DISABLED'}${label ? `, LABEL=${label}` : ''})`;
     const ascii = `${header}\n|---${left}------------${right}---|`;
-    return { index: idx, net_id: netId, active, label, ascii, il: ilStrings };
+    return { index: idx, net_id: netId, active, bookmark, label, ascii, il: ilStrings };
   });
 
   return { rungs };
 }
 
-const DEVICE_REF_RE = /(?<![A-Z0-9_])(X|Y|M|S|T|C|D|V|Z|R)\s*(\d+)(?![A-Z0-9_])/gi;
-const WRITE_LAST_OPS = new Set(['OUT', 'SET', 'RST', 'MOV', 'DMOV', 'DADD', 'DSUB', 'DMUL', 'DDIV', 'ADD', 'SUB', 'MUL', 'DIV', 'INC', 'DEC', 'DINC', 'DDEC', 'ALT', 'PLS', 'PLF']);
+const DEVICE_REF_RE = /(?<![A-Z0-9_])(X|Y|M|S|T|C|D|V|Z|R)\s*(\d+)(?:\.[0-9A-Fa-f]+)?(?![A-Z0-9_])/gi;
+const WRITE_LAST_OPS = new Set([
+  'OUT', 'SET', 'RST', 'MOV', 'DMOV', 'DADD', 'DSUB', 'DMUL', 'DDIV', 'ADD', 'SUB', 'MUL', 'DIV',
+  'INC', 'DEC', 'DINC', 'DDEC', 'ALT', 'PLS', 'PLF', 'ANDW', 'ORW', 'XORW', 'NEG', 'SWAP', 'CMP', 'ZCP',
+]);
 const WRITE_FIRST_OPS = new Set(['TMR', 'CNT', 'DCNT']);
-const WRITE_ALL_OPS = new Set(['ZRST']);
+const WRITE_ALL_OPS = new Set(['ZRST', 'XCH']);
 
 export function extractCrossRefsFromText(source: string) {
   const refs = new Map<string, { reads: number[]; writes: number[] }>();
@@ -658,6 +909,327 @@ export function extractCrossRefsFromText(source: string) {
     }));
 }
 
+export function exportProjectBundle(source: string, containerInfo: ReturnType<typeof inspectContainer>, includeAscii = false) {
+  const projSec = sections(source, 'PROJECT')[0];
+  const properties: Record<string, string> = {};
+  if (projSec) {
+    for (const line of projSec.inner.split(/\r?\n/)) {
+      const eq = line.indexOf('=');
+      if (eq > 0) properties[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+    }
+  }
+  const tasks = readTasks(source);
+  const systemVars = readSystemVars(source);
+  const deviceComments = readDeviceComments(source);
+  const duts = readDuts(source);
+  const globalSec = sections(source, 'GLOBAL_VAR')[0];
+  const globalVars = globalSec ? parseLocalVariables(globalSec.inner).entries : [];
+
+  const pous = sections(source, 'POU').map((m) => {
+    const name = propertyValue(m.inner, 'P_Name') ?? 'Unknown';
+    const langCode = propertyValue(m.inner, 'P_Lang') ?? '1';
+    const pTypeCode = propertyValue(m.inner, 'P_type') ?? '0';
+    const active = (propertyValue(m.inner, 'P_Active') ?? 'TRUE').trim().toUpperCase() !== 'FALSE';
+    const language = langCode === '2' ? 'ST' : langCode === '3' ? 'IL' : 'LD';
+    const pouType = pTypeCode === '1' ? 'FB' : pTypeCode === '2' ? 'FC' : 'PRG';
+    const lvSec = sections(m.inner, 'LOCAL_VAR')[0];
+    const localVars = lvSec ? parseLocalVariables(lvSec.inner).entries : [];
+
+    if (language === 'LD') {
+      const rendered = renderLdAsciiForPou(m.inner);
+      return {
+        name,
+        language,
+        pou_type: pouType,
+        active,
+        local_vars: localVars,
+        networks: rendered.rungs.map((r) => ({
+          index: r.index,
+          net_id: r.net_id,
+          active: r.active,
+          bookmark: r.bookmark,
+          label: r.label,
+          il: r.il,
+          ...(includeAscii ? { ascii: r.ascii } : {}),
+        })),
+      };
+    }
+    const code = sections(m.inner, 'IL_ST_CODE')[0]?.inner ?? '';
+    return {
+      name,
+      language,
+      pou_type: pouType,
+      active,
+      local_vars: localVars,
+      code,
+    };
+  });
+
+  return {
+    model: containerInfo.project_model,
+    layout: containerInfo.layout,
+    encoding: containerInfo.encoding,
+    properties,
+    tasks,
+    system_vars: systemVars,
+    device_comments: deviceComments,
+    global_vars: globalVars,
+    duts,
+    pous,
+  };
+}
+
+export interface ProjectBundleInput {
+  model: string;
+  properties?: Record<string, string>;
+  tasks?: TaskConfig[];
+  system_vars?: Record<string, string> | Array<{ area: string; start: number; end: number }>;
+  device_comments?: Record<string, string>;
+  global_vars?: Array<Record<string, unknown>>;
+  duts?: Array<{ name: string; content: string }>;
+  pous: Array<{
+    name: string;
+    language: 'LD' | 'ST' | 'IL';
+    pou_type?: 'PRG' | 'FB' | 'FC';
+    active?: boolean;
+    local_vars?: Array<Record<string, unknown>>;
+    code?: string;
+    networks?: Array<{ il: string | string[]; active?: boolean; bookmark?: boolean; label?: string }>;
+  }>;
+}
+
+export function buildProjectFromBundle(bundle: ProjectBundleInput): {
+  ispBytes: Buffer;
+  iniBytes: Buffer;
+  canonicalModel: string;
+} {
+  if (!bundle.pous || !bundle.pous.length) {
+    throw new FileTransformError('Bundle must include at least one POU');
+  }
+  const firstPou = bundle.pous[0];
+  const { ispBytes: baseBytes, iniBytes, canonicalModel } = createBlankProjectBytes({
+    model: bundle.model,
+    initialPouName: firstPou.name,
+    language: firstPou.language === 'ST' ? 'ST' : 'LD',
+  });
+  const container = decodeContainer(baseBytes);
+  const nl = container.newline;
+  let source = decodeCodepage(container.source, container.encoding);
+
+  // Properties
+  if (bundle.properties) {
+    const projSec = sections(source, 'PROJECT')[0];
+    if (projSec) {
+      let projInner = projSec.inner;
+      for (const [k, v] of Object.entries(bundle.properties)) {
+        const re = new RegExp(`^${k}=[^\\r\\n]*`, 'm');
+        projInner = re.test(projInner) ? projInner.replace(re, `${k}=${v}`) : projInner.trimEnd() + nl + `${k}=${v}` + nl;
+      }
+      source = source.slice(0, projSec.innerStart) + projInner + source.slice(projSec.innerEnd);
+    }
+  }
+
+  // Create remaining POUs first so tasks can reference them
+  for (let i = 1; i < bundle.pous.length; i++) {
+    const p = bundle.pous[i];
+    source = createPouInSource(
+      source,
+      {
+        pouName: p.name,
+        language: p.language,
+        pouType: p.pou_type ?? 'PRG',
+        code: p.code,
+        assignToTask: false,
+      },
+      nl,
+    );
+  }
+
+  // Populate every POU's networks/code, local_vars, active flag
+  for (const p of bundle.pous) {
+    if (p.language === 'LD' && Array.isArray(p.networks) && p.networks.length > 0) {
+      const blocks: string[] = [];
+      for (let idx = 0; idx < p.networks.length; idx++) {
+        const netSpec = p.networks[idx];
+        const ilText = Array.isArray(netSpec.il) ? netSpec.il.join('\n') : netSpec.il;
+        const built = buildNetworksFromIl(ilText, nl);
+        for (let b of built) {
+          if (netSpec.active === false) {
+            b = b.replace(/^NET_ACTIVE=[^\r\n]*/m, 'NET_ACTIVE=FALSE');
+          }
+          if (netSpec.bookmark) {
+            b = b.replace(/^NET_BOOKMARK=[^\r\n]*/m, 'NET_BOOKMARK=TRUE');
+          }
+          if (netSpec.label) {
+            b = b.replace(/^NET_LABEL=[^\r\n]*/m, `NET_LABEL=${netSpec.label.replace(/[\r\n]/g, ' ')}`);
+          }
+          blocks.push(b);
+        }
+      }
+      const renumbered = blocks.map((b, i) => b.replace(/^NET_ID=\d+/m, `NET_ID=${i + 1}`));
+      source = replaceLdPouNetworks(source, p.name, renumbered, nl);
+    } else if (p.language === 'LD' && p.code) {
+      const built = buildNetworksFromIl(p.code, nl);
+      source = replaceLdPouNetworks(source, p.name, built, nl);
+    } else if (p.language !== 'LD' && typeof p.code === 'string') {
+      const pouMatch = sections(source, 'POU').find((m) => propertyValue(m.inner, 'P_Name') === p.name);
+      if (pouMatch) {
+        const stSec = sections(pouMatch.inner, 'IL_ST_CODE')[0];
+        if (stSec) {
+          const repCode = normalized(p.code).replace(/\n/g, nl);
+          const newInner = pouMatch.inner.slice(0, stSec.innerStart) + repCode + pouMatch.inner.slice(stSec.innerEnd);
+          source = source.slice(0, pouMatch.innerStart) + newInner + source.slice(pouMatch.innerEnd);
+        }
+      }
+    }
+
+    if (p.local_vars && p.local_vars.length > 0) {
+      source = editLocalVarsInSource(source, p.name, { upsertVars: p.local_vars }, nl).updatedSource;
+    }
+    if (p.active === false) {
+      const pouMatch = sections(source, 'POU').find((m) => propertyValue(m.inner, 'P_Name') === p.name);
+      if (pouMatch) {
+        const newInner = pouMatch.inner.replace(/^P_Active=[^\r\n]*/m, 'P_Active=FALSE');
+        source = source.slice(0, pouMatch.innerStart) + newInner + source.slice(pouMatch.innerEnd);
+      }
+    }
+  }
+
+  // Global vars
+  if (bundle.global_vars && bundle.global_vars.length > 0) {
+    source = editGlobalVarsInSource(source, { upsertVars: bundle.global_vars }, nl).updatedSource;
+  }
+
+  // DUTs
+  if (bundle.duts) {
+    for (const d of bundle.duts) {
+      source = upsertDutInSource(source, d.name, d.content, nl);
+    }
+  }
+
+  // Device comments
+  if (bundle.device_comments) {
+    source = writeDeviceCommentsInSource(source, bundle.device_comments, nl, true).updatedSource;
+  }
+
+  // System vars
+  if (bundle.system_vars) {
+    const map: Record<string, string> = {};
+    if (Array.isArray(bundle.system_vars)) {
+      for (const r of bundle.system_vars) {
+        map[r.area] = `${r.start}-${r.end}`;
+      }
+    } else {
+      Object.assign(map, bundle.system_vars);
+    }
+    source = writeSystemVarsInSource(source, map, nl);
+  }
+
+  // Tasks
+  if (bundle.tasks && bundle.tasks.length > 0) {
+    source = replaceTasksInSource(source, bundle.tasks, nl);
+  }
+
+  const ispBytes = container.rebuild(encodeCodepage(source, container.encoding));
+  return { ispBytes, iniBytes, canonicalModel };
+}
+
+export function searchProjectSource(
+  source: string,
+  query: string,
+  options: { caseSensitive?: boolean; regex?: boolean; scope?: 'all' | 'code' | 'vars' | 'comments' } = {},
+) {
+  const q = query.trim();
+  if (!q) throw new FileTransformError('query must be non-empty');
+  const scope = options.scope ?? 'all';
+  const flags = options.caseSensitive ? 'g' : 'gi';
+  const pattern = options.regex ? new RegExp(q, flags) : new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+  const matches: Array<{ scope: string; pou?: string; location: string; text: string }> = [];
+
+  if (scope === 'all' || scope === 'comments') {
+    const cmts = readDeviceComments(source);
+    for (const [dev, text] of Object.entries(cmts)) {
+      if (pattern.test(dev) || pattern.test(text)) {
+        pattern.lastIndex = 0;
+        matches.push({ scope: 'DEVICE_COMMENT', location: dev, text: `${dev}::${text}` });
+      }
+    }
+  }
+
+  if (scope === 'all' || scope === 'vars') {
+    const gSec = sections(source, 'GLOBAL_VAR')[0];
+    if (gSec) {
+      for (const e of parseLocalVariables(gSec.inner).entries) {
+        const line = `${e.identifier} : ${e.type} (${e.address ?? 'unmapped'}) // ${e.comment ?? ''}`;
+        if (pattern.test(line)) {
+          pattern.lastIndex = 0;
+          matches.push({ scope: 'GLOBAL_VAR', location: e.identifier, text: line });
+        }
+      }
+    }
+    for (const d of readDuts(source)) {
+      if (pattern.test(d.name) || pattern.test(d.content)) {
+        pattern.lastIndex = 0;
+        matches.push({ scope: 'DUT', location: d.name, text: d.content });
+      }
+    }
+  }
+
+  for (const pou of sections(source, 'POU')) {
+    const pouName = propertyValue(pou.inner, 'P_Name') ?? 'Unknown';
+    const lang = propertyValue(pou.inner, 'P_Lang') ?? '1';
+    if (scope === 'all' && pattern.test(pouName)) {
+      pattern.lastIndex = 0;
+      matches.push({ scope: 'POU_HEADER', pou: pouName, location: pouName, text: `POU ${pouName}` });
+    }
+    if (scope === 'all' || scope === 'vars') {
+      const lv = sections(pou.inner, 'LOCAL_VAR')[0];
+      if (lv) {
+        for (const e of parseLocalVariables(lv.inner).entries) {
+          const line = `${e.identifier} : ${e.type} (${e.address ?? 'unmapped'}) // ${e.comment ?? ''}`;
+          if (pattern.test(line)) {
+            pattern.lastIndex = 0;
+            matches.push({ scope: 'LOCAL_VAR', pou: pouName, location: e.identifier, text: line });
+          }
+        }
+      }
+    }
+    if (scope === 'all' || scope === 'code') {
+      if (lang === '1') {
+        const rendered = renderLdAsciiForPou(pou.inner);
+        for (const r of rendered.rungs) {
+          const ilText = r.il.join('\n');
+          if (pattern.test(ilText) || (r.label && pattern.test(r.label))) {
+            pattern.lastIndex = 0;
+            matches.push({
+              scope: 'LD_NETWORK',
+              pou: pouName,
+              location: `Network ${r.index}${r.label ? ` (${r.label})` : ''}`,
+              text: ilText,
+            });
+          }
+        }
+      } else {
+        const stCode = sections(pou.inner, 'IL_ST_CODE')[0]?.inner ?? '';
+        stCode.split(/\r?\n/).forEach((line, idx) => {
+          if (pattern.test(line)) {
+            pattern.lastIndex = 0;
+            matches.push({ scope: 'ST_LINE', pou: pouName, location: `Line ${idx + 1}`, text: line.trim() });
+          }
+        });
+      }
+    }
+  }
+
+  return {
+    success: true,
+    query: q,
+    match_count: matches.length,
+    matches: matches.slice(0, 100),
+    truncated: matches.length > 100,
+  };
+}
+
 export function staticCheckAndCompileProject(container: IspContainer) {
   const info = inspectContainer(container);
   const text = decodeCodepage(container.source, container.encoding);
@@ -666,11 +1238,12 @@ export function staticCheckAndCompileProject(container: IspContainer) {
 
   const tasks = readTasks(text);
   const pous = sections(text, 'POU');
-  const pouMap = new Map<string, { lang: string; body: string }>();
+  const pouMap = new Map<string, { lang: string; pouType: string; body: string }>();
 
   for (const m of pous) {
     const name = propertyValue(m.inner, 'P_Name') ?? '';
     const lang = propertyValue(m.inner, 'P_Lang') ?? '';
+    const pouType = propertyValue(m.inner, 'P_type') ?? '0';
     if (!name) {
       errors.push({ scope: 'POU', message: 'POU missing P_Name' });
       continue;
@@ -678,7 +1251,7 @@ export function staticCheckAndCompileProject(container: IspContainer) {
     if (pouMap.has(name)) {
       errors.push({ scope: `POU:${name}`, message: `Duplicate POU name ${name}` });
     }
-    pouMap.set(name, { lang, body: m.inner });
+    pouMap.set(name, { lang, pouType, body: m.inner });
   }
 
   for (const t of tasks) {
@@ -690,7 +1263,6 @@ export function staticCheckAndCompileProject(container: IspContainer) {
     warnings.push({ scope: 'TASK', message: 'No TASK entries found; POUs will not be cyclically scheduled.' });
   }
 
-  // Device range limits from SYSTEM_VAR
   const sysVars = sections(text, 'SYSTEM_VAR');
   const areaRanges = new Map<string, { min: number; max: number }>();
   if (sysVars.length === 1) {
@@ -702,8 +1274,8 @@ export function staticCheckAndCompileProject(container: IspContainer) {
     }
   }
 
-  // Double-coil detection across all LD POUs
   const coilWrites = new Map<string, string[]>();
+  const setRstWrites = new Map<string, string[]>();
   let totalNetworks = 0;
   let totalInstructions = 0;
 
@@ -712,8 +1284,7 @@ export function staticCheckAndCompileProject(container: IspContainer) {
     if (localVars.length > 0) {
       const parsedVars = parseLocalVariables(localVars[0].inner);
       if (parsedVars.errors.length && localVars[0].inner.trim() && !/^\s*<VAR>\s*<\/VAR>\s*$/i.test(localVars[0].inner)) {
-        // Only warn if non-empty unstructured IEC VAR block
-        if (!/^\s*VAR\b[\s\S]*\bEND_VAR\s*$/i.test(localVars[0].inner.trim())) {
+        if (!/^\s*VAR[\s\S]*\bEND_VAR\s*$/i.test(localVars[0].inner.trim())) {
           warnings.push({ scope: `POU:${name}`, message: `LOCAL_VAR contains unparsed rows (${parsedVars.errors[0]})` });
         }
       }
@@ -725,6 +1296,13 @@ export function staticCheckAndCompileProject(container: IspContainer) {
       if (nets.length === 0) {
         warnings.push({ scope: `POU:${name}`, message: 'LD POU contains zero networks' });
       }
+      const labels = new Set<string>();
+      for (const rawNet of nets) {
+        const pn = parseLdNetwork(rawNet);
+        const lbl = (pn.properties.NET_LABEL ?? '').trim();
+        if (lbl) labels.add(lbl.toUpperCase());
+      }
+
       nets.forEach((rawNet, i) => {
         const netNum = i + 1;
         const netErrors = validateLdBodyErrors(rawNet);
@@ -737,6 +1315,10 @@ export function staticCheckAndCompileProject(container: IspContainer) {
             const dev = node.fields.DEV_NAME.toUpperCase();
             if (!coilWrites.has(dev)) coilWrites.set(dev, []);
             coilWrites.get(dev)!.push(`${name}:Net${netNum}`);
+          } else if ((node.fields.TYPE === '15' || node.fields.TYPE === '16') && node.fields.DEV_NAME) {
+            const dev = node.fields.DEV_NAME.toUpperCase();
+            if (!setRstWrites.has(dev)) setRstWrites.set(dev, []);
+            setRstWrites.get(dev)!.push(`${name}:Net${netNum}`);
           }
         }
         try {
@@ -744,9 +1326,15 @@ export function staticCheckAndCompileProject(container: IspContainer) {
           if (ilNets.length === 1) {
             const ins = netToIl(ilNets[0]);
             totalInstructions += ins.length;
-            for (const [, ops] of ins) {
+            for (const [opCode, ops] of ins) {
+              if (opCode === 'CJ' && ops[0] && !labels.has(ops[0].toUpperCase())) {
+                errors.push({ scope: `POU:${name}:Net${netNum}`, message: `CJ target label ${ops[0]} not found in POU ${name}` });
+              }
+              if (opCode === 'CALL' && ops[0] && !labels.has(ops[0].toUpperCase()) && !pouMap.has(ops[0])) {
+                errors.push({ scope: `POU:${name}:Net${netNum}`, message: `CALL target ${ops[0]} not found as NET_LABEL or POU` });
+              }
               for (const op of ops) {
-                const dm = /^(X|Y|M|S|T|C|D)(\d+)$/i.exec(op);
+                const dm = /^(X|Y|M|S|T|C|D)(\d+)(?:\.[0-9A-Fa-f]+)?$/i.exec(op);
                 if (dm) {
                   const area = dm[1].toUpperCase();
                   const num = area === 'X' || area === 'Y' ? parseInt(dm[2], 8) : parseInt(dm[2], 10);
@@ -770,19 +1358,19 @@ export function staticCheckAndCompileProject(container: IspContainer) {
       });
     } else if (lang === '2') {
       const code = sections(body, 'IL_ST_CODE')[0]?.inner ?? '';
-      const lines = code.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith('(*'));
+      const cleanCode = code.replace(/\(\*[\s\S]*?\*\)/g, '').replace(/\/\/[^\r\n]*/g, '');
+      const lines = cleanCode.split(/\r?\n/).filter((l) => l.trim());
       totalInstructions += lines.length;
-      // Basic ST balanced block check
-      const ifCount = (code.match(/\bIF\b/gi) ?? []).length;
-      const endIfCount = (code.match(/\bEND_IF\b/gi) ?? []).length;
-      if (ifCount !== endIfCount) {
-        errors.push({ scope: `POU:${name}`, message: `Unbalanced IF/END_IF blocks (${ifCount} IF vs ${endIfCount} END_IF)` });
-      }
-      const forCount = (code.match(/\bFOR\b/gi) ?? []).length;
-      const endForCount = (code.match(/\bEND_FOR\b/gi) ?? []).length;
-      if (forCount !== endForCount) {
-        errors.push({ scope: `POU:${name}`, message: `Unbalanced FOR/END_FOR blocks (${forCount} FOR vs ${endForCount} END_FOR)` });
-      }
+      const checkPair = (openRe: RegExp, closeRe: RegExp, label: string) => {
+        const o = (cleanCode.match(openRe) ?? []).length;
+        const c = (cleanCode.match(closeRe) ?? []).length;
+        if (o !== c) errors.push({ scope: `POU:${name}`, message: `Unbalanced ${label} blocks (${o} vs ${c})` });
+      };
+      checkPair(/\bIF\b/gi, /\bEND_IF\b/gi, 'IF/END_IF');
+      checkPair(/\bFOR\b/gi, /\bEND_FOR\b/gi, 'FOR/END_FOR');
+      checkPair(/\bWHILE\b/gi, /\bEND_WHILE\b/gi, 'WHILE/END_WHILE');
+      checkPair(/\bCASE\b/gi, /\bEND_CASE\b/gi, 'CASE/END_CASE');
+      checkPair(/\bREPEAT\b/gi, /\bEND_REPEAT\b/gi, 'REPEAT/END_REPEAT');
     }
   }
 
@@ -791,6 +1379,12 @@ export function staticCheckAndCompileProject(container: IspContainer) {
       warnings.push({
         scope: 'DOUBLE_COIL',
         message: `Double-coil output OUT ${dev} appears in multiple networks: ${locs.join(', ')}`,
+      });
+    }
+    if (setRstWrites.has(dev)) {
+      warnings.push({
+        scope: 'COIL_CONFLICT',
+        message: `Bit ${dev} mixes OUT (${locs.join(', ')}) with SET/RST (${setRstWrites.get(dev)!.join(', ')})`,
       });
     }
   }
@@ -809,6 +1403,88 @@ export function staticCheckAndCompileProject(container: IspContainer) {
     errors,
     warnings,
     note: 'Comprehensive offline IEC/DVP static check and memory-range verification (non-vendor binary compilation).',
+  };
+}
+
+export function auditProjectDeep(container: IspContainer) {
+  const staticCheck = staticCheckAndCompileProject(container);
+  const text = decodeCodepage(container.source, container.encoding);
+  const tasks = readTasks(text);
+  const scheduledPrograms = new Set(tasks.filter((t) => t.active).map((t) => t.program));
+
+  const codeParts: string[] = [];
+  const inactivePous: string[] = [];
+  const unscheduledPrgs: string[] = [];
+  const disabledRungs: Array<{ pou: string; network_index: number }> = [];
+  const declaredSymbols: Array<{ scope: string; identifier: string; address: string | null }> = [];
+
+  const gSec = sections(text, 'GLOBAL_VAR')[0];
+  if (gSec) {
+    for (const e of parseLocalVariables(gSec.inner).entries) {
+      declaredSymbols.push({ scope: 'GLOBAL', identifier: e.identifier, address: e.address });
+    }
+  }
+
+  for (const pou of sections(text, 'POU')) {
+    const name = propertyValue(pou.inner, 'P_Name') ?? 'Unknown';
+    const lang = propertyValue(pou.inner, 'P_Lang') ?? '1';
+    const pType = propertyValue(pou.inner, 'P_type') ?? '0';
+    const active = (propertyValue(pou.inner, 'P_Active') ?? 'TRUE').trim().toUpperCase() !== 'FALSE';
+    if (!active) inactivePous.push(name);
+    if (pType === '0' && !scheduledPrograms.has(name)) unscheduledPrgs.push(name);
+
+    const lv = sections(pou.inner, 'LOCAL_VAR')[0];
+    if (lv) {
+      for (const e of parseLocalVariables(lv.inner).entries) {
+        declaredSymbols.push({ scope: `POU:${name}`, identifier: e.identifier, address: e.address });
+      }
+    }
+
+    if (lang === '1') {
+      ldNetworks(pou.inner).forEach((raw, idx) => {
+        const pn = parseLdNetwork(raw);
+        if ((pn.properties.NET_ACTIVE ?? 'TRUE').toUpperCase() === 'FALSE') {
+          disabledRungs.push({ pou: name, network_index: idx + 1 });
+        }
+        codeParts.push(raw);
+      });
+    } else {
+      codeParts.push(sections(pou.inner, 'IL_ST_CODE')[0]?.inner ?? '');
+    }
+  }
+
+  const combinedCode = codeParts.join('\n');
+  const refs = extractCrossRefsFromText(combinedCode);
+  const floatingContacts = refs
+    .filter((r) => r.read_count > 0 && r.write_count === 0 && !/^(X\d+|M10\d\d)$/.test(r.address))
+    .map((r) => r.address);
+  const deadWrites = refs
+    .filter((r) => r.write_count > 0 && r.read_count === 0 && !/^Y\d+$/.test(r.address))
+    .map((r) => r.address);
+
+  const unusedSymbols = declaredSymbols.filter((sym) => {
+    const idRe = new RegExp(`(?<![A-Za-z0-9_])${sym.identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_])`);
+    const usedById = idRe.test(combinedCode);
+    const usedByAddr = sym.address ? refs.some((r) => r.address === sym.address) : false;
+    return !usedById && !usedByAddr;
+  });
+
+  return {
+    ...staticCheck,
+    findings: {
+      inactive_pous: inactivePous,
+      unscheduled_prgs: unscheduledPrgs,
+      disabled_rungs: disabledRungs,
+      floating_undriven_devices: floatingContacts,
+      dead_unread_outputs: deadWrites,
+      unused_symbols: unusedSymbols,
+    },
+    engineering_health:
+      staticCheck.error_count > 0
+        ? 'ERRORS_FOUND'
+        : staticCheck.warning_count > 0 || unscheduledPrgs.length > 0 || floatingContacts.length > 0
+          ? 'WARNINGS_PRESENT'
+          : 'CLEAN',
   };
 }
 
@@ -863,5 +1539,4 @@ export function diffProjectsSource(sourceA: string, sourceB: string) {
   };
 }
 
-// Keep unused reference silenced cleanly
 export { API_NUM, CONTACT_AND, CONTACT_LD, CONTACT_OR, COIL, nv };

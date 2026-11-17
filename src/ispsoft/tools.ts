@@ -1,21 +1,33 @@
 import path from 'node:path';
 import {
   MODEL_PROFILES,
+  ProjectBundleInput,
   TaskConfig,
+  auditProjectDeep,
+  buildNetworksFromIl,
+  buildProjectFromBundle,
   createBlankProjectBytes,
   createPouInSource,
   deleteDutInSource,
   deleteOrRenamePouInSource,
   diffProjectsSource,
+  editGlobalVarsInSource,
   editLdRungsInSource,
+  editLocalVarsInSource,
+  exportProjectBundle,
   extractCrossRefsFromText,
+  readDeviceComments,
   readDuts,
+  readSystemVars,
   readTasks,
   renderLdAsciiForPou,
   replaceTasksInSource,
   resolveModel,
+  searchProjectSource,
   staticCheckAndCompileProject,
   upsertDutInSource,
+  writeDeviceCommentsInSource,
+  writeSystemVarsInSource,
 } from './authoring.js';
 import {
   decodeContainer,
@@ -49,22 +61,41 @@ import { packPackage, unpackPackage } from './packages.js';
 import {
   compareSimulatorWithProject,
   controlSimulator,
+  dumpSimulatorMemory,
   forceAndWriteSimulator,
   listSimulatorSessions,
+  manageBreakpoints,
   manageWatchTable,
   monitorSimulator,
+  profileSimulatorSession,
   reloadSimulatorSession,
+  runSimulatorSequence,
   startSimulatorSession,
+  stepSimulatorUntil,
 } from './simulator.js';
+import {
+  ToolAnnotations,
+  classifyToolError,
+  deriveToolAnnotations,
+  mcpTelemetry,
+  sanitizeJsonValue,
+  validateToolArguments,
+} from './mcpProtocol.js';
 import {
   DEFAULT_WORK_DIR,
   artifactPath,
+  cleanupWorkspaceBackups,
+  copyOrMoveWorkspaceFile,
+  deleteWorkspaceFile,
+  getCachedMeta,
   getFileMeta,
+  getWorkspaceStorageStats,
   hasFile,
   listAllFiles,
   normalizeVirtualPath,
   readFileBuffer,
   seedDefaultWorkspace,
+  setCachedMeta,
   writeFileBuffer,
   writeProjectCandidateAndBackup,
 } from './workspace.js';
@@ -74,27 +105,11 @@ export interface McpToolDef {
   description: string;
   category: string;
   inputSchema: Record<string, unknown>;
+  annotations?: ToolAnnotations;
   handler: (args: Record<string, unknown>) => Record<string, unknown>;
 }
 
 const LIVE_WRITES_ENV = 'ISPSOFT_WRITES_ENABLED';
-
-function projectCommentMap(source: string): Record<string, string> {
-  const comments: Record<string, string> = {};
-  const match = /(?:<DEVICE_CMT_START>\r*\n|\[DEVICE_CMT_START\]\r*\n)([\s\S]*?)(?:<\/DEVICE_CMT_START>|\[DEVICE_CMT_END\])/i.exec(
-    source,
-  );
-  if (!match) return comments;
-  for (const rawLine of match[1].split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || !line.includes('::')) continue;
-    const idx = line.indexOf('::');
-    const addr = line.slice(0, idx).trim().toUpperCase();
-    const text = line.slice(idx + 2).trim();
-    if (addr) comments[addr] = text;
-  }
-  return comments;
-}
 
 function capabilityMatrix() {
   const perProfile: Record<string, Record<string, unknown>> = {};
@@ -123,25 +138,36 @@ function capabilityMatrix() {
       status: 'QUALIFIED',
       features: [
         'blank_project_creation',
+        'full_bundle_export_import',
+        'atomic_multi_edit_transactions_and_in_place_updates',
+        'workspace_file_management_and_backup_rollback',
         'pou_create_rename_delete',
         'st_code_patching',
-        'ld_rung_edit_and_ascii_render',
+        'ld_rung_edit_stack_ops_and_ascii_render',
         'il_to_ld_program_authoring',
-        'local_and_global_var_editing',
+        'local_and_global_var_upsert_delete',
         'dut_struct_enum_management',
         'task_and_system_var_config',
         'device_comment_merge',
-        'project_wide_symbol_refactor',
-        'project_diff',
+        'project_wide_symbol_refactor_and_search',
+        'deep_engineering_audit_and_project_diff',
       ],
     },
     offline_static_check_and_compile: {
       status: 'QUALIFIED',
-      checks: ['syntax', 'double_coil', 'system_var_bounds', 'task_integrity', 'variable_wrappers'],
+      checks: ['syntax', 'double_coil', 'coil_conflict', 'floating_contacts', 'system_var_bounds', 'task_integrity', 'variable_wrappers'],
     },
     soft_plc_simulator_and_monitor: {
       status: 'QUALIFIED_SIMULATOR',
-      features: ['run_stop_step_reset', 'live_rung_power_flow', 'force_on_off', 'watch_tables', 'scan_trace', 'upload_compare'],
+      features: [
+        'run_stop_step_step_until_warm_cold_reset',
+        'true_iec_ladder_stack_machine_anb_orb_mps_mrd_mpp',
+        '32bit_dword_math_and_bit_of_word',
+        'subroutines_call_sret_fend_and_cj_jumps',
+        'st_case_repeat_arrays_structs_fc_fb_calls',
+        'multi_step_sequence_testbench_and_breakpoints',
+        'memory_table_dump_watch_tables_trace_compact_monitor',
+      ],
     },
     dvp_modbus_address_mapping: { status: 'QUALIFIED', models: ['ES2'], device_io: 'NOT_RUN' },
     native_windows_ide_automation: { status: process.platform === 'win32' ? 'AVAILABLE' : 'UNAVAILABLE_ON_LINUX' },
@@ -175,29 +201,44 @@ export const MCP_TOOLS: McpToolDef[] = [
           is_windows: isWin,
         },
         workspace: {
-          work_dir: DEFAULT_WORK_DIR,
+          ...getWorkspaceStorageStats(),
           project_count: listAllFiles().filter((f) => /\.(isp|bak|mpu)$/i.test(f)).length,
           files: listAllFiles(),
         },
         simulator: {
           active_sessions: listSimulatorSessions(),
         },
+        telemetry: mcpTelemetry.getSummary().totals,
         limits: {
           max_file_bytes: 32 * 1024 * 1024,
           max_item_chars: MAX_ITEM_CHARS,
           max_response_chars: MAX_RESPONSE_CHARS,
         },
         qualified_workflows: [
-          'blank_project_and_template_creation',
+          'blank_project_and_bundle_export_import',
+          'atomic_multi_edit_transaction_and_in_place_editing',
           'pou_task_dut_global_var_authoring',
-          'ld_rung_editing_and_ascii_visualization',
+          'ld_stack_ops_rung_editing_and_ascii_visualization',
           'offline_il_mpu_bidirectional_transpile',
-          'offline_iec_dvp_static_check_and_compile',
-          'soft_plc_simulator_online_monitor_force_and_trace',
+          'offline_iec_dvp_static_check_compile_and_deep_audit',
+          'soft_plc_simulator_online_monitor_breakpoints_sequence_and_trace',
           'offline_dvp_modbus_translation',
-          'optimistic_concurrency_control_and_dry_run',
         ],
       };
+    },
+  },
+  {
+    name: 'ispsoft_server_telemetry',
+    description: 'Return MCP server operational telemetry: per-tool call/error/p95 latency histograms, recent audit events, workspace disk quota usage, and active simulator count.',
+    category: 'Diagnostics',
+    inputSchema: { type: 'object', properties: {} },
+    handler: () => {
+      seedDefaultWorkspace();
+      return mcpTelemetry.getSummary({
+        workspace_storage: getWorkspaceStorageStats(),
+        active_simulator_sessions: listSimulatorSessions().length,
+        tool_catalog_count: MCP_TOOLS.length,
+      });
     },
   },
   {
@@ -225,11 +266,11 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
 
   // =========================================================================
-  // 2. Project Discovery, Creation, Properties, Tasks & Hardware/Memory Config
+  // 2. Project Discovery, Creation, Bundle Export/Import, Workspace Ops & Batch Tx
   // =========================================================================
   {
     name: 'ispsoft_list_projects',
-    description: 'List and inspect ISPSoft .isp/.bak/.mpu artifacts in the workspace.',
+    description: 'List and inspect ISPSoft .isp/.bak/.mpu artifacts in the workspace (sha256-cached).',
     category: 'Project Management',
     inputSchema: {
       type: 'object',
@@ -245,10 +286,14 @@ export const MCP_TOOLS: McpToolDef[] = [
       const all = listAllFiles(searchPath).filter((p) => /\.(isp|bak|mpu)$/i.test(p));
       const projects = all.slice(0, maxResults).map((p) => {
         const buf = readFileBuffer(p);
+        const cached = getCachedMeta(p, buf);
+        if (cached) return cached;
+
+        let summary: Record<string, unknown>;
         if (p.toLowerCase().endsWith('.mpu')) {
           try {
             const { il, detail } = mpuToIl(buf, 'cp1252');
-            return {
+            summary = {
               path: p,
               kind: 'MPU',
               bytes: buf.length,
@@ -258,28 +303,365 @@ export const MCP_TOOLS: McpToolDef[] = [
               sha256: sha256(buf),
             };
           } catch (e) {
-            return { path: p, kind: 'MPU', bytes: buf.length, readable: false, error: errMsg(e) };
+            summary = { path: p, kind: 'MPU', bytes: buf.length, readable: false, error: errMsg(e) };
+          }
+        } else {
+          try {
+            const c = decodeContainer(buf);
+            const info = inspectContainer(c);
+            summary = {
+              path: p,
+              kind: 'PROJECT',
+              bytes: buf.length,
+              readable: true,
+              model: info.project_model,
+              layout: info.layout,
+              pou_count: info.pous.length,
+              sha256: sha256(buf),
+              content_hash: computeContentHash('isp', buf),
+            };
+          } catch (e) {
+            summary = { path: p, kind: 'PROJECT', bytes: buf.length, readable: false, error: errMsg(e) };
           }
         }
-        try {
-          const c = decodeContainer(buf);
-          const info = inspectContainer(c);
-          return {
-            path: p,
-            kind: 'PROJECT',
-            bytes: buf.length,
-            readable: true,
-            model: info.project_model,
-            layout: info.layout,
-            pou_count: info.pous.length,
-            sha256: sha256(buf),
-            content_hash: computeContentHash('isp', buf),
-          };
-        } catch (e) {
-          return { path: p, kind: 'PROJECT', bytes: buf.length, readable: false, error: errMsg(e) };
-        }
+        setCachedMeta(p, buf, summary);
+        return summary;
       });
       return { success: true, projects, truncated: all.length > maxResults };
+    },
+  },
+  {
+    name: 'ispsoft_manage_workspace_files',
+    description: 'Copy, move/rename, delete workspace files, restore a project backup, or clean up *.before.* clutter.',
+    category: 'Project Management',
+    inputSchema: {
+      type: 'object',
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['copy', 'move', 'delete', 'restore_backup', 'cleanup_backups'] },
+        path: { type: 'string', description: 'Source path (or target project path for restore_backup)' },
+        destination_path: { type: 'string', description: 'Destination path for copy/move' },
+        backup_path: { type: 'string', description: 'Optional explicit backup path for restore_backup (defaults to <name>.latest.before.isp)' },
+        overwrite: { type: 'boolean', default: false },
+        prefix: { type: 'string', description: 'Optional directory filter for cleanup_backups' },
+      },
+    },
+    handler: (args) => {
+      try {
+        const action = String(args.action ?? '');
+        if (action === 'copy' || action === 'move') {
+          const res = copyOrMoveWorkspaceFile(
+            String(args.path ?? ''),
+            String(args.destination_path ?? ''),
+            action === 'move',
+            Boolean(args.overwrite),
+          );
+          return { success: true, action, ...res };
+        }
+        if (action === 'delete') {
+          const p = normalizeVirtualPath(String(args.path ?? ''));
+          const deleted = deleteWorkspaceFile(p);
+          return { success: deleted, action, path: p, deleted };
+        }
+        if (action === 'restore_backup') {
+          const targetPath = normalizeVirtualPath(String(args.path ?? ''));
+          const parsed = path.posix.parse(targetPath);
+          const backupPath = typeof args.backup_path === 'string' && args.backup_path.trim()
+            ? normalizeVirtualPath(args.backup_path)
+            : path.posix.join(parsed.dir, `${parsed.name}.latest.before${parsed.ext}`);
+          const backupBytes = readFileBuffer(backupPath);
+          decodeContainer(backupBytes);
+          writeFileBuffer(targetPath, backupBytes, true);
+          return {
+            success: true,
+            action,
+            restored_to: targetPath,
+            from_backup: backupPath,
+            content_hash: computeContentHash('isp', backupBytes),
+          };
+        }
+        if (action === 'cleanup_backups') {
+          const res = cleanupWorkspaceBackups(typeof args.prefix === 'string' ? args.prefix : '');
+          return { success: true, action, ...res };
+        }
+        return { success: false, error: `Unsupported action: ${action}` };
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_export_project_bundle',
+    description: 'Export an entire .isp project as compact structured JSON (properties, tasks, system_vars, global/local vars, DUTs, device_comments, and all POUs with IL/ST code).',
+    category: 'Project Management',
+    inputSchema: {
+      type: 'object',
+      required: ['project_path'],
+      properties: {
+        project_path: { type: 'string' },
+        include_ascii: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        const p = normalizeVirtualPath(String(args.project_path ?? ''));
+        const raw = readFileBuffer(p);
+        const c = decodeContainer(raw);
+        const info = inspectContainer(c);
+        const source = decodeCodepage(c.source, c.encoding);
+        const bundle = exportProjectBundle(source, info, Boolean(args.include_ascii));
+        return {
+          success: true,
+          project_path: p,
+          content_hash: computeContentHash('isp', raw),
+          bundle,
+        };
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_import_project_bundle',
+    description: 'Create or overwrite a complete .isp project + .ini from a structured JSON bundle in a single operation (with static compile verification).',
+    category: 'Project Management',
+    inputSchema: {
+      type: 'object',
+      required: ['output_path', 'bundle'],
+      properties: {
+        output_path: { type: 'string' },
+        bundle: { type: 'object', description: 'Project bundle matching ispsoft_export_project_bundle output schema' },
+        overwrite: { type: 'boolean', default: false },
+        dry_run: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        const outPath = normalizeVirtualPath(String(args.output_path ?? ''));
+        if (!outPath.toLowerCase().endsWith('.isp')) {
+          throw new FileTransformError('output_path must use .isp extension');
+        }
+        const { ispBytes, iniBytes, canonicalModel } = buildProjectFromBundle(args.bundle as ProjectBundleInput);
+        const decoded = decodeContainer(ispBytes);
+        const staticCheck = staticCheckAndCompileProject(decoded);
+        if (args.dry_run) {
+          return {
+            success: staticCheck.success,
+            status: 'DRY_RUN_PASSED',
+            dry_run: true,
+            model: canonicalModel,
+            output_path: outPath,
+            static_check: staticCheck,
+          };
+        }
+        const overwrite = Boolean(args.overwrite);
+        if (overwrite && hasFile(outPath)) {
+          const orig = readFileBuffer(outPath);
+          const written = writeProjectCandidateAndBackup(outPath, outPath, orig, ispBytes, true);
+          return {
+            success: staticCheck.success,
+            status: staticCheck.success ? 'IMPORTED_BUNDLE_VERIFIED' : 'IMPORTED_BUNDLE_WITH_WARNINGS',
+            project_path: written.target,
+            backup: written.backup,
+            model: canonicalModel,
+            static_check: staticCheck,
+            content_hash: computeContentHash('isp', ispBytes),
+          };
+        }
+        const saved = writeFileBuffer(outPath, ispBytes, false);
+        const iniPath = saved.replace(/\.isp$/i, '.ini');
+        writeFileBuffer(iniPath, iniBytes, true);
+        return {
+          success: staticCheck.success,
+          status: staticCheck.success ? 'IMPORTED_BUNDLE_VERIFIED' : 'IMPORTED_BUNDLE_WITH_WARNINGS',
+          project_path: saved,
+          companion_path: iniPath,
+          model: canonicalModel,
+          static_check: staticCheck,
+          content_hash: computeContentHash('isp', ispBytes),
+        };
+      } catch (e) {
+        return { success: false, status: 'IMPORT_FAILED', error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_apply_project_transaction',
+    description: 'Atomically apply multiple authoring edits to a project in ONE call, run static check, write once (in-place or candidate), and optionally hot-reload a simulator session.',
+    category: 'Project Management',
+    inputSchema: {
+      type: 'object',
+      required: ['project_path', 'operations'],
+      properties: {
+        project_path: { type: 'string' },
+        operations: {
+          type: 'array',
+          description: 'Sequence of ops: { type: "edit_properties"|"configure_tasks"|"configure_hardware_io"|"create_pou"|"manage_pou"|"write_st"|"write_ld"|"edit_ld_rungs"|"edit_local_vars"|"edit_global_vars"|"manage_dut"|"write_comments"|"rename_symbol", ... }',
+        },
+        in_place: { type: 'boolean', default: false },
+        output_path: { type: 'string' },
+        expected_content_hash: { type: 'string' },
+        reload_simulator_session_id: { type: 'string', description: 'Optional simulator session ID to hot-reload upon commit' },
+        abort_on_compile_error: { type: 'boolean', default: true },
+        dry_run: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        const srcPath = normalizeVirtualPath(String(args.project_path ?? ''));
+        const original = readFileBuffer(srcPath);
+        const currentHash = computeContentHash('isp', original);
+        if (args.expected_content_hash && args.expected_content_hash !== currentHash) {
+          return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'state_changed', current_content_hash: currentHash };
+        }
+        const c = decodeContainer(original);
+        let source = decodeCodepage(c.source, c.encoding);
+        const ops = (Array.isArray(args.operations) ? args.operations : []) as Array<Record<string, unknown>>;
+        if (!ops.length) throw new FileTransformError('operations must be a non-empty array');
+
+        const applied: string[] = [];
+        for (const op of ops) {
+          const t = String(op.type ?? '');
+          if (t === 'edit_properties') {
+            const projSec = sections(source, 'PROJECT')[0];
+            if (!projSec) throw new FileTransformError('Missing <PROJECT> section');
+            let inner = projSec.inner;
+            for (const [k, v] of Object.entries((op.properties as Record<string, string>) ?? {})) {
+              const re = new RegExp(`^${k}=[^\\r\\n]*`, 'm');
+              inner = re.test(inner) ? inner.replace(re, `${k}=${v}`) : inner.trimEnd() + c.newline + `${k}=${v}` + c.newline;
+            }
+            source = source.slice(0, projSec.innerStart) + inner + source.slice(projSec.innerEnd);
+          } else if (t === 'configure_tasks') {
+            source = replaceTasksInSource(source, (op.tasks as TaskConfig[]) ?? [], c.newline);
+          } else if (t === 'configure_hardware_io') {
+            source = writeSystemVarsInSource(source, (op.ranges as Record<string, string>) ?? {}, c.newline);
+          } else if (t === 'create_pou') {
+            source = createPouInSource(
+              source,
+              {
+                pouName: String(op.pou_name ?? ''),
+                language: (op.language as 'LD' | 'ST' | 'IL') ?? 'LD',
+                pouType: (op.pou_type as 'PRG' | 'FB' | 'FC') ?? 'PRG',
+                code: typeof op.code === 'string' ? op.code : undefined,
+                localVariables: typeof op.local_variables === 'string' ? op.local_variables : undefined,
+                assignToTask: op.assign_to_task !== false,
+              },
+              c.newline,
+            );
+          } else if (t === 'manage_pou') {
+            source = deleteOrRenamePouInSource(
+              source,
+              String(op.pou_name ?? ''),
+              op.action === 'delete' ? 'delete' : 'rename',
+              typeof op.new_name === 'string' ? op.new_name : undefined,
+            );
+          } else if (t === 'write_st') {
+            const pouName = String(op.pou_name ?? '');
+            const pouMatch = sections(source, 'POU').find((m) => propertyValue(m.inner, 'P_Name') === pouName);
+            if (!pouMatch) throw new FileTransformError(`POU ${pouName} not found`);
+            const stSec = sections(pouMatch.inner, 'IL_ST_CODE')[0];
+            if (!stSec) throw new FileTransformError(`POU ${pouName} is missing IL_ST_CODE`);
+            const repCode = normalized(String(op.code ?? '')).replace(/\n/g, c.newline);
+            const newInner = pouMatch.inner.slice(0, stSec.innerStart) + repCode + pouMatch.inner.slice(stSec.innerEnd);
+            source = source.slice(0, pouMatch.innerStart) + newInner + source.slice(pouMatch.innerEnd);
+          } else if (t === 'write_ld') {
+            const pouName = String(op.pou_name ?? '');
+            const built = buildNetworksFromIl(String(op.program ?? ''), c.newline);
+            source = replaceLdPouNetworks(source, pouName, built, c.newline);
+          } else if (t === 'edit_ld_rungs') {
+            source = editLdRungsInSource(source, String(op.pou_name ?? ''), (op.operations as never[]) ?? [], c.newline).updatedSource;
+          } else if (t === 'edit_local_vars') {
+            source = editLocalVarsInSource(
+              source,
+              String(op.pou_name ?? ''),
+              {
+                replaceText: typeof op.variables === 'string' ? op.variables : undefined,
+                upsertVars: Array.isArray(op.upsert_vars) ? (op.upsert_vars as Array<Record<string, unknown>>) : undefined,
+                deleteVars: Array.isArray(op.delete_vars) ? op.delete_vars.map(String) : undefined,
+              },
+              c.newline,
+            ).updatedSource;
+          } else if (t === 'edit_global_vars') {
+            source = editGlobalVarsInSource(
+              source,
+              {
+                replaceText: typeof op.global_var_text === 'string' ? op.global_var_text : undefined,
+                upsertVars: Array.isArray(op.upsert_vars) ? (op.upsert_vars as Array<Record<string, unknown>>) : undefined,
+                deleteVars: Array.isArray(op.delete_vars) ? op.delete_vars.map(String) : undefined,
+              },
+              c.newline,
+            ).updatedSource;
+          } else if (t === 'manage_dut') {
+            source = op.action === 'delete'
+              ? deleteDutInSource(source, String(op.dut_name ?? ''))
+              : upsertDutInSource(source, String(op.dut_name ?? ''), String(op.dut_content ?? ''), c.newline);
+          } else if (t === 'write_comments') {
+            source = writeDeviceCommentsInSource(
+              source,
+              (op.device_comments as Record<string, string>) ?? {},
+              c.newline,
+              Boolean(op.replace_all),
+            ).updatedSource;
+          } else if (t === 'rename_symbol') {
+            const findSym = String(op.find_symbol ?? '').trim();
+            const repSym = String(op.replace_symbol ?? '').trim();
+            if (!findSym || !repSym) throw new FileTransformError('rename_symbol requires find_symbol and replace_symbol');
+            const tokenRe = new RegExp(`(?<![A-Za-z0-9_])${findSym.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_])`, 'g');
+            source = source.replace(tokenRe, repSym);
+          } else {
+            throw new FileTransformError(`Unsupported transaction op type: ${t}`);
+          }
+          applied.push(t);
+        }
+
+        const candidateBytes = c.rebuild(encodeCodepage(source, c.encoding));
+        const verified = decodeContainer(candidateBytes);
+        const staticCheck = staticCheckAndCompileProject(verified);
+        const abortOnErr = args.abort_on_compile_error !== false;
+        if (abortOnErr && !staticCheck.success) {
+          return {
+            success: false,
+            status: 'TRANSACTION_ABORTED_COMPILE_ERROR',
+            applied_steps: applied,
+            static_check: staticCheck,
+          };
+        }
+
+        if (args.dry_run) {
+          return {
+            success: staticCheck.success,
+            status: 'DRY_RUN_PASSED',
+            dry_run: true,
+            applied_steps: applied,
+            static_check: staticCheck,
+          };
+        }
+
+        const inPlace = Boolean(args.in_place);
+        const target = typeof args.output_path === 'string' && args.output_path.trim()
+          ? normalizeVirtualPath(args.output_path)
+          : artifactPath(`${path.posix.parse(srcPath).name}-tx`, '.isp');
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, inPlace);
+
+        let simulatorReloaded: unknown = null;
+        if (typeof args.reload_simulator_session_id === 'string' && args.reload_simulator_session_id.trim()) {
+          simulatorReloaded = reloadSimulatorSession(args.reload_simulator_session_id.trim(), written.target, false);
+        }
+
+        return {
+          success: staticCheck.success,
+          status: 'TRANSACTION_COMMITTED',
+          in_place: inPlace,
+          candidate: written.target,
+          backup: written.backup,
+          applied_steps: applied,
+          static_check: staticCheck,
+          simulator_reloaded: simulatorReloaded ? true : false,
+          content_hash: computeContentHash('isp', candidateBytes),
+        };
+      } catch (e) {
+        return { success: false, status: 'TRANSACTION_FAILED', failure_category: 'validation_error', error: errMsg(e) };
+      }
     },
   },
   {
@@ -432,7 +814,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const info = inspectContainer(c);
         const tasks = readTasks(source);
         const duts = readDuts(source);
-        const comments = projectCommentMap(source);
+        const comments = readDeviceComments(source);
         return {
           success: true,
           path: p,
@@ -480,7 +862,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_edit_project_properties',
-    description: 'Read or update project metadata (<PROJECT> properties) and .ini communication settings in a backed-up candidate.',
+    description: 'Read or update project metadata (<PROJECT> properties) and .ini communication settings in-place or in a backed-up candidate.',
     category: 'Project Management',
     inputSchema: {
       type: 'object',
@@ -489,6 +871,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         project_path: { type: 'string' },
         properties: { type: 'object', description: 'Optional map of PROJECT keys to update, e.g. { Prj_DT: "EH3" }' },
         ini_settings: { type: 'object', description: 'Optional map of .ini [PRJ_DATA] keys, e.g. { STATION_ADDR: "2" }' },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -528,7 +911,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         }
         source = source.slice(0, projSec.innerStart) + projInner + source.slice(projSec.innerEnd);
         const candidateBytes = c.rebuild(encodeCodepage(source, c.encoding));
-        if (args.dry_run || Object.keys(propUpdates).length === 0 && !args.ini_settings) {
+        if (args.dry_run || (Object.keys(propUpdates).length === 0 && !args.ini_settings)) {
           const parsedProps: Record<string, string> = {};
           for (const line of projInner.split(/\r?\n/)) {
             const eq = line.indexOf('=');
@@ -545,7 +928,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-props`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
         if (args.ini_settings && written.candidateCompanion) {
           let iniText = readFileBuffer(written.candidateCompanion).toString('utf-8');
           for (const [k, v] of Object.entries(args.ini_settings as Record<string, string>)) {
@@ -569,7 +952,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_configure_tasks',
-    description: 'Read or replace cyclic/interrupt TASK schedules and POU assignments in a backed-up project candidate.',
+    description: 'Read or replace cyclic/interrupt TASK schedules and POU assignments in-place or in a backed-up project candidate.',
     category: 'Project Management',
     inputSchema: {
       type: 'object',
@@ -580,6 +963,7 @@ export const MCP_TOOLS: McpToolDef[] = [
           type: 'array',
           description: 'Optional full replacement task list [{id, name, type, interval_ms, priority, active, program}]',
         },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -617,7 +1001,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-tasks`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
         return {
           success: true,
           status: 'GENERATED_UNCOMPILED',
@@ -644,6 +1028,7 @@ export const MCP_TOOLS: McpToolDef[] = [
           type: 'object',
           description: 'Optional map e.g. { "M": "0-4095", "D": "0-9999", "T": "0-255" }',
         },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -659,43 +1044,16 @@ export const MCP_TOOLS: McpToolDef[] = [
         }
         const c = decodeContainer(original);
         const source = decodeCodepage(c.source, c.encoding);
-        const sysSec = sections(source, 'SYSTEM_VAR')[0];
         if (!args.ranges || typeof args.ranges !== 'object') {
-          const parsedRanges = [];
-          if (sysSec) {
-            for (const line of sysSec.inner.split(/\r?\n/)) {
-              const m = /^\s*<([A-Z])>(\d+)-(\d+)\s*$/i.exec(line.trim());
-              if (m) parsedRanges.push({ area: m[1].toUpperCase(), start: Number(m[2]), end: Number(m[3]), capacity: Number(m[3]) - Number(m[2]) + 1 });
-            }
-          }
-          return { success: true, ranges: parsedRanges, content_hash: currentHash };
+          return { success: true, ranges: readSystemVars(source), content_hash: currentHash };
         }
-        let inner = sysSec?.inner ?? '';
-        for (const [areaRaw, spanRaw] of Object.entries(args.ranges as Record<string, string>)) {
-          const area = areaRaw.toUpperCase();
-          const m = /^(\d+)-(\d+)$/.exec(String(spanRaw).trim());
-          if (!m || Number(m[1]) > Number(m[2])) throw new FileTransformError(`Invalid range for ${area}: ${spanRaw}`);
-          const lineRe = new RegExp(`^\\s*<${area}>\\d+-\\d+\\s*$`, 'im');
-          if (lineRe.test(inner)) {
-            inner = inner.replace(lineRe, `<${area}>${m[1]}-${m[2]}`);
-          } else {
-            inner = (inner ? inner.trimEnd() + c.newline : '') + `<${area}>${m[1]}-${m[2]}` + c.newline;
-          }
-        }
-        let updated: string;
-        if (sysSec) {
-          updated = source.slice(0, sysSec.innerStart) + inner + source.slice(sysSec.innerEnd);
-        } else {
-          const firstPou = sections(source, 'POU')[0];
-          const block = `<SYSTEM_VAR>${c.newline}${inner}</SYSTEM_VAR>${c.newline}`;
-          updated = firstPou ? source.slice(0, firstPou.start) + block + source.slice(firstPou.start) : source + block;
-        }
+        const updated = writeSystemVarsInSource(source, args.ranges as Record<string, string>, c.newline);
         const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
         if (args.dry_run) return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, current_content_hash: currentHash };
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-sysvar`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
         return { success: true, status: 'GENERATED_UNCOMPILED', candidate: written.target, backup: written.backup, content_hash: computeContentHash('isp', candidateBytes) };
       } catch (e) {
         return { success: false, status: 'CANDIDATE_FAILED', failure_category: 'validation_error', error: errMsg(e) };
@@ -714,15 +1072,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const source = decodeCodepage(c.source, c.encoding);
         const sysSecs = sections(source, 'SYSTEM_VAR');
         if (sysSecs.length !== 1) throw new FileTransformError('Expected exactly one SYSTEM_VAR section.');
-        const ranges = [];
-        for (const line of sysSecs[0].inner.split(/\r?\n/)) {
-          const m = /^\s*<([A-Z])>(\d+)-(\d+)\s*$/i.exec(line.trim());
-          if (!m) continue;
-          const start = Number(m[2]);
-          const end = Number(m[3]);
-          if (start > end) throw new FileTransformError(`Invalid SYSTEM_VAR range for ${m[1]}: ${start}-${end}`);
-          ranges.push({ area: m[1].toUpperCase(), start, end, capacity: end - start + 1 });
-        }
+        const ranges = readSystemVars(source);
         return { success: true, model: inspectContainer(c).project_model, ranges };
       } catch (e) {
         return { success: false, error: errMsg(e) };
@@ -735,7 +1085,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   // =========================================================================
   {
     name: 'ispsoft_create_pou',
-    description: 'Create a new PRG, FB, or FC POU in LD, ST, or IL inside a backed-up project candidate (optionally assigning a TASK).',
+    description: 'Create a new PRG, FB, or FC POU in LD, ST, or IL inside a project (in_place or backed-up candidate).',
     category: 'POU & Symbol Authoring',
     inputSchema: {
       type: 'object',
@@ -748,6 +1098,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         code: { type: 'string', description: 'ST code or IL program (compiled to LD networks if language=LD)' },
         local_variables: { type: 'string' },
         assign_to_task: { type: 'boolean', default: true },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -782,7 +1133,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-add-${String(args.pou_name)}`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
         return {
           success: true,
           status: 'GENERATED_UNCOMPILED',
@@ -798,7 +1149,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_manage_pou',
-    description: 'Rename or delete a POU (automatically updating TASK references) in a backed-up project candidate.',
+    description: 'Rename or delete a POU (automatically updating TASK references) in-place or in a backed-up project candidate.',
     category: 'POU & Symbol Authoring',
     inputSchema: {
       type: 'object',
@@ -808,6 +1159,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         pou_name: { type: 'string' },
         action: { type: 'string', enum: ['rename', 'delete'] },
         new_name: { type: 'string' },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -834,7 +1186,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-pou-${String(args.action)}`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
         return {
           success: true,
           status: 'GENERATED_UNCOMPILED',
@@ -891,7 +1243,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_write_st_candidate',
-    description: 'Patch an ST POU code body into a new backed-up .isp candidate with OCC & dry_run.',
+    description: 'Patch an ST POU code body in-place or into a new backed-up .isp candidate with OCC & dry_run.',
     category: 'POU & Symbol Authoring',
     inputSchema: {
       type: 'object',
@@ -901,6 +1253,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         pou_name: { type: 'string' },
         code: { type: 'string' },
         model: { type: 'string' },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -940,7 +1293,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-${pouName}-st`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, patched);
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, patched, Boolean(args.in_place));
         return {
           success: true,
           status: 'GENERATED_UNCOMPILED',
@@ -958,16 +1311,26 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_write_local_variables_candidate',
-    description: 'Replace one POU LOCAL_VAR symbol declaration section in a backed-up project candidate.',
+    description: 'Replace, upsert, or delete variables in one POU LOCAL_VAR symbol section (in_place or backed-up candidate).',
     category: 'POU & Symbol Authoring',
     inputSchema: {
       type: 'object',
-      required: ['project_path', 'pou_name', 'variables', 'model'],
+      required: ['project_path', 'pou_name', 'model'],
       properties: {
         project_path: { type: 'string' },
         pou_name: { type: 'string' },
-        variables: { type: 'string' },
+        variables: { type: 'string', description: 'Optional raw replacement LOCAL_VAR text' },
+        upsert_vars: {
+          type: 'array',
+          description: 'Optional structured variables [{ name, type, address?, initial_value?, comment?, class? }] to upsert',
+        },
+        delete_vars: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional variable names to remove',
+        },
         model: { type: 'string' },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -979,7 +1342,6 @@ export const MCP_TOOLS: McpToolDef[] = [
         if (error || !canonical) return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'validation_error', error };
         const srcPath = normalizeVirtualPath(String(args.project_path ?? ''));
         const pouName = String(args.pou_name ?? '');
-        const variables = String(args.variables ?? '');
         const original = readFileBuffer(srcPath);
         const currentHash = computeContentHash('isp', original);
         const c = decodeContainer(original);
@@ -991,15 +1353,36 @@ export const MCP_TOOLS: McpToolDef[] = [
         if (expected && expected !== currentHash && expected !== pouHash) {
           return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'state_changed', current_content_hash: currentHash, pou_content_hash: pouHash };
         }
-        const candidateBytes = patchSt(c, pouName, null, variables);
+        const hasStructured = Array.isArray(args.upsert_vars) || Array.isArray(args.delete_vars);
+        let candidateBytes: Buffer;
+        let parsedResult: ReturnType<typeof parseLocalVariables> | undefined;
+        if (hasStructured) {
+          const { updatedSource, parsed } = editLocalVarsInSource(
+            source,
+            pouName,
+            {
+              replaceText: typeof args.variables === 'string' ? args.variables : undefined,
+              upsertVars: Array.isArray(args.upsert_vars) ? (args.upsert_vars as Array<Record<string, unknown>>) : undefined,
+              deleteVars: Array.isArray(args.delete_vars) ? args.delete_vars.map(String) : undefined,
+            },
+            c.newline,
+          );
+          candidateBytes = c.rebuild(encodeCodepage(updatedSource, c.encoding));
+          parsedResult = parsed;
+        } else {
+          if (typeof args.variables !== 'string') {
+            throw new FileTransformError('Provide variables, upsert_vars, or delete_vars');
+          }
+          candidateBytes = patchSt(c, pouName, null, args.variables);
+        }
         const verified = decodeContainer(candidateBytes);
         if (args.dry_run) {
-          return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, model: canonical, pou_name: pouName, readback_verified: true };
+          return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, model: canonical, pou_name: pouName, parsed: parsedResult, readback_verified: true };
         }
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-${pouName}-vars`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
         return {
           success: true,
           status: 'GENERATED_UNCOMPILED',
@@ -1007,6 +1390,7 @@ export const MCP_TOOLS: McpToolDef[] = [
           backup: written.backup,
           model: canonical,
           pou_name: pouName,
+          parsed: parsedResult,
           source_sha256: sha256(verified.source),
           content_hash: computeContentHash('isp', candidateBytes),
           readback_verified: true,
@@ -1018,7 +1402,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_edit_global_variables',
-    description: 'Read, replace, or upsert project-wide GLOBAL_VAR symbol declarations in a backed-up candidate.',
+    description: 'Read, replace, upsert, or delete project-wide GLOBAL_VAR symbol declarations in-place or in a backed-up candidate.',
     category: 'POU & Symbol Authoring',
     inputSchema: {
       type: 'object',
@@ -1030,6 +1414,12 @@ export const MCP_TOOLS: McpToolDef[] = [
           type: 'array',
           description: 'Optional structured variables [{ name, type, address?, initial_value?, comment?, class? }] to upsert cleanly',
         },
+        delete_vars: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional global variable names to delete',
+        },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -1046,63 +1436,26 @@ export const MCP_TOOLS: McpToolDef[] = [
         const c = decodeContainer(original);
         const source = decodeCodepage(c.source, c.encoding);
         const gSecs = sections(source, 'GLOBAL_VAR');
-        if (typeof args.global_var_text !== 'string' && !Array.isArray(args.upsert_vars)) {
+        if (typeof args.global_var_text !== 'string' && !Array.isArray(args.upsert_vars) && !Array.isArray(args.delete_vars)) {
           const raw = gSecs[0]?.inner ?? '';
           return { success: true, raw, parsed: parseLocalVariables(raw), content_hash: currentHash };
         }
-        let nextInnerText: string;
-        if (Array.isArray(args.upsert_vars)) {
-          const existing = parseLocalVariables(gSecs[0]?.inner ?? '');
-          const map = new Map(existing.entries.map((e) => [e.identifier, e]));
-          for (const rawItem of args.upsert_vars as Array<Record<string, unknown>>) {
-            const name = String(rawItem.name ?? '').trim();
-            if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name)) {
-              throw new FileTransformError(`Invalid variable identifier: ${name}`);
-            }
-            const varType = String(rawItem.type ?? 'INT').trim().toUpperCase();
-            const addr = rawItem.address ? String(rawItem.address).trim().toUpperCase() : null;
-            const init = rawItem.initial_value !== undefined ? String(rawItem.initial_value) : '';
-            const cls = String(rawItem.class ?? 'VAR_GLOBAL').trim();
-            const cmt = rawItem.comment ? String(rawItem.comment).trim() : null;
-            const initialStr = `${init}${addr ? ` [@${addr}@]` : ''}`.trim();
-            map.set(name, {
-              identifier: name,
-              type: varType,
-              address: addr,
-              class: cls,
-              initial_value: initialStr,
-              comment: cmt,
-            });
-          }
-          const blocks = [...map.values()].map((e) =>
-            [
-              '{',
-              `${e.identifier} : ${e.type} := ${e.initial_value} {${e.class}}`,
-              '(*',
-              e.comment ?? '',
-              '*)',
-              '}',
-            ].join(c.newline),
-          );
-          nextInnerText = ['<VAR>', ...blocks, '</VAR>'].join(c.newline);
-        } else {
-          nextInnerText = normalized(String(args.global_var_text)).replace(/\n/g, c.newline);
-        }
-        let updated: string;
-        if (gSecs.length >= 1) {
-          updated = source.slice(0, gSecs[0].innerStart) + nextInnerText + source.slice(gSecs[0].innerEnd);
-        } else {
-          const firstPou = sections(source, 'POU')[0];
-          const block = `<GLOBAL_VAR>${c.newline}${nextInnerText}${c.newline}</GLOBAL_VAR>${c.newline}`;
-          updated = firstPou ? source.slice(0, firstPou.start) + block + source.slice(firstPou.start) : source + block;
-        }
-        const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
-        if (args.dry_run) return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, parsed: parseLocalVariables(nextInnerText) };
+        const { updatedSource, parsed } = editGlobalVarsInSource(
+          source,
+          {
+            replaceText: typeof args.global_var_text === 'string' ? args.global_var_text : undefined,
+            upsertVars: Array.isArray(args.upsert_vars) ? (args.upsert_vars as Array<Record<string, unknown>>) : undefined,
+            deleteVars: Array.isArray(args.delete_vars) ? args.delete_vars.map(String) : undefined,
+          },
+          c.newline,
+        );
+        const candidateBytes = c.rebuild(encodeCodepage(updatedSource, c.encoding));
+        if (args.dry_run) return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, parsed };
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-gvars`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
-        return { success: true, status: 'GENERATED_UNCOMPILED', candidate: written.target, backup: written.backup, parsed: parseLocalVariables(nextInnerText), content_hash: computeContentHash('isp', candidateBytes) };
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
+        return { success: true, status: 'GENERATED_UNCOMPILED', candidate: written.target, backup: written.backup, parsed, content_hash: computeContentHash('isp', candidateBytes) };
       } catch (e) {
         return { success: false, status: 'CANDIDATE_FAILED', failure_category: 'validation_error', error: errMsg(e) };
       }
@@ -1120,6 +1473,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         action: { type: 'string', enum: ['list', 'upsert', 'delete'] },
         dut_name: { type: 'string' },
         dut_content: { type: 'string' },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -1147,7 +1501,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-dut`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
         return { success: true, status: 'GENERATED_UNCOMPILED', candidate: written.target, backup: written.backup, duts: readDuts(updated), content_hash: computeContentHash('isp', candidateBytes) };
       } catch (e) {
         return { success: false, status: 'CANDIDATE_FAILED', failure_category: 'validation_error', error: errMsg(e) };
@@ -1156,7 +1510,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_find_and_replace_symbol',
-    description: 'Safely rename a device address or symbol across all POUs, variables, and device comments in a backed-up candidate.',
+    description: 'Safely rename a device address or symbol across all POUs, variables, and device comments in-place or in a backed-up candidate.',
     category: 'POU & Symbol Authoring',
     inputSchema: {
       type: 'object',
@@ -1165,6 +1519,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         project_path: { type: 'string' },
         find_symbol: { type: 'string' },
         replace_symbol: { type: 'string' },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -1193,7 +1548,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-refactor`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
         return {
           success: true,
           status: 'GENERATED_UNCOMPILED',
@@ -1329,7 +1684,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_edit_ld_rungs',
-    description: 'Insert, append, replace, delete, move, enable/disable, bookmark, or label individual LD rungs in a POU.',
+    description: 'Insert, append, replace, delete, move, enable/disable, bookmark, or label individual LD rungs in a POU (in_place or backed-up candidate).',
     category: 'Ladder & IL/MPU',
     inputSchema: {
       type: 'object',
@@ -1341,6 +1696,7 @@ export const MCP_TOOLS: McpToolDef[] = [
           type: 'array',
           description: 'List of rung edits: { op: "insert"|"append"|"replace"|"delete"|"move"|"set_active"|"set_bookmark"|"set_label", network_index?, to_index?, il_program?, active?, bookmark?, label? }',
         },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -1374,7 +1730,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-${pouName}-rungs`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
         return {
           success: true,
           status: 'GENERATED_UNCOMPILED',
@@ -1391,7 +1747,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_write_ld_network_candidate',
-    description: 'Replace one raw LD network body in a backed-up ES2 project candidate.',
+    description: 'Replace one raw LD network body in-place or in a backed-up ES2 project candidate.',
     category: 'Ladder & IL/MPU',
     inputSchema: {
       type: 'object',
@@ -1402,6 +1758,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         network_index: { type: 'integer' },
         replacement_network: { type: 'string' },
         model: { type: 'string' },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -1440,7 +1797,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-${pouName}-net-${idx}`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
         return { success: true, status: 'GENERATED_UNCOMPILED', candidate: written.target, backup: written.backup, readback_verified: true, content_hash: computeContentHash('isp', candidateBytes) };
       } catch (e) {
         return { success: false, status: 'CANDIDATE_FAILED', error: errMsg(e) };
@@ -1459,6 +1816,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         pou_name: { type: 'string' },
         program: { type: 'string' },
         model: { type: 'string' },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -1514,7 +1872,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-${pouName}-ld`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
         return {
           success: staticCheck.success,
           status: staticCheck.success ? 'LD_PROGRAM_STATIC_CHECK_READBACK_VERIFIED' : 'LD_PROGRAM_STATIC_CHECK_FAILED',
@@ -1537,7 +1895,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_validate_il',
-    description: 'Validate DVP IL subset and confirm round-trip MPU serialization.',
+    description: 'Validate DVP IL subset (including ANB/ORB/MPS/MRD/MPP stack ops, CMP/ZCP/ANDW/ORW/XORW/NEG/SWAP/XCH, CALL/SRET/FEND) and confirm round-trip MPU serialization.',
     category: 'Ladder & IL/MPU',
     inputSchema: {
       type: 'object',
@@ -1645,8 +2003,60 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
 
   // =========================================================================
-  // 5. Device Comments, Cross-References, Static Compile & Project Diff
+  // 5. Device Comments, Search, Deep Audit, Cross-Refs, Static Compile & Diff
   // =========================================================================
+  {
+    name: 'ispsoft_search_project',
+    description: 'Search across POUs, LD networks, ST code, variables, DUTs, and device comments inside an .isp project.',
+    category: 'Analysis & Compilation',
+    inputSchema: {
+      type: 'object',
+      required: ['project_path', 'query'],
+      properties: {
+        project_path: { type: 'string' },
+        query: { type: 'string' },
+        scope: { type: 'string', enum: ['all', 'code', 'vars', 'comments'], default: 'all' },
+        regex: { type: 'boolean', default: false },
+        case_sensitive: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        const p = normalizeVirtualPath(String(args.project_path ?? ''));
+        const c = decodeContainer(readFileBuffer(p));
+        const source = decodeCodepage(c.source, c.encoding);
+        return {
+          project_path: p,
+          ...searchProjectSource(source, String(args.query ?? ''), {
+            scope: (args.scope as 'all' | 'code' | 'vars' | 'comments') ?? 'all',
+            regex: Boolean(args.regex),
+            caseSensitive: Boolean(args.case_sensitive),
+          }),
+        };
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_audit_project',
+    description: 'Perform a deep engineering audit: compile errors/warnings, double coils, OUT+SET/RST conflicts, floating undriven contacts, dead outputs, unused symbols, and unscheduled POUs.',
+    category: 'Analysis & Compilation',
+    inputSchema: {
+      type: 'object',
+      required: ['project_path'],
+      properties: { project_path: { type: 'string' } },
+    },
+    handler: (args) => {
+      try {
+        const p = normalizeVirtualPath(String(args.project_path ?? ''));
+        const c = decodeContainer(readFileBuffer(p));
+        return { project_path: p, ...auditProjectDeep(c) };
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
   {
     name: 'ispsoft_read_device_comments',
     description: 'Read project-level DEVICE_CMT device comment map.',
@@ -1657,7 +2067,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const p = normalizeVirtualPath(String(args.project_path ?? ''));
         const raw = readFileBuffer(p);
         const c = decodeContainer(raw);
-        const comments = projectCommentMap(decodeCodepage(c.source, c.encoding));
+        const comments = readDeviceComments(decodeCodepage(c.source, c.encoding));
         return {
           success: true,
           path: p,
@@ -1704,7 +2114,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_write_device_comment_candidate',
-    description: 'Merge device comments into a project and emit a verified backed-up candidate.',
+    description: 'Merge device comments into a project in-place or emit a verified backed-up candidate.',
     category: 'Analysis & Compilation',
     inputSchema: {
       type: 'object',
@@ -1713,6 +2123,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         project_path: { type: 'string' },
         device_comments: { type: 'object' },
         model: { type: 'string' },
+        in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -1728,30 +2139,17 @@ export const MCP_TOOLS: McpToolDef[] = [
         }
         const c = decodeContainer(original);
         const source = decodeCodepage(c.source, c.encoding);
-        const re = /(<DEVICE_CMT_START>\r*\n|\[DEVICE_CMT_START\]\r*\n)([\s\S]*?)(<\/DEVICE_CMT_START>|\[DEVICE_CMT_END\])/i;
-        const m = re.exec(source);
-        const comments = projectCommentMap(source);
-        for (const [k, v] of Object.entries((args.device_comments as Record<string, string>) ?? {})) {
-          comments[k.trim().toUpperCase()] = String(v).trim();
-        }
-        const body = Object.entries(comments)
-          .sort((a, b) => a[0].localeCompare(b[0]))
-          .map(([a, txt]) => `${a}::${txt}`)
-          .join(c.newline);
-        let updated: string;
-        if (m) {
-          updated = source.replace(re, `$1${body}${c.newline}$3`);
-        } else {
-          const firstPou = sections(source, 'POU')[0];
-          const block = `[DEVICE_CMT_START]${c.newline}${body}${c.newline}[DEVICE_CMT_END]${c.newline}`;
-          updated = firstPou ? source.slice(0, firstPou.start) + block + source.slice(firstPou.start) : source + block;
-        }
-        const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
+        const { updatedSource, comments } = writeDeviceCommentsInSource(
+          source,
+          (args.device_comments as Record<string, string>) ?? {},
+          c.newline,
+        );
+        const candidateBytes = c.rebuild(encodeCodepage(updatedSource, c.encoding));
         if (args.dry_run) return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, comment_count: Object.keys(comments).length };
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-comments`, '.isp');
-        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
         return { success: true, status: 'GENERATED_UNCOMPILED', candidate: written.target, backup: written.backup, comment_count: Object.keys(comments).length, content_hash: computeContentHash('isp', candidateBytes) };
       } catch (e) {
         return { success: false, status: 'CANDIDATE_FAILED', error: errMsg(e) };
@@ -1794,7 +2192,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const p = normalizeVirtualPath(String(args.project_path ?? ''));
         const c = decodeContainer(readFileBuffer(p));
         const source = decodeCodepage(c.source, c.encoding);
-        const comments = projectCommentMap(source);
+        const comments = readDeviceComments(source);
         const byPou: Record<string, ReturnType<typeof extractCrossRefsFromText>> = {};
         const globalDevices = new Map<string, { pous: string[]; total_reads: number; total_writes: number; comment: string | null }>();
 
@@ -1956,11 +2354,11 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
 
   // =========================================================================
-  // 6. Soft-PLC Simulator, Live Online Monitor, Force/Write, Watch & Trace
+  // 6. Soft-PLC Simulator, Live Online Monitor, Testbench, Breakpoints & Trace
   // =========================================================================
   {
     name: 'ispsoft_sim_start',
-    description: 'Download an .isp project into an isolated Soft-PLC simulator instance for RUN/STOP, online monitoring, forcing, and trace.',
+    description: 'Download an .isp project into an isolated Soft-PLC simulator instance for RUN/STOP, online monitoring, forcing, sequence testing, breakpoints, and trace.',
     category: 'Soft-PLC Simulator & Monitor',
     inputSchema: {
       type: 'object',
@@ -1999,22 +2397,144 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_sim_control',
-    description: 'Control Soft-PLC CPU mode: RUN (continuous live scanning), STOP, STEP (execute N deterministic scan cycles), RESET, or CLOSE.',
+    description: 'Control Soft-PLC CPU mode: RUN, STOP, STEP, WARM_RESET (keeps retentive words), RESET / COLD_RESET, or CLOSE.',
     category: 'Soft-PLC Simulator & Monitor',
     inputSchema: {
       type: 'object',
       required: ['session_id', 'command'],
       properties: {
         session_id: { type: 'string' },
-        command: { type: 'string', enum: ['RUN', 'STOP', 'STEP', 'RESET', 'CLOSE'] },
+        command: { type: 'string', enum: ['RUN', 'STOP', 'STEP', 'WARM_RESET', 'COLD_RESET', 'RESET', 'CLOSE'] },
         cycles: { type: 'integer', default: 1 },
       },
     },
     handler: (args) => {
       try {
-        const cmd = String(args.command ?? 'STEP').toUpperCase() as 'RUN' | 'STOP' | 'STEP' | 'RESET' | 'CLOSE';
+        const cmd = String(args.command ?? 'STEP').toUpperCase() as
+          | 'RUN'
+          | 'STOP'
+          | 'STEP'
+          | 'RESET'
+          | 'COLD_RESET'
+          | 'WARM_RESET'
+          | 'CLOSE';
         const cycles = typeof args.cycles === 'number' ? args.cycles : 1;
         return controlSimulator(String(args.session_id ?? ''), cmd, cycles);
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_sim_step_until',
+    description: 'Step Soft-PLC deterministically scan-by-scan until a boolean condition becomes true (e.g. "T0.Q", "D10 >= 100", "Y0 AND NOT X1").',
+    category: 'Soft-PLC Simulator & Monitor',
+    inputSchema: {
+      type: 'object',
+      required: ['session_id', 'condition'],
+      properties: {
+        session_id: { type: 'string' },
+        condition: { type: 'string', description: 'Boolean/numeric condition over devices, timer .Q/.PV, or symbols' },
+        max_cycles: { type: 'integer', default: 500 },
+        addresses: { type: 'array', items: { type: 'string' } },
+      },
+    },
+    handler: (args) => {
+      try {
+        return stepSimulatorUntil(
+          String(args.session_id ?? ''),
+          String(args.condition ?? ''),
+          typeof args.max_cycles === 'number' ? args.max_cycles : 500,
+          Array.isArray(args.addresses) ? args.addresses.map(String) : undefined,
+        );
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_sim_run_sequence',
+    description: 'Execute a complete multi-step PLC test scenario (stimulus + cycles/step_until + expect/assert_expr checks) in ONE MCP call.',
+    category: 'Soft-PLC Simulator & Monitor',
+    inputSchema: {
+      type: 'object',
+      required: ['session_id', 'steps'],
+      properties: {
+        session_id: { type: 'string' },
+        steps: {
+          type: 'array',
+          description: 'Array of steps: [{ label?, force_bits?, bits?, words?, symbols?, cycles?, step_until?, max_cycles?, expect?, assert_expr? }]',
+        },
+        stop_on_failure: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        return runSimulatorSequence(
+          String(args.session_id ?? ''),
+          (Array.isArray(args.steps) ? args.steps : []) as never[],
+          Boolean(args.stop_on_failure),
+        );
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_sim_memory_dump',
+    description: 'Inspect contiguous device memory ranges (X, Y, M, S, T, C, D) in ISPSoft Device Monitor table format.',
+    category: 'Soft-PLC Simulator & Monitor',
+    inputSchema: {
+      type: 'object',
+      required: ['session_id', 'area'],
+      properties: {
+        session_id: { type: 'string' },
+        area: { type: 'string', enum: ['X', 'Y', 'M', 'S', 'T', 'C', 'D'] },
+        start: { type: 'integer', default: 0 },
+        count: { type: 'integer', default: 32 },
+        only_non_zero: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        return dumpSimulatorMemory(
+          String(args.session_id ?? ''),
+          (String(args.area ?? 'D').toUpperCase() as 'X' | 'Y' | 'M' | 'S' | 'T' | 'C' | 'D'),
+          typeof args.start === 'number' ? args.start : 0,
+          typeof args.count === 'number' ? args.count : 32,
+          Boolean(args.only_non_zero),
+        );
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_sim_breakpoints',
+    description: 'Manage conditional scan breakpoints that automatically halt RUN/STEP when an expression becomes true.',
+    category: 'Soft-PLC Simulator & Monitor',
+    inputSchema: {
+      type: 'object',
+      required: ['session_id', 'action'],
+      properties: {
+        session_id: { type: 'string' },
+        action: { type: 'string', enum: ['list', 'add', 'remove', 'clear'] },
+        id: { type: 'string' },
+        expr: { type: 'string', description: 'Condition expression for add, e.g. "D10 >= 5 OR M20"' },
+        enabled: { type: 'boolean', default: true },
+      },
+    },
+    handler: (args) => {
+      try {
+        return manageBreakpoints(
+          String(args.session_id ?? ''),
+          (String(args.action ?? 'list') as 'list' | 'add' | 'remove' | 'clear'),
+          {
+            id: typeof args.id === 'string' ? args.id : undefined,
+            expr: typeof args.expr === 'string' ? args.expr : undefined,
+            enabled: typeof args.enabled === 'boolean' ? args.enabled : undefined,
+          },
+        );
       } catch (e) {
         return { success: false, error: errMsg(e) };
       }
@@ -2077,7 +2597,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_sim_monitor',
-    description: 'Read live Soft-PLC online monitor state: device values, timers, counters, forced I/O, symbols, and per-rung power flow.',
+    description: 'Read live Soft-PLC online monitor state (supports compact=true to omit bulky full-rung traces for token efficiency).',
     category: 'Soft-PLC Simulator & Monitor',
     inputSchema: {
       type: 'object',
@@ -2085,6 +2605,7 @@ export const MCP_TOOLS: McpToolDef[] = [
       properties: {
         session_id: { type: 'string' },
         addresses: { type: 'array', items: { type: 'string' }, description: 'Optional specific devices/symbols to query' },
+        compact: { type: 'boolean', default: false, description: 'Omit rung_power_flow, st_trace, and full active_bits/words when true' },
       },
     },
     handler: (args) => {
@@ -2092,6 +2613,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         return monitorSimulator(
           String(args.session_id ?? ''),
           Array.isArray(args.addresses) ? args.addresses.map(String) : undefined,
+          Boolean(args.compact),
         );
       } catch (e) {
         return { success: false, error: errMsg(e) };
@@ -2159,6 +2681,50 @@ export const MCP_TOOLS: McpToolDef[] = [
           programs_match: cmp.programs_match,
           uploaded_path: uploadedPath,
         };
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_sim_diagnostics',
+    description:
+      'Profile Soft-PLC scan execution speed (min/avg/p50/p95/max ms, budget utilization, overruns), per-POU and per-network hotspots, ST loop-cap / LD jump-cap hits, memory map & array bloat, and optimization recommendations.',
+    category: 'Soft-PLC Simulator & Monitor',
+    inputSchema: {
+      type: 'object',
+      required: ['session_id'],
+      properties: {
+        session_id: { type: 'string' },
+        sample_cycles: {
+          type: 'integer',
+          default: 0,
+          description: 'Optional number of benchmark scan cycles to step immediately before generating the diagnostic report (0 = passive read of existing scan history)',
+        },
+        slow_threshold_ms: {
+          type: 'number',
+          description: 'Optional scan latency threshold in ms above which scans are flagged as slow',
+        },
+        reset_metrics: {
+          type: 'boolean',
+          default: false,
+          description: 'Reset accumulated timing/memory baselines before sampling',
+        },
+        include_recent_scans: {
+          type: 'boolean',
+          default: false,
+          description: 'Include per-scan breakdown for up to the last 25 scans',
+        },
+      },
+    },
+    handler: (args) => {
+      try {
+        return profileSimulatorSession(String(args.session_id ?? ''), {
+          sample_cycles: typeof args.sample_cycles === 'number' ? args.sample_cycles : undefined,
+          slow_threshold_ms: typeof args.slow_threshold_ms === 'number' ? args.slow_threshold_ms : undefined,
+          reset_metrics: Boolean(args.reset_metrics),
+          include_recent_scans: Boolean(args.include_recent_scans),
+        });
       } catch (e) {
         return { success: false, error: errMsg(e) };
       }
@@ -2375,16 +2941,109 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
 ];
 
-const TOOL_MAP = new Map<string, McpToolDef>(MCP_TOOLS.map((t) => [t.name, t]));
+const TOOL_MAP = new Map<string, McpToolDef>(
+  MCP_TOOLS.map((t) => {
+    if (!t.annotations) t.annotations = deriveToolAnnotations(t.name);
+    return [t.name, t];
+  }),
+);
+
+export const FAIL_STATUSES = new Set([
+  'REJECTED_BEFORE_WRITE',
+  'WRITE_FAILED',
+  'UNSUPPORTED_MODEL',
+  'MODEL_NOT_QUALIFIED',
+  'REJECTED_BEFORE_IO',
+  'BLOCKED',
+  'CANDIDATE_FAILED',
+  'CREATE_FAILED',
+  'TRANSACTION_FAILED',
+  'TRANSACTION_ABORTED_COMPILE_ERROR',
+  'IMPORT_FAILED',
+  'SEQUENCE_ASSERTION_FAILED',
+  'VALIDATION_ERROR',
+  'IDEMPOTENCY_CONFLICT',
+]);
+
+export function isToolResultError(output: Record<string, unknown>): boolean {
+  return (
+    output.success === false ||
+    output.valid === false ||
+    FAIL_STATUSES.has(String(output.status ?? ''))
+  );
+}
+
+export function getAnnotatedTools() {
+  return MCP_TOOLS.map((t) => ({
+    name: t.name,
+    category: t.category,
+    description: t.description,
+    inputSchema: t.inputSchema,
+    annotations: t.annotations ?? deriveToolAnnotations(t.name),
+  }));
+}
+
+export function getToolDef(name: string): McpToolDef | undefined {
+  return TOOL_MAP.get(name);
+}
 
 export function executeMcpTool(name: string, args: Record<string, unknown> = {}): Record<string, unknown> {
   seedDefaultWorkspace();
   const tool = TOOL_MAP.get(name);
   if (!tool) {
-    return { success: false, error: `Unknown tool: ${name}` };
+    return {
+      success: false,
+      error_code: 'NOT_FOUND',
+      retryable: false,
+      error: `Unknown tool: ${name}`,
+      remediation: 'Call tools/list to inspect available MCP tools.',
+    };
   }
-  const rawResult = tool.handler(args);
-  return budgetPayload(rawResult, MAX_ITEM_CHARS, MAX_RESPONSE_CHARS);
+
+  let sanitizedArgs: Record<string, unknown>;
+  try {
+    sanitizedArgs = sanitizeJsonValue(args);
+  } catch (err) {
+    mcpTelemetry.recordValidationError();
+    return {
+      success: false,
+      status: 'VALIDATION_ERROR',
+      error_code: 'VALIDATION_ERROR',
+      retryable: false,
+      error: errMsg(err),
+      remediation: 'Reduce JSON nesting depth and remove reserved keys.',
+    };
+  }
+
+  const check = validateToolArguments(tool.inputSchema, sanitizedArgs);
+  if (!check.valid) {
+    mcpTelemetry.recordValidationError();
+    return {
+      success: false,
+      status: 'VALIDATION_ERROR',
+      error_code: 'VALIDATION_ERROR',
+      retryable: false,
+      error: check.errors.map((e) => e.message).join('; '),
+      validation_errors: check.errors,
+      remediation: 'Verify required fields and types against the tool inputSchema.',
+    };
+  }
+
+  let rawResult: Record<string, unknown>;
+  try {
+    rawResult = tool.handler(sanitizedArgs);
+  } catch (err) {
+    rawResult = { success: false, error: errMsg(err) };
+  }
+
+  const budgeted = budgetPayload(rawResult, MAX_ITEM_CHARS, MAX_RESPONSE_CHARS);
+  if (isToolResultError(budgeted) && !budgeted.error_code) {
+    const classified = classifyToolError(budgeted);
+    budgeted.error_code = classified.error_code;
+    budgeted.retryable = classified.retryable;
+    budgeted.remediation = classified.remediation;
+  }
+  return budgeted;
 }
 
 export { getFileMeta };

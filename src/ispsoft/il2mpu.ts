@@ -1,10 +1,18 @@
 export const CRLF = '\r\n';
 
 export const API_NUM: Record<string, number> = {
+  CMP: 10,
+  ZCP: 11,
   MOV: 28,
   DMOV: 29,
   BMOV: 30,
   FMOV: 31,
+  ANDW: 34,
+  ORW: 35,
+  XORW: 36,
+  NEG: 38,
+  SWAP: 39,
+  XCH: 40,
   ADD: 60,
   DADD: 62,
   SUB: 64,
@@ -37,10 +45,18 @@ export const API_NUM: Record<string, number> = {
 };
 
 export const OP_SPLIT: Record<string, [number, number]> = {
+  CMP: [2, 1],
+  ZCP: [3, 1],
   MOV: [1, 1],
   DMOV: [1, 1],
   BMOV: [2, 1],
   FMOV: [2, 1],
+  ANDW: [2, 1],
+  ORW: [2, 1],
+  XORW: [2, 1],
+  NEG: [0, 1],
+  SWAP: [0, 1],
+  XCH: [0, 2],
   ADD: [2, 1],
   DADD: [2, 1],
   SUB: [2, 1],
@@ -75,6 +91,7 @@ export const OP_SPLIT: Record<string, [number, number]> = {
 export const CONTACT_LD: Record<string, number> = { LD: 1, LDI: 2, LDP: 3, LDF: 4 };
 export const CONTACT_AND: Record<string, number> = { AND: 1, ANI: 2, ANDP: 3, ANDF: 4 };
 export const CONTACT_OR: Record<string, number> = { OR: 1, ORI: 2, ORP: 3, ORF: 4 };
+export const STACK_OPS = new Set(['ANB', 'ORB', 'MPS', 'MRD', 'MPP']);
 export const CMP_SYMB: Record<string, string> = {
   'LD=': '=',
   'LD<=': '<=',
@@ -100,6 +117,9 @@ export type Instruction = [string, string[]];
 export interface IlNet {
   in: Instruction[];
   out: Instruction[];
+  hasStackOps?: boolean;
+  seq?: Instruction[];
+  label?: string;
 }
 
 export function nv(v: string): string {
@@ -161,63 +181,166 @@ export function splitNets(ins: Instruction[]): IlNet[] {
   const nets: IlNet[] = [];
   let curIn: Instruction[] = [];
   let curOut: Instruction[] = [];
+  let curSeq: Instruction[] = [];
+  let stackDepth = 0;
+  let branchDepth = 0;
+  let hasStackOps = false;
+  let interleavedBranch = false;
+  let pendingLabel: string | undefined;
 
   const flush = () => {
     if (curIn.length || curOut.length) {
-      nets.push({ in: curIn, out: curOut });
+      nets.push({
+        in: curIn,
+        out: curOut,
+        hasStackOps,
+        seq: interleavedBranch ? curSeq : undefined,
+        ...(pendingLabel ? { label: pendingLabel } : {}),
+      });
+      pendingLabel = undefined;
     }
     curIn = [];
     curOut = [];
+    curSeq = [];
+    stackDepth = 0;
+    branchDepth = 0;
+    hasStackOps = false;
+    interleavedBranch = false;
   };
 
-  for (const [mn, ops] of ins) {
-    if (mn === 'STL' || mn === 'RET') {
+  for (let idx = 0; idx < ins.length; idx++) {
+    const [mn, ops] = ins[idx];
+    if (mn === 'LABEL') {
       flush();
-      nets.push({ in: [], out: [[mn, ops]] });
+      pendingLabel = ops[0];
+      continue;
+    }
+    if (mn === 'STL' || mn === 'RET' || mn === 'FEND' || mn === 'SRET') {
+      flush();
+      nets.push({ in: [], out: [[mn, ops]], ...(pendingLabel ? { label: pendingLabel } : {}) });
+      pendingLabel = undefined;
       continue;
     }
     if (mn === 'END') {
       continue;
     }
+    if (STACK_OPS.has(mn)) {
+      hasStackOps = true;
+      curSeq.push([mn, ops]);
+      if (mn === 'ANB' || mn === 'ORB') {
+        stackDepth = Math.max(1, stackDepth - 1);
+      } else if (mn === 'MPS') {
+        branchDepth += 1;
+        interleavedBranch = true;
+      } else if (mn === 'MPP') {
+        branchDepth = Math.max(0, branchDepth - 1);
+      }
+      if (curOut.length === 0) {
+        curIn.push([mn, ops]);
+      }
+      continue;
+    }
     if (STARTERS.has(mn)) {
+      if (curIn.length > 0 && curOut.length === 0) {
+        let pendingPushes = 1;
+        let isSubBranch = false;
+        for (let k = idx + 1; k < ins.length; k++) {
+          const [kMn] = ins[k];
+          if (kMn === 'ANB' || kMn === 'ORB') {
+            pendingPushes -= 1;
+            if (pendingPushes === 0) {
+              isSubBranch = true;
+              break;
+            }
+          } else if (STARTERS.has(kMn)) {
+            pendingPushes += 1;
+          } else if (!(kMn in CONTACT_AND || kMn in CONTACT_OR || SEQ_CMPS.has(kMn) || STACK_OPS.has(kMn))) {
+            break;
+          }
+        }
+        if (isSubBranch) {
+          stackDepth += 1;
+          hasStackOps = true;
+          curIn.push([mn, ops]);
+          curSeq.push([mn, ops]);
+          continue;
+        }
+      }
       flush();
+      stackDepth = 1;
       curIn = [[mn, ops]];
+      curSeq = [[mn, ops]];
     } else if (mn in CONTACT_AND || mn in CONTACT_OR || SEQ_CMPS.has(mn)) {
-      if (curOut.length) {
+      if (branchDepth > 0 || (interleavedBranch && curOut.length > 0)) {
+        interleavedBranch = true;
+        curSeq.push([mn, ops]);
+      } else if (curOut.length) {
         const prev = [...curIn];
         flush();
         curIn = [...prev, [mn, ops]];
+        curSeq = [...curIn];
       } else {
         curIn.push([mn, ops]);
+        curSeq.push([mn, ops]);
       }
     } else {
       curOut.push([mn, ops]);
+      curSeq.push([mn, ops]);
     }
   }
   flush();
+  if (pendingLabel) {
+    throw new Error(`Label ${pendingLabel} has no following network`);
+  }
   return nets;
 }
 
 export function buildNet(nid: number, net: IlNet): string[] {
   const root: string[] = [];
   const out: string[] = [];
-  let nOr = 0;
   let nOut = 0;
 
+  let seriesCols = 0;
+  let pendingOr = 0;
+
+  const flushOr = () => {
+    if (pendingOr > 0) {
+      root.push(...buildNode(T_LNK_OR, null, [Math.max(1, seriesCols), pendingOr]));
+      pendingOr = 0;
+    }
+  };
+
+  let rawIlComment = '';
+  if (net.seq && net.hasStackOps) {
+    rawIlComment = `META_IL=FULL:${net.seq.map(([m, o]) => [m, ...o].join(',')).join(';')}`;
+  } else if (net.hasStackOps) {
+    rawIlComment = `META_IL=${net.in.map(([m, o]) => [m, ...o].join(',')).join(';')}`;
+  }
+
   for (const [mn, ops] of net.in) {
+    if (STACK_OPS.has(mn)) {
+      continue;
+    }
     if (mn in CONTACT_LD) {
+      flushOr();
       root.push(...buildNode(CONTACT_LD[mn], ops[0]));
+      seriesCols = 1;
     } else if (mn in CONTACT_AND) {
+      flushOr();
       root.push(...buildNode(CONTACT_AND[mn], ops[0]));
+      seriesCols += 1;
     } else if (mn in CONTACT_OR) {
       root.push(...buildNode(CONTACT_OR[mn], ops[0]));
-      nOr += 1;
+      pendingOr += 1;
     } else if (mn in CMP_SYMB) {
+      flushOr();
       root.push(...cmpNode(CMP_SYMB[mn], ops));
+      seriesCols += 1;
     } else {
       throw new Error(`Unhandled input instruction: ${mn} ${ops.join(' ')}`);
     }
   }
+  flushOr();
 
   for (const [mn, ops] of net.out) {
     if (mn in COIL) {
@@ -231,9 +354,6 @@ export function buildNet(nid: number, net: IlNet): string[] {
     }
   }
 
-  if (nOr) {
-    root.push(...buildNode(T_LNK_OR, null, [nOr + 1, nOr]));
-  }
   if (nOut > 1) {
     out.push(...buildNode(T_LNK_OUT, null, [nOut, nOut - 1]));
   }
@@ -242,13 +362,13 @@ export function buildNet(nid: number, net: IlNet): string[] {
     '<NETWORK_START>',
     '<PROPERTIES_START>',
     `NET_ID=${nid}`,
-    'NET_LABEL=',
+    `NET_LABEL=${net.label ?? ''}`,
     'NET_ACTIVE=TRUE',
     'NET_BOOKMARK=FALSE',
     'NET_MODIFY=TRUE',
     'NET_FOLD=FALSE',
     '(',
-    '',
+    rawIlComment,
     '*)',
     '<PROPERTIES_END>',
     '<ROOTLINK_START>',

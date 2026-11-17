@@ -21,6 +21,9 @@ export function parseIl(text: string): il2mpu.Instruction[] {
   for (const [op, split] of Object.entries(il2mpu.OP_SPLIT)) {
     arity[op] = split[0] + split[1];
   }
+  for (const op of il2mpu.STACK_OPS) {
+    arity[op] = 0;
+  }
   arity.END = 0;
 
   let ended = false;
@@ -29,6 +32,15 @@ export function parseIl(text: string): il2mpu.Instruction[] {
     const number = idx + 1;
     const line = lines[idx].trim();
     if (!line || line.startsWith('#') || line.startsWith(';') || line.startsWith('//')) {
+      continue;
+    }
+    const labelMatch = /^(?:([A-Za-z_][A-Za-z0-9_]*):|(P\d+))$/i.exec(line);
+    if (labelMatch) {
+      if (ended) {
+        throw new FileTransformError('Instructions after END would be discarded');
+      }
+      const lbl = labelMatch[1] ?? labelMatch[2];
+      instructions.push(['LABEL', [lbl]]);
       continue;
     }
     const pieces = line.split(/[,\s]+/).filter(Boolean);
@@ -40,26 +52,24 @@ export function parseIl(text: string): il2mpu.Instruction[] {
     if (ended) {
       throw new FileTransformError('Instructions after END would be discarded');
     }
-    if (operands.some((p) => !/^(?:[A-Za-z_][A-Za-z_0-9]*|-?\d+|[Kk]-?\d+)$/.test(p))) {
+    if (operands.some((p) => !/^(?:[A-Za-z_][A-Za-z_0-9.]*|-?\d+|[Kk]-?\d+|[Hh][0-9A-Fa-f]+)$/.test(p))) {
       throw new FileTransformError(`Unsupported operand syntax on IL line ${number}`);
     }
     ended = op === 'END';
     instructions.push([op, operands]);
   }
 
-  if (instructions.length === 0 || instructions.every(([op]) => op === 'END')) {
+  if (instructions.length === 0 || instructions.every(([op]) => op === 'END' || op === 'LABEL')) {
     throw new FileTransformError('No executable IL instructions');
   }
 
-  for (const net of il2mpu.splitNets(instructions)) {
-    let sawOr = false;
-    for (const [op] of net.in) {
-      if (op in il2mpu.CONTACT_OR) {
-        sawOr = true;
-      } else if (sawOr) {
-        throw new FileTransformError('OR followed by series logic requires a richer Ladder serializer');
-      }
-    }
+  let nets: il2mpu.IlNet[];
+  try {
+    nets = il2mpu.splitNets(instructions);
+  } catch (e) {
+    throw new FileTransformError(e instanceof Error ? e.message : String(e));
+  }
+  for (const net of nets) {
     if (net.out.length === 0) {
       throw new FileTransformError('Network without an output is unsupported');
     }
@@ -100,7 +110,7 @@ export function ilToMpu(
 function canonicalNetwork(network: mpu2il.ParsedNetwork): string {
   const mapNodes = (nodes: mpu2il.ParsedLdNode[]) =>
     nodes.map((n) => [n.type, n.dev, n.symb, n.api, n.vars, n.lnk]);
-  return JSON.stringify([mapNodes(network.root), mapNodes(network.out)]);
+  return JSON.stringify([mapNodes(network.root), mapNodes(network.out), network.metaIl ?? null, network.label ?? null]);
 }
 
 export function mpuToIl(
@@ -142,11 +152,15 @@ export function mpuToIl(
   const lines: string[] = [];
   for (const net of nets) {
     const values = mpu2il.netToIl(net);
-    const text = values.map(([op, ops]) => [op, ...ops].join(',')).join('\n');
+    const prefix = net.label ? `${net.label}:\n` : '';
+    const text = prefix + values.map(([op, ops]) => [op, ...ops].join(',')).join('\n');
     const parsed = parseIl(text);
     const rebuilt = mpu2il.parseNetworks(il2mpu.buildPou(il2mpu.splitNets(parsed)));
     if (rebuilt.length !== 1 || canonicalNetwork(rebuilt[0]) !== canonicalNetwork(net)) {
       throw new FileTransformError('Network contains unsupported layout; conversion would lose nodes');
+    }
+    if (net.label) {
+      lines.push(`${net.label}:`);
     }
     for (const [op, ops] of values) {
       lines.push([op, ...ops].join(','));
