@@ -142,3 +142,320 @@ test('workspace persists files atomically to disk across cache resets and blocks
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('all MCP_TOOLS have consistent schemas, annotations, and bounded validation', async () => {
+  const { MCP_TOOLS, executeMcpTool, getAnnotatedTools } = await import('./tools.js');
+  const seen = new Set<string>();
+  const annotated = getAnnotatedTools();
+  assert.equal(annotated.length, MCP_TOOLS.length);
+
+  for (const t of annotated) {
+    assert.ok(!seen.has(t.name), `Duplicate tool name: ${t.name}`);
+    seen.add(t.name);
+    assert.equal(t.inputSchema.type, 'object', `${t.name} must have object inputSchema`);
+    const props = (t.inputSchema.properties ?? {}) as Record<string, unknown>;
+    const req = Array.isArray(t.inputSchema.required) ? t.inputSchema.required : [];
+    for (const r of req) {
+      assert.ok(r in props, `${t.name} required field '${r}' missing from properties`);
+    }
+    assert.equal(typeof t.annotations.readOnlyHint, 'boolean');
+    assert.equal(typeof t.annotations.destructiveHint, 'boolean');
+    assert.equal(typeof t.annotations.idempotentHint, 'boolean');
+    assert.equal(typeof t.annotations.openWorldHint, 'boolean');
+  }
+
+  const compileTool = annotated.find((t) => t.name === 'ispsoft_compile_and_check');
+  const analyzeTool = annotated.find((t) => t.name === 'ispsoft_analyze_source');
+  assert.equal(compileTool?.annotations.readOnlyHint, true);
+  assert.equal(analyzeTool?.annotations.readOnlyHint, true);
+
+  const badDiag = executeMcpTool('ispsoft_sim_diagnostics', { session_id: 'sim-1', sample_cycles: -5, slow_threshold_ms: 0 });
+  assert.equal(badDiag.success, false);
+  assert.equal(badDiag.error_code, 'VALIDATION_ERROR');
+
+  const delMissing = executeMcpTool('ispsoft_manage_workspace_files', { action: 'delete', path: '/workspace/does_not_exist_12345.isp' });
+  assert.equal(delMissing.success, false);
+  assert.equal(delMissing.error_code, 'NOT_FOUND');
+
+  // Strict schema compliance across all 60 AI-agent tools (Gemini / Google Antigravity / OpenAI / VS Code)
+  assert.equal(annotated.length, 60);
+  const walkSchema = (node: Record<string, unknown>, loc: string) => {
+    assert.ok(!Array.isArray(node.type), `${loc}: type must not be an array`);
+    if (node.type === 'array') {
+      assert.ok(node.items && typeof node.items === 'object', `${loc}: array must define items`);
+      walkSchema(node.items as Record<string, unknown>, `${loc}.items`);
+    }
+    if (node.type === 'object') {
+      assert.ok(
+        node.properties !== undefined || (node.additionalProperties !== undefined && node.additionalProperties !== true),
+        `${loc}: object must define properties or typed additionalProperties`,
+      );
+      if (node.properties && typeof node.properties === 'object') {
+        for (const [k, v] of Object.entries(node.properties as Record<string, Record<string, unknown>>)) {
+          walkSchema(v, `${loc}.properties.${k}`);
+        }
+      }
+    }
+  };
+  for (const t of annotated) {
+    walkSchema(t.inputSchema, t.name);
+  }
+});
+
+test('ispsoft_manage_workspace_files supports pure-MCP list, upload_base64, download_base64, and delete', async () => {
+  const { executeMcpTool } = await import('./tools.js');
+  const prevWorkDir = process.env.ISPSOFT_WORK_DIR;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ispsoft-b64-test-'));
+  try {
+    process.env.ISPSOFT_WORK_DIR = tmpDir;
+    resetWorkspaceMemoryCacheForTests();
+    seedDefaultWorkspace();
+
+    const samplePayload = Buffer.from('DELTA_BINARY_PAYLOAD_123', 'utf8');
+    const up = executeMcpTool('ispsoft_manage_workspace_files', {
+      action: 'upload_base64',
+      path: '/workspace/mcp_uploaded.bin',
+      content_base64: samplePayload.toString('base64'),
+    });
+    assert.equal(up.success, true);
+    assert.equal(up.path, '/workspace/mcp_uploaded.bin');
+
+    const listed = executeMcpTool('ispsoft_manage_workspace_files', { action: 'list' });
+    assert.equal(listed.success, true);
+    assert.ok((listed.files as string[]).includes('/workspace/mcp_uploaded.bin'));
+
+    const dl = executeMcpTool('ispsoft_manage_workspace_files', {
+      action: 'download_base64',
+      path: '/workspace/mcp_uploaded.bin',
+    });
+    assert.equal(dl.success, true);
+    assert.equal(Buffer.from(String(dl.content_base64), 'base64').toString('utf8'), 'DELTA_BINARY_PAYLOAD_123');
+
+    const del = executeMcpTool('ispsoft_manage_workspace_files', {
+      action: 'delete',
+      path: '/workspace/mcp_uploaded.bin',
+    });
+    assert.equal(del.success, true);
+    assert.equal(del.deleted, true);
+  } finally {
+    resetWorkspaceMemoryCacheForTests();
+    if (prevWorkDir === undefined) delete process.env.ISPSOFT_WORK_DIR;
+    else process.env.ISPSOFT_WORK_DIR = prevWorkDir;
+    seedDefaultWorkspace();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('handleSingleRpc negotiates MCP protocol versions, reads resources/completions, and validates params', async () => {
+  const { handleSingleRpc } = await import('./mcpServer.js');
+
+  const init24 = handleSingleRpc(
+    { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' } },
+    { requestId: 'r1' },
+  );
+  assert.equal(init24.status, 200);
+  const res24 = (init24.body?.result ?? {}) as Record<string, unknown>;
+  assert.equal(res24.protocolVersion, '2024-11-05');
+  assert.equal(typeof res24.instructions, 'string');
+
+  const init25 = handleSingleRpc(
+    { jsonrpc: '2.0', id: 2, method: 'initialize', params: { protocolVersion: '2025-03-26' } },
+    { requestId: 'r2' },
+  );
+  assert.equal(((init25.body?.result ?? {}) as Record<string, unknown>).protocolVersion, '2025-03-26');
+
+  const badParams = handleSingleRpc(
+    { jsonrpc: '2.0', id: 3, method: 'tools/call', params: ['not-an-object'] },
+    { requestId: 'r3' },
+  );
+  assert.equal((badParams.body?.error as Record<string, unknown>)?.code, -32602);
+
+  const telemetryRes = handleSingleRpc(
+    { jsonrpc: '2.0', id: 4, method: 'resources/read', params: { uri: 'ispsoft://telemetry' } },
+    { requestId: 'r4' },
+  );
+  const tContents = ((telemetryRes.body?.result as Record<string, unknown>)?.contents as Array<Record<string, unknown>>) ?? [];
+  assert.equal(tContents.length, 1);
+
+  const bundleRes = handleSingleRpc(
+    { jsonrpc: '2.0', id: 5, method: 'resources/read', params: { uri: 'ispsoft://projects/sample_es2.isp/bundle' } },
+    { requestId: 'r5' },
+  );
+  const bContents = ((bundleRes.body?.result as Record<string, unknown>)?.contents as Array<Record<string, unknown>>) ?? [];
+  assert.equal(bContents.length, 1);
+
+  const compRes = handleSingleRpc(
+    {
+      jsonrpc: '2.0',
+      id: 6,
+      method: 'completion/complete',
+      params: { ref: { type: 'ref/prompt', name: 'audit_and_optimize_plc' }, argument: { name: 'project_path', value: 'sample' } },
+    },
+    { requestId: 'r6' },
+  );
+  const values = (((compRes.body?.result as Record<string, unknown>)?.completion as Record<string, unknown>)?.values as string[]) ?? [];
+  assert.ok(values.some((v) => v.includes('sample_es2.isp')));
+});
+
+test('stdio.ts handles NDJSON + multi-header Content-Length framing and clean simulator workflow', async () => {
+  const { spawn } = await import('node:child_process');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ispsoft-stdio-e2e-'));
+  try {
+    const child = spawn(process.execPath, ['--import', 'tsx', 'stdio.ts'], {
+      cwd: process.cwd(),
+      env: { ...process.env, ISPSOFT_WORK_DIR: tmpDir },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let stdoutBuf = '';
+    let stderrBuf = '';
+    child.stdout.on('data', (d) => {
+      stdoutBuf += d.toString('utf8');
+    });
+    child.stderr.on('data', (d) => {
+      stderrBuf += d.toString('utf8');
+    });
+
+    const msgs = [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', clientInfo: { name: 'antigravity-test', version: '1.0' } } },
+      { jsonrpc: '2.0', method: 'notifications/initialized' },
+      { jsonrpc: '2.0', id: 2, method: 'tools/list' },
+      { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'ispsoft_doctor', arguments: {} } },
+      { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'ispsoft_sim_start', arguments: { project_path: '/workspace/sample_es2.isp' } } },
+    ];
+    for (const m of msgs) {
+      child.stdin.write(JSON.stringify(m) + '\n');
+    }
+
+    // Wait for first 4 responses (notification produces no response)
+    const waitForLines = async (count: number) => {
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        const lines = stdoutBuf.split('\n').filter((l) => l.trim().length > 0);
+        if (lines.length >= count) return lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      throw new Error(`Timed out waiting for ${count} stdio JSON-RPC responses; got stdout=${stdoutBuf} stderr=${stderrBuf}`);
+    };
+
+    const batch1 = await waitForLines(4);
+    assert.equal(batch1[0].id, 1);
+    const listedTools = ((batch1[1].result as Record<string, unknown>).tools as Array<Record<string, unknown>>);
+    assert.equal(listedTools.length, 60);
+
+    const simStartOut = JSON.parse(
+      String((((batch1[3].result as Record<string, unknown>).content as Array<Record<string, unknown>>)[0]).text),
+    ) as Record<string, unknown>;
+    assert.equal(simStartOut.success, true);
+    const sid = String(simStartOut.session_id);
+
+    // Send sim diagnostics + close via NDJSON, plus ping via Content-Length framing
+    child.stdin.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 5,
+        method: 'tools/call',
+        params: { name: 'ispsoft_sim_diagnostics', arguments: { session_id: sid, sample_cycles: 3 } },
+      }) + '\n',
+    );
+    child.stdin.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 6,
+        method: 'tools/call',
+        params: { name: 'ispsoft_sim_control', arguments: { session_id: sid, command: 'CLOSE' } },
+      }) + '\n',
+    );
+    const pingBody = JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'ping' });
+    child.stdin.write(
+      `Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(pingBody, 'utf8')}\r\n\r\n${pingBody}`,
+    );
+
+    const batch2 = await waitForLines(7);
+    assert.equal(batch2[4].id, 5);
+    assert.equal(batch2[5].id, 6);
+    assert.equal(batch2[6].id, 7);
+    assert.deepEqual(batch2[6].result, {});
+
+    child.stdin.end();
+    const exitCode = await new Promise<number | null>((resolve) => child.on('exit', resolve));
+    assert.equal(exitCode, 0);
+    assert.equal(stderrBuf.trim(), '');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('simulator evaluates ==, <>, nested arrays, CASE multi-ranges, radix literals, and zero-scan diagnostics cleanly', async () => {
+  const { executeMcpTool } = await import('./tools.js');
+  const prevWorkDir = process.env.ISPSOFT_WORK_DIR;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ispsoft-sim-edge-'));
+  let simId = '';
+  try {
+    process.env.ISPSOFT_WORK_DIR = tmpDir;
+    resetWorkspaceMemoryCacheForTests();
+    seedDefaultWorkspace();
+
+    const imported = executeMcpTool('ispsoft_import_project_bundle', {
+      output_path: '/workspace/edge_case_test.isp',
+      bundle: {
+        model: 'ES2',
+        tasks: [{ id: 0, name: 'Main', type: 0, interval_ms: 50, priority: 1, active: true, program: 'EdgeST' }],
+        pous: [
+          {
+            name: 'EdgeST',
+            language: 'ST',
+            pou_type: 'PRG',
+            code: [
+              'Idx[0] := 2;',
+              'Buf[2] := 16#FF;',
+              'D10 := Buf[Idx[0]] + 2#101;',
+              'D11 := 10 / 0;',
+              'D12 := -5;',
+              'D13 := -D12;',
+              'CASE D20 OF',
+              '  1, 3..5: D21 := 42;',
+              '  ELSE D21 := 99;',
+              'END_CASE;',
+              'IF D10 == 260 AND D13 = 5 THEN',
+              '  M0 := TRUE;',
+              'END_IF;',
+            ].join('\n'),
+          },
+        ],
+      },
+    });
+    assert.equal(imported.success, true);
+
+    const started = executeMcpTool('ispsoft_sim_start', { project_path: '/workspace/edge_case_test.isp', scan_interval_ms: 50 });
+    assert.equal(started.success, true);
+    simId = String(started.session_id);
+
+    // 0-scan diagnostics before stepping must succeed cleanly with zero NaN
+    const zeroDiag = executeMcpTool('ispsoft_sim_diagnostics', { session_id: simId, sample_cycles: 0 });
+    assert.equal(zeroDiag.success, true);
+    assert.equal(zeroDiag.health_status, 'OPTIMAL');
+    assert.equal((zeroDiag.timing as Record<string, unknown>).scans_profiled, 0);
+
+    const seq = executeMcpTool('ispsoft_sim_run_sequence', {
+      session_id: simId,
+      steps: [
+        {
+          label: 'Run with D20=4 matching range 3..5 and == comparison',
+          words: { D20: 4 },
+          cycles: 1,
+          expect: { D10: 260, D11: 0, D13: 5, D21: 42, M0: true },
+          assert_expr: 'D10 == 260 AND D21 <> 99 AND -D12 == 5',
+        },
+      ],
+    });
+    assert.equal(seq.success, true, JSON.stringify(seq));
+  } finally {
+    if (simId) executeMcpTool('ispsoft_sim_control', { session_id: simId, command: 'CLOSE' });
+    resetWorkspaceMemoryCacheForTests();
+    if (prevWorkDir === undefined) delete process.env.ISPSOFT_WORK_DIR;
+    else process.env.ISPSOFT_WORK_DIR = prevWorkDir;
+    seedDefaultWorkspace();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

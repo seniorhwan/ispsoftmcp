@@ -1,6 +1,6 @@
 {
   "name": "ISPSoft MCP Agent Server",
-  "description": "Full-featured AI-agent MCP server and offline/simulator workbench for Delta ISPSoft PLCs (DVP & AS series).",
+  "description": "Pure headless AI-agent MCP server (Streamable HTTP + Stdio) for Delta ISPSoft PLCs (DVP & AS series): authoring, LD/ST/IL editing, static check, Soft-PLC simulation, diagnostics, and Modbus mapping.",
   "requestFramePermissions": [],
   "capabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

@@ -253,6 +253,8 @@ const READ_ONLY_PREFIXES = [
   'ispsoft_project_',
   'ispsoft_diff_',
   'ispsoft_static_check_',
+  'ispsoft_compile_and_check',
+  'ispsoft_analyze_',
   'ispsoft_map_',
   'ispsoft_parse_',
   'ispsoft_translate_',
@@ -277,17 +279,13 @@ const DESTRUCTIVE_NAMES = new Set([
 export function deriveToolAnnotations(name: string): ToolAnnotations {
   const readOnly = READ_ONLY_PREFIXES.some((p) => name.startsWith(p));
   const destructive = !readOnly && (DESTRUCTIVE_NAMES.has(name) || name.includes('delete') || name.includes('write'));
-  const idempotent =
-    readOnly ||
-    name === 'ispsoft_generate_mpu' ||
-    name === 'ispsoft_sim_breakpoints' ||
-    name === 'ispsoft_sim_watch_table';
+  const idempotent = readOnly || name === 'ispsoft_sim_watch_table';
   const openWorld =
     name.startsWith('ispsoft_connect') ||
     name.startsWith('ispsoft_upload_from_plc') ||
     name.startsWith('ispsoft_runtime_') ||
     name.startsWith('ispsoft_download') ||
-    name.includes('_monitor') && !name.includes('sim_monitor');
+    (name.includes('_monitor') && !name.includes('sim_monitor'));
 
   const title = name
     .replace(/^ispsoft_/, '')

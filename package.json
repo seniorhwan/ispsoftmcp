@@ -4,8 +4,12 @@
   "description": "AI-agent-first Delta ISPSoft MCP server: full project authoring, LD/ST/IL editing, static check, Soft-PLC simulation & online monitoring, and Modbus PDU mapping",
   "type": "module",
   "main": "dist/server.js",
+  "bin": {
+    "ispsoft-mcp": "dist/stdio.js"
+  },
   "scripts": {
     "dev": "tsx server.ts",
+    "mcp:stdio": "tsx stdio.ts",
     "build": "tsc",
     "start": "node dist/server.js",
     "lint": "tsc --noEmit"

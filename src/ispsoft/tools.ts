@@ -276,7 +276,7 @@ export const MCP_TOOLS: McpToolDef[] = [
       type: 'object',
       properties: {
         search_path: { type: 'string', description: 'Optional directory prefix filter (default /workspace)' },
-        max_results: { type: 'integer', default: 100 },
+        max_results: { type: 'integer', minimum: 1, maximum: 1000, default: 100 },
       },
     },
     handler: (args) => {
@@ -332,23 +332,60 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_manage_workspace_files',
-    description: 'Copy, move/rename, delete workspace files, restore a project backup, or clean up *.before.* clutter.',
+    description: 'List, upload_base64, download_base64, copy, move/rename, delete workspace files, restore backups, or clean up *.before.* clutter purely over MCP.',
     category: 'Project Management',
     inputSchema: {
       type: 'object',
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['copy', 'move', 'delete', 'restore_backup', 'cleanup_backups'] },
-        path: { type: 'string', description: 'Source path (or target project path for restore_backup)' },
+        action: { type: 'string', enum: ['list', 'upload_base64', 'download_base64', 'copy', 'move', 'delete', 'restore_backup', 'cleanup_backups'] },
+        path: { type: 'string', description: 'Workspace path (e.g. /workspace/myproj.isp)' },
+        content_base64: { type: 'string', description: 'Base64-encoded binary file bytes for upload_base64' },
         destination_path: { type: 'string', description: 'Destination path for copy/move' },
         backup_path: { type: 'string', description: 'Optional explicit backup path for restore_backup (defaults to <name>.latest.before.isp)' },
         overwrite: { type: 'boolean', default: false },
-        prefix: { type: 'string', description: 'Optional directory filter for cleanup_backups' },
+        prefix: { type: 'string', description: 'Optional directory filter for list/cleanup_backups' },
       },
     },
     handler: (args) => {
       try {
         const action = String(args.action ?? '');
+        if (action === 'list') {
+          const prefix = typeof args.prefix === 'string' ? args.prefix : '';
+          return {
+            success: true,
+            action,
+            storage: getWorkspaceStorageStats(),
+            files: listAllFiles(prefix),
+          };
+        }
+        if (action === 'upload_base64') {
+          const target = normalizeVirtualPath(String(args.path ?? ''));
+          const b64 = String(args.content_base64 ?? '').trim();
+          if (!b64) throw new FileTransformError('content_base64 is required for upload_base64');
+          const data = Buffer.from(b64, 'base64');
+          const saved = writeFileBuffer(target, data, Boolean(args.overwrite));
+          return {
+            success: true,
+            action,
+            path: saved,
+            bytes: data.length,
+            sha256: sha256(data),
+            content_hash: computeContentHash('file', data),
+          };
+        }
+        if (action === 'download_base64') {
+          const target = normalizeVirtualPath(String(args.path ?? ''));
+          const data = readFileBuffer(target);
+          return {
+            success: true,
+            action,
+            path: target,
+            bytes: data.length,
+            sha256: sha256(data),
+            content_base64: data.toString('base64'),
+          };
+        }
         if (action === 'copy' || action === 'move') {
           const res = copyOrMoveWorkspaceFile(
             String(args.path ?? ''),
@@ -361,7 +398,10 @@ export const MCP_TOOLS: McpToolDef[] = [
         if (action === 'delete') {
           const p = normalizeVirtualPath(String(args.path ?? ''));
           const deleted = deleteWorkspaceFile(p);
-          return { success: deleted, action, path: p, deleted };
+          if (!deleted) {
+            return { success: false, action, path: p, deleted: false, error: `File not found in workspace: ${p}` };
+          }
+          return { success: true, action, path: p, deleted: true };
         }
         if (action === 'restore_backup') {
           const targetPath = normalizeVirtualPath(String(args.path ?? ''));
@@ -430,7 +470,83 @@ export const MCP_TOOLS: McpToolDef[] = [
       required: ['output_path', 'bundle'],
       properties: {
         output_path: { type: 'string' },
-        bundle: { type: 'object', description: 'Project bundle matching ispsoft_export_project_bundle output schema' },
+        bundle: {
+          type: 'object',
+          description: 'Project bundle matching ispsoft_export_project_bundle output schema',
+          properties: {
+            model: { type: 'string', description: 'PLC model, e.g. ES2, AS228T' },
+            properties: { type: 'object', additionalProperties: { type: 'string' } },
+            tasks: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'integer' },
+                  name: { type: 'string' },
+                  type: { type: 'integer' },
+                  interval_ms: { type: 'integer' },
+                  priority: { type: 'integer' },
+                  active: { type: 'boolean' },
+                  program: { type: 'string' },
+                },
+              },
+            },
+            system_vars: { type: 'object', additionalProperties: { type: 'string' } },
+            global_vars: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  type: { type: 'string' },
+                  address: { type: 'string' },
+                  initial_value: { type: 'string' },
+                  comment: { type: 'string' },
+                  class: { type: 'string' },
+                },
+              },
+            },
+            duts: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  content: { type: 'string' },
+                },
+              },
+            },
+            device_comments: { type: 'object', additionalProperties: { type: 'string' } },
+            pous: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  language: { type: 'string', enum: ['LD', 'ST', 'IL'] },
+                  pou_type: { type: 'string', enum: ['PRG', 'FB', 'FC'] },
+                  active: { type: 'boolean' },
+                  code: { type: 'string', description: 'ST source code' },
+                  il: { type: 'string', description: 'DVP IL program text for LD POUs' },
+                  local_vars: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        name: { type: 'string' },
+                        type: { type: 'string' },
+                        address: { type: 'string' },
+                        initial_value: { type: 'string' },
+                        comment: { type: 'string' },
+                        class: { type: 'string' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
         overwrite: { type: 'boolean', default: false },
         dry_run: { type: 'boolean', default: false },
       },
@@ -497,6 +613,93 @@ export const MCP_TOOLS: McpToolDef[] = [
         operations: {
           type: 'array',
           description: 'Sequence of ops: { type: "edit_properties"|"configure_tasks"|"configure_hardware_io"|"create_pou"|"manage_pou"|"write_st"|"write_ld"|"edit_ld_rungs"|"edit_local_vars"|"edit_global_vars"|"manage_dut"|"write_comments"|"rename_symbol", ... }',
+          items: {
+            type: 'object',
+            properties: {
+              type: {
+                type: 'string',
+                enum: [
+                  'edit_properties',
+                  'configure_tasks',
+                  'configure_hardware_io',
+                  'create_pou',
+                  'manage_pou',
+                  'write_st',
+                  'write_ld',
+                  'edit_ld_rungs',
+                  'edit_local_vars',
+                  'edit_global_vars',
+                  'manage_dut',
+                  'write_comments',
+                  'rename_symbol',
+                ],
+              },
+              pou_name: { type: 'string' },
+              code: { type: 'string' },
+              program: { type: 'string' },
+              language: { type: 'string' },
+              pou_type: { type: 'string' },
+              action: { type: 'string' },
+              new_name: { type: 'string' },
+              properties: { type: 'object', additionalProperties: { type: 'string' } },
+              tasks: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'integer' },
+                    name: { type: 'string' },
+                    type: { type: 'integer' },
+                    interval_ms: { type: 'integer' },
+                    priority: { type: 'integer' },
+                    active: { type: 'boolean' },
+                    program: { type: 'string' },
+                  },
+                },
+              },
+              ranges: { type: 'object', additionalProperties: { type: 'string' } },
+              local_variables: { type: 'string' },
+              assign_to_task: { type: 'boolean' },
+              variables: { type: 'string' },
+              global_var_text: { type: 'string' },
+              dut_name: { type: 'string' },
+              dut_content: { type: 'string' },
+              replace_all: { type: 'boolean' },
+              operations: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    op: { type: 'string' },
+                    network_index: { type: 'integer' },
+                    to_index: { type: 'integer' },
+                    il_program: { type: 'string' },
+                    active: { type: 'boolean' },
+                    bookmark: { type: 'boolean' },
+                    label: { type: 'string' },
+                  },
+                },
+              },
+              upsert_vars: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string' },
+                    type: { type: 'string' },
+                    address: { type: 'string' },
+                    initial_value: { type: 'string' },
+                    comment: { type: 'string' },
+                    class: { type: 'string' },
+                  },
+                },
+              },
+              delete_vars: { type: 'array', items: { type: 'string' } },
+              device_comments: { type: 'object', additionalProperties: { type: 'string' } },
+              find_symbol: { type: 'string' },
+              replace_symbol: { type: 'string' },
+            },
+          },
         },
         in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
@@ -869,8 +1072,8 @@ export const MCP_TOOLS: McpToolDef[] = [
       required: ['project_path'],
       properties: {
         project_path: { type: 'string' },
-        properties: { type: 'object', description: 'Optional map of PROJECT keys to update, e.g. { Prj_DT: "EH3" }' },
-        ini_settings: { type: 'object', description: 'Optional map of .ini [PRJ_DATA] keys, e.g. { STATION_ADDR: "2" }' },
+        properties: { type: 'object', additionalProperties: { type: 'string' }, description: 'Optional map of PROJECT keys to update, e.g. { Prj_DT: "EH3" }' },
+        ini_settings: { type: 'object', additionalProperties: { type: 'string' }, description: 'Optional map of .ini [PRJ_DATA] keys, e.g. { STATION_ADDR: "2" }' },
         in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
@@ -962,6 +1165,18 @@ export const MCP_TOOLS: McpToolDef[] = [
         tasks: {
           type: 'array',
           description: 'Optional full replacement task list [{id, name, type, interval_ms, priority, active, program}]',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'integer' },
+              name: { type: 'string' },
+              type: { type: 'integer' },
+              interval_ms: { type: 'integer' },
+              priority: { type: 'integer' },
+              active: { type: 'boolean' },
+              program: { type: 'string' },
+            },
+          },
         },
         in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
@@ -1026,6 +1241,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         project_path: { type: 'string' },
         ranges: {
           type: 'object',
+          additionalProperties: { type: 'string' },
           description: 'Optional map e.g. { "M": "0-4095", "D": "0-9999", "T": "0-255" }',
         },
         in_place: { type: 'boolean', default: false },
@@ -1323,6 +1539,17 @@ export const MCP_TOOLS: McpToolDef[] = [
         upsert_vars: {
           type: 'array',
           description: 'Optional structured variables [{ name, type, address?, initial_value?, comment?, class? }] to upsert',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              type: { type: 'string' },
+              address: { type: 'string' },
+              initial_value: { type: 'string' },
+              comment: { type: 'string' },
+              class: { type: 'string' },
+            },
+          },
         },
         delete_vars: {
           type: 'array',
@@ -1413,6 +1640,17 @@ export const MCP_TOOLS: McpToolDef[] = [
         upsert_vars: {
           type: 'array',
           description: 'Optional structured variables [{ name, type, address?, initial_value?, comment?, class? }] to upsert cleanly',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              type: { type: 'string' },
+              address: { type: 'string' },
+              initial_value: { type: 'string' },
+              comment: { type: 'string' },
+              class: { type: 'string' },
+            },
+          },
         },
         delete_vars: {
           type: 'array',
@@ -1576,7 +1814,7 @@ export const MCP_TOOLS: McpToolDef[] = [
       properties: {
         project_path: { type: 'string' },
         pou_name: { type: 'string' },
-        network_index: { type: 'integer' },
+        network_index: { type: 'integer', minimum: 1 },
       },
     },
     handler: (args) => {
@@ -1664,7 +1902,7 @@ export const MCP_TOOLS: McpToolDef[] = [
       properties: {
         project_path: { type: 'string' },
         pou_name: { type: 'string' },
-        network_index: { type: 'integer', description: 'Optional 1-based rung index' },
+        network_index: { type: 'integer', minimum: 1, description: 'Optional 1-based rung index' },
       },
     },
     handler: (args) => {
@@ -1695,6 +1933,18 @@ export const MCP_TOOLS: McpToolDef[] = [
         operations: {
           type: 'array',
           description: 'List of rung edits: { op: "insert"|"append"|"replace"|"delete"|"move"|"set_active"|"set_bookmark"|"set_label", network_index?, to_index?, il_program?, active?, bookmark?, label? }',
+          items: {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['insert', 'append', 'replace', 'delete', 'move', 'set_active', 'set_bookmark', 'set_label'] },
+              network_index: { type: 'integer' },
+              to_index: { type: 'integer' },
+              il_program: { type: 'string' },
+              active: { type: 'boolean' },
+              bookmark: { type: 'boolean' },
+              label: { type: 'string' },
+            },
+          },
         },
         in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
@@ -2088,7 +2338,7 @@ export const MCP_TOOLS: McpToolDef[] = [
     inputSchema: {
       type: 'object',
       required: ['device_comments', 'model'],
-      properties: { device_comments: { type: 'object' }, model: { type: 'string' } },
+      properties: { device_comments: { type: 'object', additionalProperties: { type: 'string' } }, model: { type: 'string' } },
     },
     handler: (args) => {
       const { canonical, error } = resolveModel(String(args.model ?? ''));
@@ -2121,7 +2371,7 @@ export const MCP_TOOLS: McpToolDef[] = [
       required: ['project_path', 'device_comments', 'model'],
       properties: {
         project_path: { type: 'string' },
-        device_comments: { type: 'object' },
+        device_comments: { type: 'object', additionalProperties: { type: 'string' } },
         model: { type: 'string' },
         in_place: { type: 'boolean', default: false },
         output_path: { type: 'string' },
@@ -2365,7 +2615,7 @@ export const MCP_TOOLS: McpToolDef[] = [
       required: ['project_path'],
       properties: {
         project_path: { type: 'string' },
-        scan_interval_ms: { type: 'integer', default: 100, description: 'Simulated time per scan cycle in ms (e.g. 100ms = 1 timer tick)' },
+        scan_interval_ms: { type: 'integer', minimum: 10, maximum: 10000, default: 100, description: 'Simulated time per scan cycle in ms (e.g. 100ms = 1 timer tick)' },
       },
     },
     handler: (args) => {
@@ -2405,7 +2655,7 @@ export const MCP_TOOLS: McpToolDef[] = [
       properties: {
         session_id: { type: 'string' },
         command: { type: 'string', enum: ['RUN', 'STOP', 'STEP', 'WARM_RESET', 'COLD_RESET', 'RESET', 'CLOSE'] },
-        cycles: { type: 'integer', default: 1 },
+        cycles: { type: 'integer', minimum: 1, maximum: 10000, default: 1 },
       },
     },
     handler: (args) => {
@@ -2435,7 +2685,7 @@ export const MCP_TOOLS: McpToolDef[] = [
       properties: {
         session_id: { type: 'string' },
         condition: { type: 'string', description: 'Boolean/numeric condition over devices, timer .Q/.PV, or symbols' },
-        max_cycles: { type: 'integer', default: 500 },
+        max_cycles: { type: 'integer', minimum: 1, maximum: 10000, default: 500 },
         addresses: { type: 'array', items: { type: 'string' } },
       },
     },
@@ -2464,6 +2714,22 @@ export const MCP_TOOLS: McpToolDef[] = [
         steps: {
           type: 'array',
           description: 'Array of steps: [{ label?, force_bits?, bits?, words?, symbols?, cycles?, step_until?, max_cycles?, expect?, assert_expr? }]',
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string' },
+              bits: { type: 'object', additionalProperties: { type: 'boolean' } },
+              words: { type: 'object', additionalProperties: { type: 'number' } },
+              force_bits: { type: 'object', additionalProperties: { description: 'Boolean coil/input state, or null to unforce' } },
+              force_words: { type: 'object', additionalProperties: { description: 'Numeric word value, or null to unforce' } },
+              symbols: { type: 'object', additionalProperties: { description: 'Scalar value (boolean or number)' } },
+              cycles: { type: 'integer' },
+              step_until: { type: 'string' },
+              max_cycles: { type: 'integer' },
+              expect: { type: 'object', additionalProperties: { description: 'Expected scalar value (boolean, number, or string)' } },
+              assert_expr: { type: 'string' },
+            },
+          },
         },
         stop_on_failure: { type: 'boolean', default: false },
       },
@@ -2490,8 +2756,8 @@ export const MCP_TOOLS: McpToolDef[] = [
       properties: {
         session_id: { type: 'string' },
         area: { type: 'string', enum: ['X', 'Y', 'M', 'S', 'T', 'C', 'D'] },
-        start: { type: 'integer', default: 0 },
-        count: { type: 'integer', default: 32 },
+        start: { type: 'integer', minimum: 0, default: 0 },
+        count: { type: 'integer', minimum: 1, maximum: 256, default: 32 },
         only_non_zero: { type: 'boolean', default: false },
       },
     },
@@ -2574,11 +2840,11 @@ export const MCP_TOOLS: McpToolDef[] = [
       required: ['session_id'],
       properties: {
         session_id: { type: 'string' },
-        bits: { type: 'object', description: 'Non-forced bit writes e.g. {"M0": true}' },
-        words: { type: 'object', description: 'Word writes e.g. {"D10": 50}' },
-        force_bits: { type: 'object', description: 'Forced inputs/coils (pass null to unforce) e.g. {"X0": true, "X1": null}' },
-        force_words: { type: 'object', description: 'Forced words (pass null to unforce)' },
-        symbols: { type: 'object', description: 'Write by symbolic variable name' },
+        bits: { type: 'object', additionalProperties: { type: 'boolean' }, description: 'Non-forced bit writes e.g. {"M0": true}' },
+        words: { type: 'object', additionalProperties: { type: 'number' }, description: 'Word writes e.g. {"D10": 50}' },
+        force_bits: { type: 'object', additionalProperties: { description: 'Boolean coil/input state, or null to unforce' }, description: 'Forced inputs/coils (pass null to unforce) e.g. {"X0": true, "X1": null}' },
+        force_words: { type: 'object', additionalProperties: { description: 'Numeric word value, or null to unforce' }, description: 'Forced words (pass null to unforce)' },
+        symbols: { type: 'object', additionalProperties: { description: 'Scalar value (boolean or number)' }, description: 'Write by symbolic variable name' },
       },
     },
     handler: (args) => {
@@ -2698,11 +2964,14 @@ export const MCP_TOOLS: McpToolDef[] = [
         session_id: { type: 'string' },
         sample_cycles: {
           type: 'integer',
+          minimum: 0,
+          maximum: 2000,
           default: 0,
           description: 'Optional number of benchmark scan cycles to step immediately before generating the diagnostic report (0 = passive read of existing scan history)',
         },
         slow_threshold_ms: {
           type: 'number',
+          minimum: 0.001,
           description: 'Optional scan latency threshold in ms above which scans are flagged as slow',
         },
         reset_metrics: {
@@ -2731,215 +3000,27 @@ export const MCP_TOOLS: McpToolDef[] = [
     },
   },
 
-  // =========================================================================
-  // 7. Windows-Only IDE & Physical PLC Transport Fail-Closed Tools (Preserved)
-  // =========================================================================
-  {
-    name: 'ispsoft_get_status',
-    description: 'Report ISPSoft/COMMGR/simulator host installation status (Windows host required for native binaries).',
-    category: 'Host & Hardware Transport',
-    inputSchema: { type: 'object', properties: {} },
-    handler: () => ({
-      ispsoft_installed: false,
-      commgr_installed: false,
-      dvp_es2_simulator_installed: false,
-      soft_plc_simulator_available: true,
-      note: 'Running in Linux Node.js runtime. Use ispsoft_sim_* tools for Soft-PLC simulation and online monitoring.',
-    }),
-  },
-  {
-    name: 'ispsoft_list_serial_ports',
-    description: 'Enumerate Windows serial COM ports (unavailable in Linux container).',
-    category: 'Host & Hardware Transport',
-    inputSchema: { type: 'object', properties: {} },
-    handler: () => ({
-      available: false,
-      ports: [],
-      error: 'Windows serial-port enumeration is unavailable on Linux.',
-    }),
-  },
-  {
-    name: 'ispsoft_list_commgr_drivers',
-    description: 'List saved Windows COMMGR driver targets (unavailable in Linux container).',
-    category: 'Host & Hardware Transport',
-    inputSchema: { type: 'object', properties: {} },
-    handler: () => ({ status: 'UNAVAILABLE_ON_LINUX', drivers: [], error: 'COMMGR configuration is Windows-only.' }),
-  },
-  {
-    name: 'ispsoft_get_ide_session',
-    description: 'Report visible Windows ISPSoft IDE windows (unavailable on Linux).',
-    category: 'Host & Hardware Transport',
-    inputSchema: { type: 'object', properties: {} },
-    handler: () => ({ running: false, windows: [], note: 'Windows GUI session inspection unavailable on Linux.' }),
-  },
-  {
-    name: 'ispsoft_start_ide',
-    description: 'Interactive Windows GUI open (unavailable on Linux).',
-    category: 'Host & Hardware Transport',
-    inputSchema: { type: 'object', properties: { project_path: { type: 'string' } } },
-    handler: () => ({ success: false, status: 'WINDOWS_GUI_UNAVAILABLE', error: 'Native ISPSoft GUI requires Windows.' }),
-  },
-  {
-    name: 'ispsoft_open_project',
-    description: 'Interactive Windows GUI project open (unavailable on Linux).',
-    category: 'Host & Hardware Transport',
-    inputSchema: { type: 'object', required: ['project_path'], properties: { project_path: { type: 'string' } } },
-    handler: () => ({ success: false, status: 'WINDOWS_GUI_UNAVAILABLE', error: 'Native ISPSoft GUI requires Windows.' }),
-  },
-  {
-    name: 'ispsoft_start_background_session',
-    description: 'Start an isolated Windows private-desktop ISPSoft session (Windows only).',
-    category: 'Host & Hardware Transport',
-    inputSchema: { type: 'object', properties: { project_path: { type: 'string' } } },
-    handler: () => ({ success: false, status: 'WINDOWS_GUI_UNAVAILABLE', error: 'Private desktop sessions require Windows.' }),
-  },
-  {
-    name: 'ispsoft_get_background_sessions',
-    description: 'List private-desktop ISPSoft sessions.',
-    category: 'Host & Hardware Transport',
-    inputSchema: { type: 'object', properties: {} },
-    handler: () => ({ success: true, sessions: [] }),
-  },
-  {
-    name: 'ispsoft_stop_background_session',
-    description: 'Stop a private-desktop ISPSoft session.',
-    category: 'Host & Hardware Transport',
-    inputSchema: { type: 'object', required: ['session_id'], properties: { session_id: { type: 'string' } } },
-    handler: () => ({ success: false, status: 'SESSION_NOT_FOUND' }),
-  },
-  {
-    name: 'ispsoft_online_status',
-    description: 'Report physical PLC transport qualification without contacting hardware.',
-    category: 'Host & Hardware Transport',
-    inputSchema: { type: 'object', required: ['model'], properties: { model: { type: 'string' } } },
-    handler: (args) => {
-      const { canonical, error } = resolveModel(String(args.model ?? ''));
-      if (error || !canonical) return { connected: false, status: 'UNSUPPORTED_MODEL', device_contacted: false, error };
-      return {
-        connected: false,
-        status: 'TRANSPORT_NOT_QUALIFIED',
-        model: canonical,
-        device_contacted: false,
-        soft_plc_simulator_sessions: listSimulatorSessions(),
-        message: 'No live physical PLC transport is qualified; use ispsoft_sim_* for Soft-PLC execution and monitoring.',
-      };
-    },
-  },
-  {
-    name: 'ispsoft_connect',
-    description: 'Fail closed for physical PLC hardware connection until a vendor adapter is qualified.',
-    category: 'Host & Hardware Transport',
-    inputSchema: {
-      type: 'object',
-      required: ['model', 'commgr_driver'],
-      properties: { model: { type: 'string' }, commgr_driver: { type: 'string' } },
-    },
-    handler: (args) => {
-      const { canonical, error } = resolveModel(String(args.model ?? ''));
-      if (error || !canonical) return { connected: false, status: 'UNSUPPORTED_MODEL', error };
-      return {
-        connected: false,
-        status: 'TRANSPORT_NOT_QUALIFIED',
-        model: canonical,
-        commgr_driver: args.commgr_driver,
-        device_contacted: false,
-        error: 'No qualified COMMGR hardware adapter; use ispsoft_sim_start for Soft-PLC.',
-      };
-    },
-  },
-  {
-    name: 'ispsoft_upload_from_plc',
-    description: 'Fail closed for physical PLC upload.',
-    category: 'Host & Hardware Transport',
-    inputSchema: {
-      type: 'object',
-      required: ['model', 'commgr_driver', 'output_path'],
-      properties: { model: { type: 'string' }, commgr_driver: { type: 'string' }, output_path: { type: 'string' } },
-    },
-    handler: (args) => ({
-      success: false,
-      status: 'TRANSPORT_NOT_QUALIFIED',
-      model: args.model,
-      device_contacted: false,
-      error: 'Physical PLC upload is not qualified; use ispsoft_sim_compare_and_upload for Soft-PLC.',
-    }),
-  },
-  {
-    name: 'ispsoft_start_monitor',
-    description: 'Fail closed for physical PLC monitor mode.',
-    category: 'Host & Hardware Transport',
-    inputSchema: {
-      type: 'object',
-      required: ['model', 'commgr_driver'],
-      properties: { model: { type: 'string' }, commgr_driver: { type: 'string' } },
-    },
-    handler: (args) => ({
-      success: false,
-      status: 'TRANSPORT_NOT_QUALIFIED',
-      model: args.model,
-      monitoring: false,
-      device_contacted: false,
-      error: 'Physical PLC monitor not qualified; use ispsoft_sim_monitor for Soft-PLC.',
-    }),
-  },
-  {
-    name: 'ispsoft_stop_monitor',
-    description: 'Report physical monitor state.',
-    category: 'Host & Hardware Transport',
-    inputSchema: { type: 'object', properties: {} },
-    handler: () => ({ success: true, status: 'ALREADY_OFFLINE', monitoring: false }),
-  },
-  {
-    name: 'ispsoft_runtime_read',
-    description: 'Fail closed for physical PLC live memory read.',
-    category: 'Host & Hardware Transport',
-    inputSchema: {
-      type: 'object',
-      required: ['model', 'addresses'],
-      properties: { model: { type: 'string' }, addresses: { type: 'array', items: { type: 'string' } } },
-    },
-    handler: (args) => ({
-      success: false,
-      status: 'TRANSPORT_NOT_QUALIFIED',
-      model: args.model,
-      error: 'Physical PLC runtime read not qualified; use ispsoft_sim_monitor.',
-    }),
-  },
-  {
-    name: 'ispsoft_runtime_write',
-    description: 'Guarded fail-closed physical PLC runtime write.',
-    category: 'Host & Hardware Transport',
-    inputSchema: {
-      type: 'object',
-      required: ['model', 'values'],
-      properties: { model: { type: 'string' }, values: { type: 'object' }, confirm_live_write: { type: 'boolean' } },
-    },
-    handler: (args) => {
-      const enabled = ['1', 'true', 'yes'].includes((process.env[LIVE_WRITES_ENV] ?? '').trim().toLowerCase());
-      if (!args.confirm_live_write || !enabled) {
-        return { success: false, status: 'BLOCKED', confirm_live_write: Boolean(args.confirm_live_write), environment_enabled: enabled, required_environment_variable: LIVE_WRITES_ENV };
-      }
-      return { success: false, status: 'TRANSPORT_NOT_QUALIFIED', error: 'Physical PLC runtime write not qualified; use ispsoft_sim_force_and_write.' };
-    },
-  },
-  {
-    name: 'ispsoft_download',
-    description: 'Guarded fail-closed physical PLC download.',
-    category: 'Host & Hardware Transport',
-    inputSchema: {
-      type: 'object',
-      required: ['project_path', 'model'],
-      properties: { project_path: { type: 'string' }, model: { type: 'string' }, confirm_download: { type: 'boolean' } },
-    },
-    handler: (args) => {
-      const enabled = ['1', 'true', 'yes'].includes((process.env[LIVE_WRITES_ENV] ?? '').trim().toLowerCase());
-      if (!args.confirm_download || !enabled) {
-        return { success: false, status: 'BLOCKED', confirm_download: Boolean(args.confirm_download), environment_enabled: enabled, required_environment_variable: LIVE_WRITES_ENV };
-      }
-      return { success: false, status: 'TRANSPORT_NOT_QUALIFIED', error: 'Physical PLC download not qualified; use ispsoft_sim_start.' };
-    },
-  },
 ];
+
+const LEGACY_HW_STUB_TOOLS = new Set([
+  'ispsoft_get_status',
+  'ispsoft_list_serial_ports',
+  'ispsoft_list_commgr_drivers',
+  'ispsoft_get_ide_session',
+  'ispsoft_start_ide',
+  'ispsoft_open_project',
+  'ispsoft_start_background_session',
+  'ispsoft_get_background_sessions',
+  'ispsoft_stop_background_session',
+  'ispsoft_online_status',
+  'ispsoft_connect',
+  'ispsoft_upload_from_plc',
+  'ispsoft_start_monitor',
+  'ispsoft_stop_monitor',
+  'ispsoft_runtime_read',
+  'ispsoft_runtime_write',
+  'ispsoft_download',
+]);
 
 const TOOL_MAP = new Map<string, McpToolDef>(
   MCP_TOOLS.map((t) => {
@@ -2989,6 +3070,16 @@ export function getToolDef(name: string): McpToolDef | undefined {
 
 export function executeMcpTool(name: string, args: Record<string, unknown> = {}): Record<string, unknown> {
   seedDefaultWorkspace();
+  if (LEGACY_HW_STUB_TOOLS.has(name)) {
+    return {
+      success: false,
+      status: 'TRANSPORT_NOT_QUALIFIED',
+      error_code: 'HARDWARE_NOT_QUALIFIED',
+      retryable: false,
+      error: `Tool '${name}' requires a native Windows ISPSoft desktop / COMMGR hardware connection and is omitted from the active agent catalog.`,
+      remediation: 'Use Soft-PLC simulator tools (ispsoft_sim_*) and offline tools (ispsoft_static_check_and_compile, ispsoft_audit_project).',
+    };
+  }
   const tool = TOOL_MAP.get(name);
   if (!tool) {
     return {

@@ -135,6 +135,7 @@ let nextSimId = 1;
 let nextBpId = 1;
 
 const MAX_CONTINUOUS_RUN_TICKS = 6000;
+const MAX_SIM_MEMORY_KEYS = 100_000;
 
 function maxSimSessions(): number {
   const n = Number(process.env.ISPSOFT_SIM_MAX_SESSIONS || 32);
@@ -357,6 +358,9 @@ function writeBit(sess: SimulatorSession, rawAddr: string, val: boolean): void {
     sess.counters.set(addr, c);
     return;
   }
+  if (!sess.bits.has(addr) && sess.bits.size >= MAX_SIM_MEMORY_KEYS) {
+    throw new FileTransformError(`Simulator bit memory limit reached (${MAX_SIM_MEMORY_KEYS} keys)`);
+  }
   sess.bits.set(addr, val);
 }
 
@@ -421,6 +425,9 @@ function writeWord(sess: SimulatorSession, rawAddr: string, val: number): void {
     c.pv = intVal;
     sess.counters.set(addr, c);
     return;
+  }
+  if (!sess.words.has(addr) && sess.words.size >= MAX_SIM_MEMORY_KEYS) {
+    throw new FileTransformError(`Simulator word memory limit reached (${MAX_SIM_MEMORY_KEYS} keys)`);
   }
   sess.words.set(addr, intVal);
 }
@@ -1498,11 +1505,17 @@ function resolveArrayAccess(
   callDepth: number,
   execStats?: StExecStats,
 ): string {
-  return expr.replace(/\b([A-Za-z_][A-Za-z0-9_]*)\[([^\[\]]+)\]/g, (_m, name, idxExpr) => {
-    const idx = Math.trunc(evalStExpression(String(idxExpr), sess, loopVars, callDepth + 1, execStats));
-    const key = `${String(name).toUpperCase()}[${idx}]`;
-    return String(sess.words.get(key) ?? (sess.bits.get(key) ? 1 : 0));
-  });
+  let out = expr;
+  const arrRe = /\b([A-Za-z_][A-Za-z0-9_]*)\[([^\[\]]+)\]/g;
+  for (let pass = 0; pass < 8 && arrRe.test(out); pass++) {
+    arrRe.lastIndex = 0;
+    out = out.replace(arrRe, (_m, name, idxExpr) => {
+      const idx = Math.trunc(evalStExpression(String(idxExpr), sess, loopVars, callDepth + 1, execStats));
+      const key = `${String(name).toUpperCase()}[${idx}]`;
+      return String(sess.words.get(key) ?? (sess.bits.get(key) ? 1 : 0));
+    });
+  }
+  return out;
 }
 
 function evalStExpression(
@@ -1513,7 +1526,9 @@ function evalStExpression(
   execStats?: StExecStats,
 ): number {
   let clean = expr.trim().replace(/\bTRUE\b/gi, '1').replace(/\bFALSE\b/gi, '0');
-  clean = clean.replace(/16#([0-9A-Fa-f]+)/g, (_m, h) => String(parseInt(String(h), 16)));
+  clean = clean.replace(/16#([0-9A-Fa-f_]+)/g, (_m, h) => String(parseInt(String(h).replace(/_/g, ''), 16)));
+  clean = clean.replace(/2#([01_]+)/g, (_m, b) => String(parseInt(String(b).replace(/_/g, ''), 2)));
+  clean = clean.replace(/8#([0-7_]+)/g, (_m, o) => String(parseInt(String(o).replace(/_/g, ''), 8)));
   clean = evalStBuiltinOrCall(clean, sess, loopVars, callDepth, execStats);
   clean = resolveArrayAccess(clean, sess, loopVars, callDepth, execStats);
 
@@ -1572,7 +1587,7 @@ function evalStExpression(
 
   const jsExpr = replaced
     .replace(/<>/g, '!=')
-    .replace(/(?<![<>!])=(?!=)/g, '==');
+    .replace(/(?<![<>!=])=(?!=)/g, '==');
 
   if (!/^[\d\s+\-*/%()&|^!<>=.]+$/.test(jsExpr)) {
     return 0;
@@ -1613,7 +1628,8 @@ function tokenizeStStatements(stCode: string): string[] {
         rest = tail;
         continue;
       }
-      const labelMatch = /^(-?\d+(?:\s*\.\.\s*-?\d+)?(?:\s*,\s*-?\d+)*)\s*:(?!=)\s*(.*)$/.exec(combined);
+      const labelMatch =
+        /^(-?\d+(?:\s*\.\.\s*-?\d+)?(?:\s*,\s*-?\d+(?:\s*\.\.\s*-?\d+)?)*)\s*:(?!=)\s*(.*)$/.exec(combined);
       if (labelMatch) {
         out.push(`CASE_LABEL:${labelMatch[1].trim()}`);
         buf = '';
@@ -1662,6 +1678,9 @@ function assignStLhs(
     const idx = Math.trunc(evalStExpression(arrMatch[2], sess, loopVars ?? new Map()));
     const key = `${arrMatch[1].toUpperCase()}[${idx}]`;
     const intVal = Math.trunc(rhsVal);
+    if (!sess.words.has(key) && sess.words.size >= MAX_SIM_MEMORY_KEYS) {
+      throw new FileTransformError(`Simulator word memory limit reached (${MAX_SIM_MEMORY_KEYS} keys)`);
+    }
     sess.words.set(key, intVal);
     outputsWritten[key] = intVal;
     return;
