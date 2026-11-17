@@ -1,7 +1,13 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { executeMcpTool, getAnnotatedTools, getToolDef, isToolResultError } from './tools.js';
-import { classifyToolError, mcpIdempotency, mcpTelemetry } from './mcpProtocol.js';
+import {
+  ISPSOFT_ERROR_JSON_SCHEMA,
+  buildStandardizedError,
+  classifyToolError,
+  mcpIdempotency,
+  mcpTelemetry,
+} from './mcpProtocol.js';
 import { listSimulatorSessions, monitorSimulator } from './simulator.js';
 import { getWorkspaceStorageStats, listAllFiles, seedDefaultWorkspace } from './workspace.js';
 
@@ -174,6 +180,12 @@ export function listStaticAndDynamicResources() {
       description: 'Live call counts, error rate, latency stats, active simulator sessions, and storage quota.',
       mimeType: 'application/json',
     },
+    {
+      uri: 'ispsoft://schemas/error',
+      name: 'ISPSoft Standardized Error JSON Schema (Draft-07)',
+      description: 'Machine-readable JSON Schema defining error_code, domain, severity, context, and prioritized recovery_actions for AI agents.',
+      mimeType: 'application/schema+json',
+    },
   ];
   for (const filePath of listAllFiles()) {
     if (/\.isp$/i.test(filePath)) {
@@ -216,6 +228,17 @@ export function readMcpResource(uri: string): { contents: Array<{ uri: string; m
     const data = executeMcpTool('ispsoft_server_telemetry', {});
     return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(data, null, 2) }] };
   }
+  if (uri === 'ispsoft://schemas/error') {
+    return {
+      contents: [
+        {
+          uri,
+          mimeType: 'application/schema+json',
+          text: JSON.stringify(ISPSOFT_ERROR_JSON_SCHEMA, null, 2),
+        },
+      ],
+    };
+  }
   const projMatch = /^ispsoft:\/\/projects\/([^/]+)\/(overview|bundle|source)$/.exec(uri);
   if (projMatch) {
     const fileName = decodeURIComponent(projMatch[1]);
@@ -249,15 +272,67 @@ export function handleSingleRpc(
 ): { status: number; body: Record<string, unknown> | null; newSessionId?: string } {
   const id = msg?.id ?? null;
   if (!msg || typeof msg !== 'object' || Array.isArray(msg) || typeof msg.method !== 'string' || !msg.method.trim()) {
+    const message = 'Invalid Request: method is required';
     return {
       status: 400,
-      body: { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request: method is required' } },
+      body: {
+        jsonrpc: '2.0',
+        id: null,
+        error: {
+          code: -32600,
+          message,
+          data: buildStandardizedError({
+            error_code: 'PROTOCOL_INVALID_REQUEST',
+            domain: 'MCP_PROTOCOL',
+            severity: 'ERROR',
+            message,
+            retryable: false,
+            remediation: 'Send a valid JSON-RPC 2.0 request object with a non-empty string "method".',
+            recovery_actions: [
+              {
+                action: 'FIX_INPUT_PARAMETERS',
+                description: 'Provide {"jsonrpc":"2.0","id":1,"method":"initialize"|"tools/list"|"tools/call",...}.',
+                automated: true,
+                priority: 1,
+              },
+            ],
+            context: { rpc_code: -32600 },
+            request_id: ctx.requestId,
+          }),
+        },
+      },
     };
   }
   if (msg.jsonrpc !== undefined && msg.jsonrpc !== '2.0') {
+    const message = 'Invalid Request: jsonrpc must be "2.0"';
     return {
       status: 400,
-      body: { jsonrpc: '2.0', id, error: { code: -32600, message: 'Invalid Request: jsonrpc must be "2.0"' } },
+      body: {
+        jsonrpc: '2.0',
+        id,
+        error: {
+          code: -32600,
+          message,
+          data: buildStandardizedError({
+            error_code: 'PROTOCOL_INVALID_REQUEST',
+            domain: 'MCP_PROTOCOL',
+            severity: 'ERROR',
+            message,
+            retryable: false,
+            remediation: 'Set "jsonrpc": "2.0" on all MCP messages.',
+            recovery_actions: [
+              {
+                action: 'FIX_INPUT_PARAMETERS',
+                description: 'Include "jsonrpc": "2.0" in the request payload and retry.',
+                automated: true,
+                priority: 1,
+              },
+            ],
+            context: { rpc_code: -32600, received_jsonrpc: msg.jsonrpc },
+            request_id: ctx.requestId,
+          }),
+        },
+      },
     };
   }
 
@@ -265,9 +340,35 @@ export function handleSingleRpc(
     msg.params !== undefined &&
     (msg.params === null || typeof msg.params !== 'object' || Array.isArray(msg.params))
   ) {
+    const message = 'Invalid params: expected JSON object';
     return {
       status: 200,
-      body: { jsonrpc: '2.0', id, error: { code: -32602, message: 'Invalid params: expected JSON object' } },
+      body: {
+        jsonrpc: '2.0',
+        id,
+        error: {
+          code: -32602,
+          message,
+          data: buildStandardizedError({
+            error_code: 'PROTOCOL_INVALID_PARAMS',
+            domain: 'MCP_PROTOCOL',
+            severity: 'ERROR',
+            message,
+            retryable: false,
+            remediation: 'Pass MCP method parameters as a JSON object ({}), not an array or primitive.',
+            recovery_actions: [
+              {
+                action: 'FIX_INPUT_PARAMETERS',
+                description: 'Wrap method arguments inside a JSON object in "params".',
+                automated: true,
+                priority: 1,
+              },
+            ],
+            context: { rpc_code: -32602, method: msg.method },
+            request_id: ctx.requestId,
+          }),
+        },
+      },
     };
   }
   const paramsObj = (msg.params ?? {}) as Record<string, unknown>;
@@ -380,16 +481,68 @@ export function handleSingleRpc(
   if (msg.method === 'resources/read') {
     const uri = String(paramsObj.uri ?? '');
     if (!uri) {
+      const message = 'Invalid params: uri is required';
       return {
         status: 200,
-        body: { jsonrpc: '2.0', id, error: { code: -32602, message: 'Invalid params: uri is required' } },
+        body: {
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: -32602,
+            message,
+            data: buildStandardizedError({
+              error_code: 'PROTOCOL_INVALID_PARAMS',
+              domain: 'MCP_PROTOCOL',
+              severity: 'ERROR',
+              message,
+              retryable: false,
+              remediation: 'Provide params.uri from resources/list or resources/templates/list.',
+              recovery_actions: [
+                {
+                  action: 'CREATE_OR_LIST_RESOURCE',
+                  description: 'Call resources/list or resources/templates/list to obtain valid ispsoft:// URIs.',
+                  automated: true,
+                  priority: 1,
+                },
+              ],
+              context: { rpc_code: -32602, method: 'resources/read' },
+              request_id: ctx.requestId,
+            }),
+          },
+        },
       };
     }
     const content = readMcpResource(uri);
     if (!content) {
+      const message = `Resource not found: ${uri}`;
       return {
         status: 200,
-        body: { jsonrpc: '2.0', id, error: { code: -32002, message: `Resource not found: ${uri}` } },
+        body: {
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: -32002,
+            message,
+            data: buildStandardizedError({
+              error_code: 'PROTOCOL_RESOURCE_NOT_FOUND',
+              domain: 'MCP_PROTOCOL',
+              severity: 'ERROR',
+              message,
+              retryable: false,
+              remediation: 'Verify the resource URI against resources/list or check /workspace files.',
+              recovery_actions: [
+                {
+                  action: 'CREATE_OR_LIST_RESOURCE',
+                  description: 'Call resources/list to inspect available static and dynamic ispsoft:// resources.',
+                  automated: true,
+                  priority: 1,
+                },
+              ],
+              context: { rpc_code: -32002, uri },
+              request_id: ctx.requestId,
+            }),
+          },
+        },
       };
     }
     return { status: 200, body: { jsonrpc: '2.0', id, result: content } };
@@ -401,9 +554,35 @@ export function handleSingleRpc(
     const name = String(paramsObj.name ?? '');
     const prompt = buildPromptMessages(name, (paramsObj.arguments as Record<string, unknown>) ?? {});
     if (!prompt) {
+      const message = `Unknown prompt: ${name}`;
       return {
         status: 200,
-        body: { jsonrpc: '2.0', id, error: { code: -32602, message: `Unknown prompt: ${name}` } },
+        body: {
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: -32602,
+            message,
+            data: buildStandardizedError({
+              error_code: 'PROTOCOL_INVALID_PARAMS',
+              domain: 'MCP_PROTOCOL',
+              severity: 'ERROR',
+              message,
+              retryable: false,
+              remediation: 'Call prompts/list to retrieve valid prompt names.',
+              recovery_actions: [
+                {
+                  action: 'CREATE_OR_LIST_RESOURCE',
+                  description: 'Invoke prompts/list to discover available workflow prompt templates.',
+                  automated: true,
+                  priority: 1,
+                },
+              ],
+              context: { rpc_code: -32602, prompt: name },
+              request_id: ctx.requestId,
+            }),
+          },
+        },
       };
     }
     return { status: 200, body: { jsonrpc: '2.0', id, result: prompt } };
@@ -437,12 +616,49 @@ export function handleSingleRpc(
     const rawArgs = paramsObj.arguments == null ? {} : paramsObj.arguments;
     const found = getToolDef(toolName);
     if (!found) {
+      const classified = classifyToolError(
+        {
+          error_code: 'NOT_FOUND',
+          error: `Unknown MCP tool: ${toolName}`,
+        },
+        { tool: toolName, request_id: ctx.requestId },
+      );
+      // If it matches a legacy hardware tool stub, emit HARDWARE_NOT_QUALIFIED guidance in error.data
+      const stubCheck = executeMcpTool(toolName, {}, ctx.requestId);
+      const errDetail =
+        stubCheck.error_code === 'HARDWARE_NOT_QUALIFIED' && stubCheck.error_detail
+          ? stubCheck.error_detail
+          : buildStandardizedError({
+              error_code: 'PROTOCOL_INVALID_PARAMS',
+              domain: 'MCP_PROTOCOL',
+              severity: 'ERROR',
+              message: `Unknown MCP tool: ${toolName}`,
+              retryable: false,
+              remediation: 'Call tools/list to inspect the 60 active headless ISPSoft MCP tools.',
+              recovery_actions: [
+                {
+                  action: 'FALLBACK_TO_TOOL',
+                  description: 'Inspect capabilities or call tools/list for valid tool names.',
+                  suggested_tool: 'ispsoft_get_capabilities',
+                  suggested_arguments: {},
+                  automated: true,
+                  priority: 1,
+                },
+              ],
+              context: { rpc_code: -32602, requested_tool: toolName, fallback_code: classified.error_code },
+              request_id: ctx.requestId,
+              tool: toolName,
+            });
       return {
         status: 200,
         body: {
           jsonrpc: '2.0',
           id,
-          error: { code: -32602, message: `Unknown MCP tool: ${toolName}` },
+          error: {
+            code: -32602,
+            message: `Unknown MCP tool: ${toolName}`,
+            data: errDetail,
+          },
         },
       };
     }
@@ -461,26 +677,32 @@ export function handleSingleRpc(
       const cached = mcpIdempotency.get(toolName, idempotencyKey, rawArgs as Record<string, unknown>);
       if (cached.hit) {
         if (cached.conflict) {
-          output = {
+          const baseErr = {
             success: false,
             status: 'IDEMPOTENCY_CONFLICT',
             error_code: 'IDEMPOTENCY_CONFLICT',
-            retryable: false,
             error: `Idempotency-Key "${idempotencyKey}" was already used with different arguments for ${toolName}.`,
-            remediation: 'Use a new Idempotency-Key for distinct arguments.',
+          };
+          const classified = classifyToolError(baseErr, { tool: toolName, args: rawArgs as Record<string, unknown>, request_id: ctx.requestId });
+          output = {
+            ...baseErr,
+            retryable: classified.retryable,
+            remediation: classified.remediation,
+            recovery_actions: classified.recovery_actions,
+            error_detail: classified.error_detail,
           };
         } else {
           output = cached.response!;
           idempotentReplay = true;
         }
       } else {
-        output = executeMcpTool(toolName, rawArgs as Record<string, unknown>);
+        output = executeMcpTool(toolName, rawArgs as Record<string, unknown>, ctx.requestId);
         if (!isToolResultError(output)) {
           mcpIdempotency.set(toolName, idempotencyKey, rawArgs as Record<string, unknown>, output);
         }
       }
     } else {
-      output = executeMcpTool(toolName, rawArgs as Record<string, unknown>);
+      output = executeMcpTool(toolName, rawArgs as Record<string, unknown>, ctx.requestId);
     }
 
     const durationMs = Math.round((Number(process.hrtime.bigint() - t0) / 1_000_000) * 1000) / 1000;
@@ -522,12 +744,34 @@ export function handleSingleRpc(
       },
     };
   }
+  const methodMsg = `Method not found: ${msg.method}`;
   return {
     status: 200,
     body: {
       jsonrpc: '2.0',
       id,
-      error: { code: -32601, message: `Method not found: ${msg.method}` },
+      error: {
+        code: -32601,
+        message: methodMsg,
+        data: buildStandardizedError({
+          error_code: 'PROTOCOL_METHOD_NOT_FOUND',
+          domain: 'MCP_PROTOCOL',
+          severity: 'ERROR',
+          message: methodMsg,
+          retryable: false,
+          remediation: 'Use supported MCP JSON-RPC methods: initialize, ping, tools/list, tools/call, resources/list, resources/templates/list, resources/read, prompts/list, prompts/get, completion/complete, logging/setLevel.',
+          recovery_actions: [
+            {
+              action: 'FIX_INPUT_PARAMETERS',
+              description: 'Retry using a supported MCP method name such as tools/list or tools/call.',
+              automated: true,
+              priority: 1,
+            },
+          ],
+          context: { rpc_code: -32601, method: msg.method },
+          request_id: ctx.requestId,
+        }),
+      },
     },
   };
 }

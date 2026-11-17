@@ -5,11 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { evaluateSafeNumericExpr } from './safeExpr.js';
 import {
+  ISPSOFT_ERROR_JSON_SCHEMA,
   IdempotencyCache,
   McpTelemetryTracker,
   classifyToolError,
   deriveToolAnnotations,
   sanitizeJsonValue,
+  validateStandardizedError,
   validateToolArguments,
 } from './mcpProtocol.js';
 import {
@@ -457,5 +459,93 @@ test('simulator evaluates ==, <>, nested arrays, CASE multi-ranges, radix litera
     else process.env.ISPSOFT_WORK_DIR = prevWorkDir;
     seedDefaultWorkspace();
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('all ISPSoft communication, Modbus, OCC, container, simulator, and MCP protocol errors conform to ISPSOFT_ERROR_JSON_SCHEMA with recovery actions', async () => {
+  const { executeMcpTool } = await import('./tools.js');
+  const { handleSingleRpc } = await import('./mcpServer.js');
+
+  assert.equal(ISPSOFT_ERROR_JSON_SCHEMA.$id, 'ispsoft://schemas/error');
+
+  // 1. Capabilities advertises schema & ispsoft://schemas/error resource is readable
+  const caps = executeMcpTool('ispsoft_get_capabilities', {});
+  assert.equal((caps.error_schema as Record<string, unknown>).uri, 'ispsoft://schemas/error');
+  const schemaRpc = handleSingleRpc(
+    { jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri: 'ispsoft://schemas/error' } },
+    { requestId: 'err-test-1' },
+  );
+  const schemaText = String((((schemaRpc.body?.result as Record<string, unknown>).contents as Array<Record<string, unknown>>)[0]).text);
+  assert.equal(JSON.parse(schemaText).$id, 'ispsoft://schemas/error');
+
+  // 2. Native hardware / COMMGR stub error -> HARDWARE_NOT_QUALIFIED + FALLBACK_TO_SIMULATOR
+  const hwErr = executeMcpTool('ispsoft_connect', { project_path: '/workspace/sample_es2.isp' }, 'req-hw');
+  assert.equal(hwErr.success, false);
+  assert.equal(hwErr.error_code, 'HARDWARE_NOT_QUALIFIED');
+  assert.equal(validateStandardizedError(hwErr.error_detail).valid, true);
+  assert.equal((hwErr.error_detail as Record<string, unknown>).domain, 'HARDWARE_TRANSPORT');
+  const hwActions = ((hwErr.error_detail as Record<string, unknown>).recovery_actions as Array<Record<string, unknown>>);
+  assert.equal(hwActions[0].action, 'FALLBACK_TO_SIMULATOR');
+  assert.equal(hwActions[0].suggested_tool, 'ispsoft_sim_start');
+
+  // 3. Modbus address error -> MODBUS_ADDRESS_ERROR + FIX_INPUT_PARAMETERS + ispsoft_get_memory_usage_map
+  const modErr = executeMcpTool('ispsoft_map_dvp_modbus_addresses', { model: 'ES2', addresses: ['X89'] }, 'req-mod');
+  assert.equal(modErr.success, false);
+  assert.equal(modErr.error_code, 'MODBUS_ADDRESS_ERROR');
+  assert.equal(validateStandardizedError(modErr.error_detail).valid, true);
+  assert.equal((modErr.error_detail as Record<string, unknown>).domain, 'MODBUS_COMM');
+  const modItem = (modErr.mappings as Array<Record<string, unknown>>)[0];
+  assert.equal(modItem.error_code, 'MODBUS_ADDRESS_ERROR');
+  assert.equal(validateStandardizedError(modItem.error_detail).valid, true);
+
+  // 4. OCC Hash Mismatch -> CONFLICT_HASH_MISMATCH + REFRESH_STATE_AND_RETRY
+  const occErr = executeMcpTool(
+    'ispsoft_compile_and_check',
+    { project_path: '/workspace/sample_es2.isp', expected_content_hash: 'isp:sha256:stale_hash' },
+    'req-occ',
+  );
+  assert.equal(occErr.success, false);
+  assert.equal(occErr.error_code, 'CONFLICT_HASH_MISMATCH');
+  assert.equal(validateStandardizedError(occErr.error_detail).valid, true);
+  assert.equal((occErr.error_detail as Record<string, unknown>).retryable, true);
+  assert.equal(
+    (((occErr.error_detail as Record<string, unknown>).recovery_actions as Array<Record<string, unknown>>)[0]).suggested_tool,
+    'ispsoft_inspect_project',
+  );
+
+  // 5. Validation error on REJECTED_BEFORE_WRITE (must NOT misclassify as CONFLICT_HASH_MISMATCH)
+  const ldValErr = executeMcpTool(
+    'ispsoft_write_ld_network_candidate',
+    { project_path: '/workspace/sample_es2.isp', pou_name: 'Prog0', network_index: 0, il_program: 'LD X0', model: 'ES2' },
+    'req-val',
+  );
+  assert.equal(ldValErr.success, false);
+  assert.equal(ldValErr.error_code, 'VALIDATION_ERROR');
+  assert.equal(validateStandardizedError(ldValErr.error_detail).valid, true);
+
+  // 6. Security path traversal -> SECURITY_BLOCKED
+  const secErr = executeMcpTool('ispsoft_inspect_project', { project_path: '/etc/passwd' }, 'req-sec');
+  assert.equal(secErr.success, false);
+  assert.equal(secErr.error_code, 'SECURITY_BLOCKED');
+  assert.equal(validateStandardizedError(secErr.error_detail).valid, true);
+
+  // 7. Unknown simulator session -> SIM_SESSION_NOT_FOUND
+  const simErr = executeMcpTool('ispsoft_sim_monitor', { session_id: 'sim-nonexistent' }, 'req-sim');
+  assert.equal(simErr.success, false);
+  assert.equal(simErr.error_code, 'SIM_SESSION_NOT_FOUND');
+  assert.equal(validateStandardizedError(simErr.error_detail).valid, true);
+
+  // 8. JSON-RPC protocol errors carry standardized error_detail in error.data
+  const rpcCases = [
+    handleSingleRpc({ jsonrpc: '2.0', id: 10, method: 'unknown/method' }, { requestId: 'rpc-1' }),
+    handleSingleRpc({ jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'ispsoft_connect' } }, { requestId: 'rpc-2' }),
+    handleSingleRpc({ jsonrpc: '2.0', id: 12, method: 'resources/read', params: { uri: 'ispsoft://projects/missing.isp/overview' } }, { requestId: 'rpc-3' }),
+    handleSingleRpc({ jsonrpc: '2.0', id: 13, method: '' }, { requestId: 'rpc-4' }),
+  ];
+  for (const res of rpcCases) {
+    const errObj = res.body?.error as Record<string, unknown>;
+    assert.ok(errObj && errObj.data, `Expected standardized error.data on RPC error: ${JSON.stringify(res.body)}`);
+    const check = validateStandardizedError(errObj.data);
+    assert.equal(check.valid, true, `Invalid RPC error_detail: ${check.errors.join(', ')}`);
   }
 });

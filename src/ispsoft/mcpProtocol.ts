@@ -23,9 +23,241 @@ export type StandardErrorCode =
   | 'SIM_SESSION_NOT_FOUND'
   | 'SIM_ASSERTION_FAILED'
   | 'HARDWARE_NOT_QUALIFIED'
+  | 'MODBUS_ADDRESS_ERROR'
+  | 'CONTAINER_CORRUPT'
   | 'SECURITY_BLOCKED'
   | 'IDEMPOTENCY_CONFLICT'
+  | 'AUTH_UNAUTHORIZED'
+  | 'PROTOCOL_PARSE_ERROR'
+  | 'PROTOCOL_INVALID_REQUEST'
+  | 'PROTOCOL_METHOD_NOT_FOUND'
+  | 'PROTOCOL_INVALID_PARAMS'
+  | 'PROTOCOL_RESOURCE_NOT_FOUND'
   | 'INTERNAL_ERROR';
+
+export type ErrorDomain =
+  | 'MCP_PROTOCOL'
+  | 'AUTH'
+  | 'VALIDATION'
+  | 'WORKSPACE_IO'
+  | 'PROJECT_CONTAINER'
+  | 'AUTHORING_OCC'
+  | 'COMPILER_SYNTAX'
+  | 'MODBUS_COMM'
+  | 'HARDWARE_TRANSPORT'
+  | 'SIMULATOR'
+  | 'QUOTA_LIMIT'
+  | 'INTERNAL';
+
+export type ErrorSeverity = 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL';
+
+export type RecoveryActionType =
+  | 'RETRY_IMMEDIATE'
+  | 'RETRY_WITH_BACKOFF'
+  | 'REFRESH_STATE_AND_RETRY'
+  | 'FIX_INPUT_PARAMETERS'
+  | 'RUN_DIAGNOSTIC_OR_CHECK'
+  | 'FALLBACK_TO_SIMULATOR'
+  | 'FALLBACK_TO_TOOL'
+  | 'CREATE_OR_LIST_RESOURCE'
+  | 'CLOSE_IDLE_RESOURCES'
+  | 'AUTHENTICATE'
+  | 'NONE';
+
+export interface RecoveryAction {
+  action: RecoveryActionType;
+  description: string;
+  suggested_tool?: string;
+  suggested_arguments?: Record<string, unknown>;
+  automated: boolean;
+  priority: number;
+}
+
+export interface StandardizedErrorEnvelope {
+  schema_version: '1.0.0';
+  error_code: StandardErrorCode;
+  domain: ErrorDomain;
+  severity: ErrorSeverity;
+  message: string;
+  retryable: boolean;
+  remediation: string;
+  recovery_actions: RecoveryAction[];
+  context?: Record<string, unknown>;
+  timestamp: string;
+  request_id?: string;
+  tool?: string;
+}
+
+export const STANDARD_ERROR_CODES: readonly StandardErrorCode[] = [
+  'VALIDATION_ERROR',
+  'NOT_FOUND',
+  'CONFLICT_HASH_MISMATCH',
+  'UNSUPPORTED_MODEL',
+  'SYNTAX_ERROR',
+  'RESOURCE_LIMIT',
+  'SIM_SESSION_NOT_FOUND',
+  'SIM_ASSERTION_FAILED',
+  'HARDWARE_NOT_QUALIFIED',
+  'MODBUS_ADDRESS_ERROR',
+  'CONTAINER_CORRUPT',
+  'SECURITY_BLOCKED',
+  'IDEMPOTENCY_CONFLICT',
+  'AUTH_UNAUTHORIZED',
+  'PROTOCOL_PARSE_ERROR',
+  'PROTOCOL_INVALID_REQUEST',
+  'PROTOCOL_METHOD_NOT_FOUND',
+  'PROTOCOL_INVALID_PARAMS',
+  'PROTOCOL_RESOURCE_NOT_FOUND',
+  'INTERNAL_ERROR',
+];
+
+export const ERROR_DOMAINS: readonly ErrorDomain[] = [
+  'MCP_PROTOCOL',
+  'AUTH',
+  'VALIDATION',
+  'WORKSPACE_IO',
+  'PROJECT_CONTAINER',
+  'AUTHORING_OCC',
+  'COMPILER_SYNTAX',
+  'MODBUS_COMM',
+  'HARDWARE_TRANSPORT',
+  'SIMULATOR',
+  'QUOTA_LIMIT',
+  'INTERNAL',
+];
+
+export const ERROR_SEVERITIES: readonly ErrorSeverity[] = ['INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+
+export const RECOVERY_ACTION_TYPES: readonly RecoveryActionType[] = [
+  'RETRY_IMMEDIATE',
+  'RETRY_WITH_BACKOFF',
+  'REFRESH_STATE_AND_RETRY',
+  'FIX_INPUT_PARAMETERS',
+  'RUN_DIAGNOSTIC_OR_CHECK',
+  'FALLBACK_TO_SIMULATOR',
+  'FALLBACK_TO_TOOL',
+  'CREATE_OR_LIST_RESOURCE',
+  'CLOSE_IDLE_RESOURCES',
+  'AUTHENTICATE',
+  'NONE',
+];
+
+export const ISPSOFT_ERROR_JSON_SCHEMA: Record<string, unknown> = {
+  $schema: 'http://json-schema.org/draft-07/schema#',
+  $id: 'ispsoft://schemas/error',
+  title: 'ISPSoftStandardizedError',
+  description:
+    'Machine-readable fault envelope emitted for all ISPSoft MCP communication, transport, protocol, authoring, Modbus, and Soft-PLC simulation errors, with prioritized recovery actions for AI agents.',
+  type: 'object',
+  required: [
+    'schema_version',
+    'error_code',
+    'domain',
+    'severity',
+    'message',
+    'retryable',
+    'remediation',
+    'recovery_actions',
+    'timestamp',
+  ],
+  additionalProperties: false,
+  properties: {
+    schema_version: { type: 'string', enum: ['1.0.0'] },
+    error_code: { type: 'string', enum: [...STANDARD_ERROR_CODES] },
+    domain: { type: 'string', enum: [...ERROR_DOMAINS] },
+    severity: { type: 'string', enum: [...ERROR_SEVERITIES] },
+    message: { type: 'string', minLength: 1 },
+    retryable: { type: 'boolean' },
+    remediation: { type: 'string', minLength: 1 },
+    recovery_actions: {
+      type: 'array',
+      minItems: 1,
+      items: {
+        type: 'object',
+        required: ['action', 'description', 'automated', 'priority'],
+        additionalProperties: false,
+        properties: {
+          action: { type: 'string', enum: [...RECOVERY_ACTION_TYPES] },
+          description: { type: 'string', minLength: 1 },
+          suggested_tool: { type: 'string' },
+          suggested_arguments: { type: 'object', additionalProperties: { description: 'Pre-filled tool argument value' } },
+          automated: { type: 'boolean' },
+          priority: { type: 'integer', minimum: 1 },
+        },
+      },
+    },
+    context: {
+      type: 'object',
+      additionalProperties: { description: 'Structured diagnostic context fields (hashes, paths, device addresses, rpc codes)' },
+    },
+    timestamp: { type: 'string', minLength: 1 },
+    request_id: { type: 'string' },
+    tool: { type: 'string' },
+  },
+};
+
+export function validateStandardizedError(payload: unknown): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { valid: false, errors: ['Error envelope must be a JSON object'] };
+  }
+  const obj = payload as Record<string, unknown>;
+  const allowedTop = new Set([
+    'schema_version',
+    'error_code',
+    'domain',
+    'severity',
+    'message',
+    'retryable',
+    'remediation',
+    'recovery_actions',
+    'context',
+    'timestamp',
+    'request_id',
+    'tool',
+  ]);
+  for (const k of Object.keys(obj)) {
+    if (!allowedTop.has(k)) errors.push(`Unexpected property '${k}'`);
+  }
+  if (obj.schema_version !== '1.0.0') errors.push('schema_version must be "1.0.0"');
+  if (!STANDARD_ERROR_CODES.includes(obj.error_code as StandardErrorCode)) {
+    errors.push(`Invalid error_code: ${String(obj.error_code)}`);
+  }
+  if (!ERROR_DOMAINS.includes(obj.domain as ErrorDomain)) {
+    errors.push(`Invalid domain: ${String(obj.domain)}`);
+  }
+  if (!ERROR_SEVERITIES.includes(obj.severity as ErrorSeverity)) {
+    errors.push(`Invalid severity: ${String(obj.severity)}`);
+  }
+  if (typeof obj.message !== 'string' || !obj.message.trim()) errors.push('message must be a non-empty string');
+  if (typeof obj.retryable !== 'boolean') errors.push('retryable must be a boolean');
+  if (typeof obj.remediation !== 'string' || !obj.remediation.trim()) {
+    errors.push('remediation must be a non-empty string');
+  }
+  if (typeof obj.timestamp !== 'string' || !obj.timestamp.trim()) errors.push('timestamp must be a non-empty string');
+  if (!Array.isArray(obj.recovery_actions) || obj.recovery_actions.length < 1) {
+    errors.push('recovery_actions must be a non-empty array');
+  } else {
+    for (let i = 0; i < obj.recovery_actions.length; i++) {
+      const ra = obj.recovery_actions[i] as Record<string, unknown>;
+      if (!ra || typeof ra !== 'object' || Array.isArray(ra)) {
+        errors.push(`recovery_actions[${i}] must be an object`);
+        continue;
+      }
+      if (!RECOVERY_ACTION_TYPES.includes(ra.action as RecoveryActionType)) {
+        errors.push(`recovery_actions[${i}].action invalid: ${String(ra.action)}`);
+      }
+      if (typeof ra.description !== 'string' || !ra.description.trim()) {
+        errors.push(`recovery_actions[${i}].description must be non-empty string`);
+      }
+      if (typeof ra.automated !== 'boolean') errors.push(`recovery_actions[${i}].automated must be boolean`);
+      if (typeof ra.priority !== 'number' || !Number.isInteger(ra.priority) || ra.priority < 1) {
+        errors.push(`recovery_actions[${i}].priority must be integer >= 1`);
+      }
+    }
+  }
+  return { valid: errors.length === 0, errors };
+}
 
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -150,93 +382,533 @@ export function validateToolArguments(
   return { valid: errors.length === 0, errors };
 }
 
+export interface ErrorClassification {
+  error_code: StandardErrorCode;
+  domain: ErrorDomain;
+  severity: ErrorSeverity;
+  retryable: boolean;
+  remediation: string;
+  recovery_actions: RecoveryAction[];
+}
+
+export function buildStandardizedError(input: {
+  error_code: StandardErrorCode;
+  domain: ErrorDomain;
+  severity?: ErrorSeverity;
+  message: string;
+  retryable: boolean;
+  remediation: string;
+  recovery_actions: RecoveryAction[];
+  context?: Record<string, unknown>;
+  request_id?: string;
+  tool?: string;
+}): StandardizedErrorEnvelope {
+  const actions: RecoveryAction[] =
+    input.recovery_actions.length > 0
+      ? input.recovery_actions
+      : [{ action: 'NONE', description: input.remediation, automated: false, priority: 1 }];
+  const envelope: StandardizedErrorEnvelope = {
+    schema_version: '1.0.0',
+    error_code: input.error_code,
+    domain: input.domain,
+    severity: input.severity ?? 'ERROR',
+    message: input.message || input.remediation,
+    retryable: input.retryable,
+    remediation: input.remediation,
+    recovery_actions: actions,
+    timestamp: new Date().toISOString(),
+  };
+  if (input.context && Object.keys(input.context).length > 0) envelope.context = input.context;
+  if (input.request_id) envelope.request_id = input.request_id;
+  if (input.tool) envelope.tool = input.tool;
+  return envelope;
+}
+
 export function classifyToolError(
   output: Record<string, unknown>,
-): { error_code: StandardErrorCode; retryable: boolean; remediation: string } {
+  meta?: { tool?: string; args?: Record<string, unknown>; request_id?: string },
+): ErrorClassification & { error_detail: StandardizedErrorEnvelope } {
+  const existingCode = typeof output.error_code === 'string' ? (output.error_code as StandardErrorCode) : undefined;
   const status = String(output.status ?? '').toUpperCase();
   const failureCategory = String(output.failure_category ?? '').toLowerCase();
-  const msg = String(output.error ?? (Array.isArray(output.errors) ? output.errors[0] : '') ?? '').toLowerCase();
+  const rawMsg =
+    (typeof output.error === 'string' && output.error) ||
+    (Array.isArray(output.errors) && output.errors.length ? String(output.errors[0]) : '') ||
+    (status ? `${status}` : 'Operation failed');
+  const msg = rawMsg.toLowerCase();
+  const toolName = meta?.tool ?? (typeof output.tool === 'string' ? output.tool : undefined);
+  const projectPath = typeof meta?.args?.project_path === 'string' ? meta.args.project_path : undefined;
+  const sessionId = typeof meta?.args?.session_id === 'string' ? meta.args.session_id : undefined;
 
-  if (status === 'REJECTED_BEFORE_WRITE' || failureCategory === 'state_changed' || msg.includes('hash')) {
-    return {
-      error_code: 'CONFLICT_HASH_MISMATCH',
-      retryable: true,
-      remediation: 'Re-read the project or POU to obtain the latest content_hash, then retry.',
-    };
-  }
-  if (status === 'UNSUPPORTED_MODEL' || status === 'MODEL_NOT_QUALIFIED' || msg.includes('unsupported model')) {
-    return {
-      error_code: 'UNSUPPORTED_MODEL',
+  const context: Record<string, unknown> = {};
+  if (status) context.status = status;
+  if (failureCategory) context.failure_category = failureCategory;
+  if (projectPath) context.project_path = projectPath;
+  if (sessionId) context.session_id = sessionId;
+  if (output.current_content_hash) context.current_content_hash = output.current_content_hash;
+  if (output.pou_content_hash) context.pou_content_hash = output.pou_content_hash;
+  if (output.validation_errors) context.validation_errors = output.validation_errors;
+  if (output.model) context.model = output.model;
+
+  const finalize = (c: ErrorClassification): ErrorClassification & { error_detail: StandardizedErrorEnvelope } => ({
+    ...c,
+    error_detail: buildStandardizedError({
+      error_code: c.error_code,
+      domain: c.domain,
+      severity: c.severity,
+      message: rawMsg,
+      retryable: c.retryable,
+      remediation: c.remediation,
+      recovery_actions: c.recovery_actions,
+      context,
+      request_id: meta?.request_id,
+      tool: toolName,
+    }),
+  });
+
+  if (existingCode === 'IDEMPOTENCY_CONFLICT' || status === 'IDEMPOTENCY_CONFLICT') {
+    return finalize({
+      error_code: 'IDEMPOTENCY_CONFLICT',
+      domain: 'MCP_PROTOCOL',
+      severity: 'WARNING',
       retryable: false,
-      remediation: 'Call ispsoft_list_supported_plc_types to pick a supported canonical model name.',
-    };
+      remediation: 'Generate a fresh Idempotency-Key header or _meta.idempotency_key when changing tool arguments.',
+      recovery_actions: [
+        {
+          action: 'FIX_INPUT_PARAMETERS',
+          description: 'Supply a new unique Idempotency-Key for distinct arguments, or omit Idempotency-Key for non-replayed calls.',
+          automated: true,
+          priority: 1,
+        },
+      ],
+    });
   }
-  if (status === 'TRANSPORT_NOT_QUALIFIED' || status === 'WINDOWS_GUI_UNAVAILABLE' || status === 'UNAVAILABLE_ON_LINUX') {
-    return {
-      error_code: 'HARDWARE_NOT_QUALIFIED',
-      retryable: false,
-      remediation: 'Use Soft-PLC simulator tools (ispsoft_sim_*) or offline project tools on Linux.',
-    };
-  }
-  if (status === 'BLOCKED' || msg.includes('unsafe') || msg.includes('traversal') || msg.includes('blocked')) {
-    return {
-      error_code: 'SECURITY_BLOCKED',
-      retryable: false,
-      remediation: 'Check workspace path rules and live-write safety environment guards.',
-    };
-  }
-  if (status === 'SEQUENCE_ASSERTION_FAILED') {
-    return {
-      error_code: 'SIM_ASSERTION_FAILED',
-      retryable: false,
-      remediation: 'Inspect sequence step observed vs expected values and adjust PLC logic or test stimulus.',
-    };
-  }
-  if (msg.includes('unknown simulator session') || status === 'SESSION_NOT_FOUND') {
-    return {
-      error_code: 'SIM_SESSION_NOT_FOUND',
-      retryable: false,
-      remediation: 'Call ispsoft_sim_list or start a new session with ispsoft_sim_start.',
-    };
-  }
-  if (msg.includes('file not found') || msg.includes('not found')) {
-    return {
-      error_code: 'NOT_FOUND',
-      retryable: false,
-      remediation: 'Call ispsoft_list_projects or inspect project overview to verify target paths and POU names.',
-    };
-  }
-  if (msg.includes('limit') || msg.includes('quota') || msg.includes('maximum') || msg.includes('exceeds')) {
-    return {
-      error_code: 'RESOURCE_LIMIT',
-      retryable: true,
-      remediation: 'Reduce batch/file/session count or close idle simulator sessions and clean up backups.',
-    };
-  }
+
   if (
+    existingCode === 'HARDWARE_NOT_QUALIFIED' ||
+    status === 'TRANSPORT_NOT_QUALIFIED' ||
+    status === 'WINDOWS_GUI_UNAVAILABLE' ||
+    status === 'UNAVAILABLE_ON_LINUX' ||
+    msg.includes('commgr') ||
+    msg.includes('hardware connection')
+  ) {
+    return finalize({
+      error_code: 'HARDWARE_NOT_QUALIFIED',
+      domain: 'HARDWARE_TRANSPORT',
+      severity: 'WARNING',
+      retryable: false,
+      remediation: 'Native Windows ISPSoft / COMMGR / physical PLC transport is unavailable in headless Linux mode. Use Soft-PLC simulator tools (ispsoft_sim_*) or offline static check tools.',
+      recovery_actions: [
+        {
+          action: 'FALLBACK_TO_SIMULATOR',
+          description: 'Run and monitor the PLC project in the isolated deterministic Soft-PLC simulator.',
+          suggested_tool: 'ispsoft_sim_start',
+          suggested_arguments: projectPath ? { project_path: projectPath } : undefined,
+          automated: true,
+          priority: 1,
+        },
+        {
+          action: 'FALLBACK_TO_TOOL',
+          description: 'Verify logic and IEC/DVP compliance offline with static compile checks.',
+          suggested_tool: 'ispsoft_static_check_and_compile',
+          suggested_arguments: projectPath ? { project_path: projectPath } : undefined,
+          automated: true,
+          priority: 2,
+        },
+      ],
+    });
+  }
+
+  if (
+    existingCode === 'CONFLICT_HASH_MISMATCH' ||
+    failureCategory === 'state_changed' ||
+    status === 'REJECTED_BEFORE_COMPILE' ||
+    (status === 'REJECTED_BEFORE_WRITE' && !output.validation_errors && !msg.includes('network_index') && !msg.includes('st not qualified') && !msg.includes('invalid model')) ||
+    msg.includes('modified concurrently') ||
+    msg.includes('hash mismatch')
+  ) {
+    return finalize({
+      error_code: 'CONFLICT_HASH_MISMATCH',
+      domain: 'AUTHORING_OCC',
+      severity: 'WARNING',
+      retryable: true,
+      remediation: 'Re-read the project or POU to obtain the latest content_hash, then retry the mutation.',
+      recovery_actions: [
+        {
+          action: 'REFRESH_STATE_AND_RETRY',
+          description: 'Inspect the project to fetch the current content_hash before re-applying the edit.',
+          suggested_tool: 'ispsoft_inspect_project',
+          suggested_arguments: projectPath ? { project_path: projectPath } : undefined,
+          automated: true,
+          priority: 1,
+        },
+        {
+          action: 'RETRY_IMMEDIATE',
+          description: 'Re-submit the edit with expected_content_hash updated to current_content_hash.',
+          suggested_tool: toolName,
+          automated: true,
+          priority: 2,
+        },
+      ],
+    });
+  }
+
+  if (
+    existingCode === 'UNSUPPORTED_MODEL' ||
+    status === 'UNSUPPORTED_MODEL' ||
+    status === 'MODEL_NOT_QUALIFIED' ||
+    msg.includes('unsupported model') ||
+    msg.includes('qualified only for dvp es2')
+  ) {
+    return finalize({
+      error_code: 'UNSUPPORTED_MODEL',
+      domain: 'VALIDATION',
+      severity: 'ERROR',
+      retryable: false,
+      remediation: 'Call ispsoft_list_supported_plc_types to select a qualified canonical Delta PLC model.',
+      recovery_actions: [
+        {
+          action: 'FALLBACK_TO_TOOL',
+          description: 'List supported canonical Delta AS/DVP PLC models and capabilities.',
+          suggested_tool: 'ispsoft_list_supported_plc_types',
+          suggested_arguments: {},
+          automated: true,
+          priority: 1,
+        },
+      ],
+    });
+  }
+
+  if (
+    existingCode === 'MODBUS_ADDRESS_ERROR' ||
+    toolName === 'ispsoft_map_dvp_modbus_addresses' ||
+    msg.includes('octal digits') ||
+    msg.includes('outside the documented') ||
+    msg.includes('supported devices are x, y, m, s, t, c and d')
+  ) {
+    return finalize({
+      error_code: 'MODBUS_ADDRESS_ERROR',
+      domain: 'MODBUS_COMM',
+      severity: 'ERROR',
+      retryable: false,
+      remediation: 'Verify DVP ES2 device area and valid numbering (X/Y octal 000-377, S0-1023, M0-4095, T/C0-255, D0-9999).',
+      recovery_actions: [
+        {
+          action: 'FIX_INPUT_PARAMETERS',
+          description: 'Correct out-of-range or non-octal X/Y addresses and supply 1-200 address strings.',
+          automated: true,
+          priority: 1,
+        },
+        {
+          action: 'FALLBACK_TO_TOOL',
+          description: 'Inspect project SYSTEM_VAR device ranges to confirm valid memory boundaries.',
+          suggested_tool: 'ispsoft_get_memory_usage_map',
+          suggested_arguments: projectPath ? { project_path: projectPath } : undefined,
+          automated: true,
+          priority: 2,
+        },
+      ],
+    });
+  }
+
+  if (
+    existingCode === 'SECURITY_BLOCKED' ||
+    status === 'BLOCKED' ||
+    msg.includes('unsafe') ||
+    msg.includes('traversal') ||
+    msg.includes('must reside inside') ||
+    msg.includes('reserved windows') ||
+    msg.includes('blocked')
+  ) {
+    return finalize({
+      error_code: 'SECURITY_BLOCKED',
+      domain: 'WORKSPACE_IO',
+      severity: 'CRITICAL',
+      retryable: false,
+      remediation: 'All file paths must remain strictly inside /workspace without traversal segments or reserved OS names.',
+      recovery_actions: [
+        {
+          action: 'FIX_INPUT_PARAMETERS',
+          description: 'Rewrite path to a normalized /workspace/<name>.isp virtual path.',
+          automated: true,
+          priority: 1,
+        },
+        {
+          action: 'CREATE_OR_LIST_RESOURCE',
+          description: 'List permitted files currently inside /workspace.',
+          suggested_tool: 'ispsoft_manage_workspace_files',
+          suggested_arguments: { action: 'list' },
+          automated: true,
+          priority: 2,
+        },
+      ],
+    });
+  }
+
+  if (existingCode === 'SIM_ASSERTION_FAILED' || status === 'SEQUENCE_ASSERTION_FAILED') {
+    return finalize({
+      error_code: 'SIM_ASSERTION_FAILED',
+      domain: 'SIMULATOR',
+      severity: 'ERROR',
+      retryable: false,
+      remediation: 'Inspect sequence step observed vs expected device states and adjust PLC logic or test stimulus.',
+      recovery_actions: [
+        {
+          action: 'RUN_DIAGNOSTIC_OR_CHECK',
+          description: 'Inspect live Soft-PLC registers, forced bits, and scan trace to diagnose the assertion failure.',
+          suggested_tool: 'ispsoft_sim_monitor',
+          suggested_arguments: sessionId ? { session_id: sessionId } : undefined,
+          automated: true,
+          priority: 1,
+        },
+        {
+          action: 'FALLBACK_TO_TOOL',
+          description: 'Read historical scan-by-scan data trace from the simulator watch table.',
+          suggested_tool: 'ispsoft_sim_watch_table',
+          suggested_arguments: sessionId ? { session_id: sessionId, action: 'trace' } : undefined,
+          automated: true,
+          priority: 2,
+        },
+      ],
+    });
+  }
+
+  if (
+    existingCode === 'SIM_SESSION_NOT_FOUND' ||
+    msg.includes('unknown simulator session') ||
+    status === 'SESSION_NOT_FOUND'
+  ) {
+    return finalize({
+      error_code: 'SIM_SESSION_NOT_FOUND',
+      domain: 'SIMULATOR',
+      severity: 'ERROR',
+      retryable: false,
+      remediation: 'List active simulator sessions with ispsoft_sim_list or start a new session with ispsoft_sim_start.',
+      recovery_actions: [
+        {
+          action: 'FALLBACK_TO_TOOL',
+          description: 'List currently active Soft-PLC simulator sessions.',
+          suggested_tool: 'ispsoft_sim_list',
+          suggested_arguments: {},
+          automated: true,
+          priority: 1,
+        },
+        {
+          action: 'CREATE_OR_LIST_RESOURCE',
+          description: 'Start a fresh Soft-PLC simulator session for the target .isp project.',
+          suggested_tool: 'ispsoft_sim_start',
+          suggested_arguments: projectPath ? { project_path: projectPath } : undefined,
+          automated: true,
+          priority: 2,
+        },
+      ],
+    });
+  }
+
+  if (
+    existingCode === 'CONTAINER_CORRUPT' ||
+    msg.includes('deflate') ||
+    msg.includes('crc') ||
+    msg.includes('invalid container') ||
+    msg.includes('invalid or truncated') ||
+    msg.includes('unsupported container') ||
+    msg.includes('missing <project>') ||
+    msg.includes('invalid source encoding')
+  ) {
+    return finalize({
+      error_code: 'CONTAINER_CORRUPT',
+      domain: 'PROJECT_CONTAINER',
+      severity: 'ERROR',
+      retryable: false,
+      remediation: 'Verify .isp/.mpu container integrity or restore from the latest workspace backup.',
+      recovery_actions: [
+        {
+          action: 'FALLBACK_TO_TOOL',
+          description: 'Restore the project from its latest pre-mutation backup (.latest.before.isp) if available.',
+          suggested_tool: 'ispsoft_manage_workspace_files',
+          suggested_arguments: projectPath ? { action: 'restore_backup', path: projectPath } : { action: 'list' },
+          automated: true,
+          priority: 1,
+        },
+        {
+          action: 'CREATE_OR_LIST_RESOURCE',
+          description: 'List valid project artifacts in /workspace.',
+          suggested_tool: 'ispsoft_list_projects',
+          suggested_arguments: {},
+          automated: true,
+          priority: 2,
+        },
+      ],
+    });
+  }
+
+  if (
+    existingCode === 'NOT_FOUND' ||
+    msg.includes('file not found') ||
+    msg.includes('not found') ||
+    msg.includes('does not exist') ||
+    msg.includes('no pou named')
+  ) {
+    return finalize({
+      error_code: 'NOT_FOUND',
+      domain: 'WORKSPACE_IO',
+      severity: 'ERROR',
+      retryable: false,
+      remediation: 'Verify workspace file paths via ispsoft_list_projects or inspect project overview for POU/DUT names.',
+      recovery_actions: [
+        {
+          action: 'CREATE_OR_LIST_RESOURCE',
+          description: 'List all workspace files to locate the exact virtual path.',
+          suggested_tool: 'ispsoft_manage_workspace_files',
+          suggested_arguments: { action: 'list' },
+          automated: true,
+          priority: 1,
+        },
+        ...(projectPath
+          ? [
+              {
+                action: 'FALLBACK_TO_TOOL' as const,
+                description: 'Inspect the project overview to verify POU, task, and DUT names.',
+                suggested_tool: 'ispsoft_get_project_overview',
+                suggested_arguments: { project_path: projectPath },
+                automated: true,
+                priority: 2,
+              },
+            ]
+          : []),
+      ],
+    });
+  }
+
+  if (
+    existingCode === 'RESOURCE_LIMIT' ||
+    msg.includes('limit') ||
+    msg.includes('quota') ||
+    msg.includes('maximum') ||
+    msg.includes('exceeds')
+  ) {
+    return finalize({
+      error_code: 'RESOURCE_LIMIT',
+      domain: 'QUOTA_LIMIT',
+      severity: 'WARNING',
+      retryable: true,
+      remediation: 'Reduce batch size, close idle simulator sessions, or clean up backup files before retrying.',
+      recovery_actions: [
+        {
+          action: 'CLOSE_IDLE_RESOURCES',
+          description: 'Clean up *.before.* backup files in /workspace to free storage quota.',
+          suggested_tool: 'ispsoft_manage_workspace_files',
+          suggested_arguments: { action: 'cleanup_backups' },
+          automated: true,
+          priority: 1,
+        },
+        {
+          action: 'CLOSE_IDLE_RESOURCES',
+          description: 'List active simulator sessions and close unused ones.',
+          suggested_tool: 'ispsoft_sim_list',
+          suggested_arguments: {},
+          automated: true,
+          priority: 2,
+        },
+      ],
+    });
+  }
+
+  if (
+    existingCode === 'SYNTAX_ERROR' ||
     status === 'TRANSACTION_ABORTED_COMPILE_ERROR' ||
+    status === 'OFFLINE_STATIC_CHECK_FAILED' ||
+    status === 'LD_PROGRAM_STATIC_CHECK_FAILED' ||
     msg.includes('unsupported opcode') ||
     msg.includes('syntax') ||
     msg.includes('parse')
   ) {
-    return {
+    return finalize({
       error_code: 'SYNTAX_ERROR',
+      domain: 'COMPILER_SYNTAX',
+      severity: 'ERROR',
       retryable: false,
-      remediation: 'Run ispsoft_validate_il or ispsoft_static_check_and_compile to inspect exact syntax issues.',
-    };
+      remediation: 'Run ispsoft_validate_il or ispsoft_static_check_and_compile to inspect exact syntax or IEC check issues.',
+      recovery_actions: [
+        {
+          action: 'RUN_DIAGNOSTIC_OR_CHECK',
+          description: 'Run full offline static check and compiler verification to pinpoint failing POUs and rungs.',
+          suggested_tool: 'ispsoft_static_check_and_compile',
+          suggested_arguments: projectPath ? { project_path: projectPath } : undefined,
+          automated: true,
+          priority: 1,
+        },
+        {
+          action: 'FALLBACK_TO_TOOL',
+          description: 'Validate IL instruction syntax and operand formats directly.',
+          suggested_tool: 'ispsoft_validate_il',
+          automated: true,
+          priority: 2,
+        },
+      ],
+    });
   }
-  if (failureCategory === 'validation_error' || msg.includes('required') || msg.includes('invalid')) {
-    return {
+
+  if (
+    existingCode === 'VALIDATION_ERROR' ||
+    failureCategory === 'validation_error' ||
+    status === 'REJECTED_BEFORE_READ' ||
+    status === 'REJECTED_BEFORE_IO' ||
+    status === 'NO_LD_NETWORKS' ||
+    status === 'NETWORK_INDEX_OUT_OF_RANGE' ||
+    status === 'REJECTED_BEFORE_WRITE' ||
+    Array.isArray(output.validation_errors) ||
+    msg.includes('required') ||
+    msg.includes('invalid') ||
+    msg.includes('must be') ||
+    msg.includes('expected')
+  ) {
+    return finalize({
       error_code: 'VALIDATION_ERROR',
+      domain: 'VALIDATION',
+      severity: 'ERROR',
       retryable: false,
-      remediation: 'Verify parameter types and values against the tool inputSchema.',
-    };
+      remediation: 'Correct invalid or out-of-range arguments against the tool inputSchema and retry.',
+      recovery_actions: [
+        {
+          action: 'FIX_INPUT_PARAMETERS',
+          description: 'Update parameter types, required fields, or index ranges to match the tool schema.',
+          automated: true,
+          priority: 1,
+        },
+        ...(projectPath
+          ? [
+              {
+                action: 'FALLBACK_TO_TOOL' as const,
+                description: 'Inspect project structure before retrying with verified POU or network indices.',
+                suggested_tool: 'ispsoft_get_project_overview',
+                suggested_arguments: { project_path: projectPath },
+                automated: true,
+                priority: 2,
+              },
+            ]
+          : []),
+      ],
+    });
   }
-  return {
-    error_code: 'INTERNAL_ERROR',
+
+  return finalize({
+    error_code: existingCode ?? 'INTERNAL_ERROR',
+    domain: 'INTERNAL',
+    severity: 'CRITICAL',
     retryable: false,
-    remediation: 'Inspect the error message and validate inputs before retrying.',
-  };
+    remediation: 'Inspect error_detail.message and run ispsoft_doctor to verify environment and workspace health.',
+    recovery_actions: [
+      {
+        action: 'RUN_DIAGNOSTIC_OR_CHECK',
+        description: 'Run environment, workspace, and simulator health diagnostics.',
+        suggested_tool: 'ispsoft_doctor',
+        suggested_arguments: {},
+        automated: true,
+        priority: 1,
+      },
+    ],
+  });
 }
 
 const READ_ONLY_PREFIXES = [

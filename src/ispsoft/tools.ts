@@ -74,7 +74,9 @@ import {
   stepSimulatorUntil,
 } from './simulator.js';
 import {
+  STANDARD_ERROR_CODES,
   ToolAnnotations,
+  buildStandardizedError,
   classifyToolError,
   deriveToolAnnotations,
   mcpTelemetry,
@@ -251,6 +253,12 @@ export const MCP_TOOLS: McpToolDef[] = [
       qualified_profiles: MODEL_PROFILES,
       model_aliases: { DVP32ES2T: 'ES2', DVP32ES2: 'ES2' },
       operations: capabilityMatrix(),
+      error_schema: {
+        uri: 'ispsoft://schemas/error',
+        http_endpoint: '/api/schemas/error',
+        schema_version: '1.0.0',
+        error_codes: [...STANDARD_ERROR_CODES],
+      },
     }),
   },
   {
@@ -2586,12 +2594,25 @@ export const MCP_TOOLS: McpToolDef[] = [
         try {
           return { success: true, ...mapDevice(String(addr)) };
         } catch (e) {
-          return { success: false, device: String(addr), error: errMsg(e) };
+          const msg = errMsg(e);
+          const detail = classifyToolError(
+            { error_code: 'MODBUS_ADDRESS_ERROR', error: msg },
+            { tool: 'ispsoft_map_dvp_modbus_addresses', args },
+          ).error_detail;
+          return {
+            success: false,
+            device: String(addr),
+            error: msg,
+            error_code: 'MODBUS_ADDRESS_ERROR',
+            error_detail: detail,
+          };
         }
       });
       const errCount = mappings.filter((m) => !m.success).length;
       return {
-        status: errCount === 0 ? 'MAPPED_OFFLINE_ONLY' : 'PARTIAL_MAPPING',
+        success: errCount < mappings.length,
+        status: errCount === 0 ? 'MAPPED_OFFLINE_ONLY' : errCount === mappings.length ? 'MODBUS_ADDRESS_ERROR' : 'PARTIAL_MAPPING',
+        ...(errCount === mappings.length ? { error_code: 'MODBUS_ADDRESS_ERROR', error: 'All Modbus device address mappings failed.' } : {}),
         model: canonical,
         address_basis: 'zero-based Modbus PDU addresses',
         mappings,
@@ -3031,7 +3052,14 @@ const TOOL_MAP = new Map<string, McpToolDef>(
 
 export const FAIL_STATUSES = new Set([
   'REJECTED_BEFORE_WRITE',
+  'REJECTED_BEFORE_READ',
+  'REJECTED_BEFORE_COMPILE',
   'WRITE_FAILED',
+  'COMPILE_FAILED',
+  'NO_LD_NETWORKS',
+  'NETWORK_INDEX_OUT_OF_RANGE',
+  'OFFLINE_STATIC_CHECK_FAILED',
+  'LD_PROGRAM_STATIC_CHECK_FAILED',
   'UNSUPPORTED_MODEL',
   'MODEL_NOT_QUALIFIED',
   'REJECTED_BEFORE_IO',
@@ -3044,6 +3072,7 @@ export const FAIL_STATUSES = new Set([
   'SEQUENCE_ASSERTION_FAILED',
   'VALIDATION_ERROR',
   'IDEMPOTENCY_CONFLICT',
+  'MODBUS_ADDRESS_ERROR',
 ]);
 
 export function isToolResultError(output: Record<string, unknown>): boolean {
@@ -3068,26 +3097,65 @@ export function getToolDef(name: string): McpToolDef | undefined {
   return TOOL_MAP.get(name);
 }
 
-export function executeMcpTool(name: string, args: Record<string, unknown> = {}): Record<string, unknown> {
+export function executeMcpTool(
+  name: string,
+  args: Record<string, unknown> = {},
+  requestId?: string,
+): Record<string, unknown> {
   seedDefaultWorkspace();
   if (LEGACY_HW_STUB_TOOLS.has(name)) {
+    const projectPath = typeof args.project_path === 'string' ? args.project_path : undefined;
+    const classified = classifyToolError(
+      {
+        status: 'TRANSPORT_NOT_QUALIFIED',
+        error_code: 'HARDWARE_NOT_QUALIFIED',
+        error: `Tool '${name}' requires a native Windows ISPSoft desktop / COMMGR hardware connection and is omitted from the active agent catalog.`,
+      },
+      { tool: name, args, request_id: requestId },
+    );
     return {
       success: false,
       status: 'TRANSPORT_NOT_QUALIFIED',
-      error_code: 'HARDWARE_NOT_QUALIFIED',
-      retryable: false,
-      error: `Tool '${name}' requires a native Windows ISPSoft desktop / COMMGR hardware connection and is omitted from the active agent catalog.`,
-      remediation: 'Use Soft-PLC simulator tools (ispsoft_sim_*) and offline tools (ispsoft_static_check_and_compile, ispsoft_audit_project).',
+      error_code: classified.error_code,
+      retryable: classified.retryable,
+      error: classified.error_detail.message,
+      remediation: classified.remediation,
+      recovery_actions: classified.recovery_actions,
+      error_detail: classified.error_detail,
+      ...(projectPath ? { project_path: projectPath } : {}),
     };
   }
   const tool = TOOL_MAP.get(name);
   if (!tool) {
+    const detail = buildStandardizedError({
+      error_code: 'NOT_FOUND',
+      domain: 'MCP_PROTOCOL',
+      severity: 'ERROR',
+      message: `Unknown tool: ${name}`,
+      retryable: false,
+      remediation: 'Call tools/list to inspect available MCP tools.',
+      recovery_actions: [
+        {
+          action: 'FALLBACK_TO_TOOL',
+          description: 'List qualified ISPSoft MCP tools via tools/list or inspect capabilities.',
+          suggested_tool: 'ispsoft_get_capabilities',
+          suggested_arguments: {},
+          automated: true,
+          priority: 1,
+        },
+      ],
+      context: { requested_tool: name },
+      request_id: requestId,
+      tool: name,
+    });
     return {
       success: false,
       error_code: 'NOT_FOUND',
       retryable: false,
-      error: `Unknown tool: ${name}`,
-      remediation: 'Call tools/list to inspect available MCP tools.',
+      error: detail.message,
+      remediation: detail.remediation,
+      recovery_actions: detail.recovery_actions,
+      error_detail: detail,
     };
   }
 
@@ -3096,27 +3164,70 @@ export function executeMcpTool(name: string, args: Record<string, unknown> = {})
     sanitizedArgs = sanitizeJsonValue(args);
   } catch (err) {
     mcpTelemetry.recordValidationError();
+    const message = errMsg(err);
+    const detail = buildStandardizedError({
+      error_code: 'VALIDATION_ERROR',
+      domain: 'VALIDATION',
+      severity: 'ERROR',
+      message,
+      retryable: false,
+      remediation: 'Reduce JSON nesting depth and remove reserved keys.',
+      recovery_actions: [
+        {
+          action: 'FIX_INPUT_PARAMETERS',
+          description: 'Flatten nested JSON arguments (max depth 32) and strip prototype keys.',
+          automated: true,
+          priority: 1,
+        },
+      ],
+      request_id: requestId,
+      tool: name,
+    });
     return {
       success: false,
       status: 'VALIDATION_ERROR',
       error_code: 'VALIDATION_ERROR',
       retryable: false,
-      error: errMsg(err),
-      remediation: 'Reduce JSON nesting depth and remove reserved keys.',
+      error: message,
+      remediation: detail.remediation,
+      recovery_actions: detail.recovery_actions,
+      error_detail: detail,
     };
   }
 
   const check = validateToolArguments(tool.inputSchema, sanitizedArgs);
   if (!check.valid) {
     mcpTelemetry.recordValidationError();
+    const message = check.errors.map((e) => e.message).join('; ');
+    const detail = buildStandardizedError({
+      error_code: 'VALIDATION_ERROR',
+      domain: 'VALIDATION',
+      severity: 'ERROR',
+      message,
+      retryable: false,
+      remediation: 'Verify required fields and types against the tool inputSchema.',
+      recovery_actions: [
+        {
+          action: 'FIX_INPUT_PARAMETERS',
+          description: 'Fix the fields listed in context.validation_errors to satisfy the tool inputSchema and retry.',
+          automated: true,
+          priority: 1,
+        },
+      ],
+      context: { validation_errors: check.errors },
+      request_id: requestId,
+      tool: name,
+    });
     return {
       success: false,
       status: 'VALIDATION_ERROR',
       error_code: 'VALIDATION_ERROR',
       retryable: false,
-      error: check.errors.map((e) => e.message).join('; '),
+      error: message,
       validation_errors: check.errors,
-      remediation: 'Verify required fields and types against the tool inputSchema.',
+      remediation: detail.remediation,
+      recovery_actions: detail.recovery_actions,
+      error_detail: detail,
     };
   }
 
@@ -3128,11 +3239,13 @@ export function executeMcpTool(name: string, args: Record<string, unknown> = {})
   }
 
   const budgeted = budgetPayload(rawResult, MAX_ITEM_CHARS, MAX_RESPONSE_CHARS);
-  if (isToolResultError(budgeted) && !budgeted.error_code) {
-    const classified = classifyToolError(budgeted);
-    budgeted.error_code = classified.error_code;
-    budgeted.retryable = classified.retryable;
-    budgeted.remediation = classified.remediation;
+  if (isToolResultError(budgeted)) {
+    const classified = classifyToolError(budgeted, { tool: name, args: sanitizedArgs, request_id: requestId });
+    if (!budgeted.error_code) budgeted.error_code = classified.error_code;
+    if (budgeted.retryable === undefined) budgeted.retryable = classified.retryable;
+    if (!budgeted.remediation) budgeted.remediation = classified.remediation;
+    if (!budgeted.recovery_actions) budgeted.recovery_actions = classified.recovery_actions;
+    if (!budgeted.error_detail) budgeted.error_detail = classified.error_detail;
   }
   return budgeted;
 }

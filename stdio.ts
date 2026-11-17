@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import crypto from 'node:crypto';
+import { buildStandardizedError } from './src/ispsoft/mcpProtocol.js';
 import { RpcMessage, handleSingleRpc } from './src/ispsoft/mcpServer.js';
 import { shutdownAllSimulators } from './src/ispsoft/simulator.js';
 import { seedDefaultWorkspace } from './src/ispsoft/workspace.js';
@@ -15,22 +16,70 @@ function writeMessage(payload: Record<string, unknown>): void {
 function dispatchRawJson(jsonText: string): void {
   const trimmed = jsonText.trim();
   if (!trimmed) return;
+  const reqId = crypto.randomUUID();
   let parsed: unknown;
   try {
     parsed = JSON.parse(trimmed);
   } catch {
+    const message = 'Parse error: malformed JSON message';
     writeMessage({
       jsonrpc: '2.0',
       id: null,
-      error: { code: -32700, message: 'Parse error: malformed JSON message' },
+      error: {
+        code: -32700,
+        message,
+        data: buildStandardizedError({
+          error_code: 'PROTOCOL_PARSE_ERROR',
+          domain: 'MCP_PROTOCOL',
+          severity: 'ERROR',
+          message,
+          retryable: false,
+          remediation: 'Send valid UTF-8 JSON-RPC 2.0 messages framed cleanly as single-line NDJSON or with exact byte Content-Length.',
+          recovery_actions: [
+            {
+              action: 'FIX_INPUT_PARAMETERS',
+              description: 'Ensure the JSON payload parses cleanly and matches Content-Length byte size if framed.',
+              automated: true,
+              priority: 1,
+            },
+          ],
+          context: { rpc_code: -32700, transport: 'stdio' },
+          request_id: reqId,
+        }),
+      },
     });
     return;
   }
 
-  const reqId = crypto.randomUUID();
   if (Array.isArray(parsed)) {
     if (parsed.length === 0) {
-      writeMessage({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid empty JSON-RPC batch' } });
+      const message = 'Invalid empty JSON-RPC batch';
+      writeMessage({
+        jsonrpc: '2.0',
+        id: null,
+        error: {
+          code: -32600,
+          message,
+          data: buildStandardizedError({
+            error_code: 'PROTOCOL_INVALID_REQUEST',
+            domain: 'MCP_PROTOCOL',
+            severity: 'ERROR',
+            message,
+            retryable: false,
+            remediation: 'Send at least one JSON-RPC 2.0 request inside a batch array.',
+            recovery_actions: [
+              {
+                action: 'FIX_INPUT_PARAMETERS',
+                description: 'Send a single JSON-RPC object or a non-empty array of JSON-RPC requests.',
+                automated: true,
+                priority: 1,
+              },
+            ],
+            context: { rpc_code: -32600, transport: 'stdio' },
+            request_id: reqId,
+          }),
+        },
+      });
       return;
     }
     const responses = parsed
