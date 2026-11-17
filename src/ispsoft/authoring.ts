@@ -552,9 +552,9 @@ export function renderLdAsciiForPou(pouBody: string, networkIndex?: number): {
     const netId = parsed.properties.NET_ID ?? parsed.properties.NetworkID ?? String(idx);
 
     const wrapped = `<NETWORK_START>\n${raw}\n<NETWORK_END>`;
-    const ilParsed = parseNetworks(wrapped);
     let ilStrings: string[] = [];
     try {
+      const ilParsed = parseNetworks(wrapped);
       if (ilParsed.length === 1) {
         ilStrings = netToIl(ilParsed[0]).map(([op, ops]) => (ops.length ? `${op} ${ops.join(', ')}` : op));
       }
@@ -601,14 +601,31 @@ export function renderLdAsciiForPou(pouBody: string, networkIndex?: number): {
 }
 
 const DEVICE_REF_RE = /(?<![A-Z0-9_])(X|Y|M|S|T|C|D|V|Z|R)\s*(\d+)(?![A-Z0-9_])/gi;
-const WRITE_OPS = new Set(['OUT', 'SET', 'RST', 'MOV', 'DMOV', 'DADD', 'DSUB', 'DMUL', 'ADD', 'SUB', 'MUL', 'DIV', 'INC', 'DEC', 'ZRST', 'ALT', 'PLS', 'PLF']);
+const WRITE_LAST_OPS = new Set(['OUT', 'SET', 'RST', 'MOV', 'DMOV', 'DADD', 'DSUB', 'DMUL', 'DDIV', 'ADD', 'SUB', 'MUL', 'DIV', 'INC', 'DEC', 'DINC', 'DDEC', 'ALT', 'PLS', 'PLF']);
+const WRITE_FIRST_OPS = new Set(['TMR', 'CNT', 'DCNT']);
+const WRITE_ALL_OPS = new Set(['ZRST']);
 
 export function extractCrossRefsFromText(source: string) {
   const refs = new Map<string, { reads: number[]; writes: number[] }>();
   const lines = source.split(/\r?\n/);
+  let inOutlink = false;
+  let pendingOutNode = false;
+
   lines.forEach((line, i) => {
     const lineNo = i + 1;
-    const upper = line.toUpperCase();
+    const upper = line.toUpperCase().trim();
+    if (upper.includes('<OUTLINK_START>')) inOutlink = true;
+    if (upper.includes('</OUTLINK_END>') || upper.includes('<OUTLINK_END>')) {
+      inOutlink = false;
+      pendingOutNode = false;
+    }
+    if (inOutlink && /^TYPE=(13|15|16|12)\b/.test(upper)) {
+      pendingOutNode = true;
+    }
+    if (inOutlink && upper.includes('[END_LD_NODE]')) {
+      pendingOutNode = false;
+    }
+
     const isAssign = line.includes(':=') ? line.split(':=', 1)[0] : '';
     const opMatch = /^\s*([A-Z_=<>]+)/.exec(upper);
     const op = opMatch ? opMatch[1] : '';
@@ -620,8 +637,12 @@ export function extractCrossRefsFromText(source: string) {
       }
       const entry = refs.get(dev)!;
       const isWrite =
+        pendingOutNode ||
+        (inOutlink && upper.startsWith('DEV_NAME=') && !upper.includes('TYPE=11')) ||
         (isAssign && m.index !== undefined && m.index < isAssign.length) ||
-        (WRITE_OPS.has(op) && idx === matches.length - 1);
+        (WRITE_LAST_OPS.has(op) && idx === matches.length - 1) ||
+        (WRITE_FIRST_OPS.has(op) && idx === 0) ||
+        WRITE_ALL_OPS.has(op);
       (isWrite ? entry.writes : entry.reads).push(lineNo);
     });
   });

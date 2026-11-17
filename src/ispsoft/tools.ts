@@ -53,6 +53,7 @@ import {
   listSimulatorSessions,
   manageWatchTable,
   monitorSimulator,
+  reloadSimulatorSession,
   startSimulatorSession,
 } from './simulator.js';
 import {
@@ -470,7 +471,7 @@ export const MCP_TOOLS: McpToolDef[] = [
           encoding: c.encoding,
           project: inspectContainer(c),
           source: enforceValueBudget(source, 'source'),
-          content_hash: computeContentHash('isp', c.source),
+          content_hash: computeContentHash('isp', raw),
         };
       } catch (e) {
         return { success: false, failure_category: 'validation_error', error: errMsg(e) };
@@ -659,16 +660,17 @@ export const MCP_TOOLS: McpToolDef[] = [
         const c = decodeContainer(original);
         const source = decodeCodepage(c.source, c.encoding);
         const sysSec = sections(source, 'SYSTEM_VAR')[0];
-        if (!sysSec) throw new FileTransformError('Expected SYSTEM_VAR section');
         if (!args.ranges || typeof args.ranges !== 'object') {
           const parsedRanges = [];
-          for (const line of sysSec.inner.split(/\r?\n/)) {
-            const m = /^\s*<([A-Z])>(\d+)-(\d+)\s*$/i.exec(line.trim());
-            if (m) parsedRanges.push({ area: m[1].toUpperCase(), start: Number(m[2]), end: Number(m[3]), capacity: Number(m[3]) - Number(m[2]) + 1 });
+          if (sysSec) {
+            for (const line of sysSec.inner.split(/\r?\n/)) {
+              const m = /^\s*<([A-Z])>(\d+)-(\d+)\s*$/i.exec(line.trim());
+              if (m) parsedRanges.push({ area: m[1].toUpperCase(), start: Number(m[2]), end: Number(m[3]), capacity: Number(m[3]) - Number(m[2]) + 1 });
+            }
           }
           return { success: true, ranges: parsedRanges, content_hash: currentHash };
         }
-        let inner = sysSec.inner;
+        let inner = sysSec?.inner ?? '';
         for (const [areaRaw, spanRaw] of Object.entries(args.ranges as Record<string, string>)) {
           const area = areaRaw.toUpperCase();
           const m = /^(\d+)-(\d+)$/.exec(String(spanRaw).trim());
@@ -677,10 +679,17 @@ export const MCP_TOOLS: McpToolDef[] = [
           if (lineRe.test(inner)) {
             inner = inner.replace(lineRe, `<${area}>${m[1]}-${m[2]}`);
           } else {
-            inner = inner.trimEnd() + c.newline + `<${area}>${m[1]}-${m[2]}` + c.newline;
+            inner = (inner ? inner.trimEnd() + c.newline : '') + `<${area}>${m[1]}-${m[2]}` + c.newline;
           }
         }
-        const updated = source.slice(0, sysSec.innerStart) + inner + source.slice(sysSec.innerEnd);
+        let updated: string;
+        if (sysSec) {
+          updated = source.slice(0, sysSec.innerStart) + inner + source.slice(sysSec.innerEnd);
+        } else {
+          const firstPou = sections(source, 'POU')[0];
+          const block = `<SYSTEM_VAR>${c.newline}${inner}</SYSTEM_VAR>${c.newline}`;
+          updated = firstPou ? source.slice(0, firstPou.start) + block + source.slice(firstPou.start) : source + block;
+        }
         const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
         if (args.dry_run) return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, current_content_hash: currentHash };
         const target = typeof args.output_path === 'string' && args.output_path.trim()
@@ -1009,7 +1018,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_edit_global_variables',
-    description: 'Read or replace project-wide GLOBAL_VAR symbol declarations in a backed-up candidate.',
+    description: 'Read, replace, or upsert project-wide GLOBAL_VAR symbol declarations in a backed-up candidate.',
     category: 'POU & Symbol Authoring',
     inputSchema: {
       type: 'object',
@@ -1017,6 +1026,10 @@ export const MCP_TOOLS: McpToolDef[] = [
       properties: {
         project_path: { type: 'string' },
         global_var_text: { type: 'string', description: 'Optional replacement inner GLOBAL_VAR text (<VAR>...</VAR>)' },
+        upsert_vars: {
+          type: 'array',
+          description: 'Optional structured variables [{ name, type, address?, initial_value?, comment?, class? }] to upsert cleanly',
+        },
         output_path: { type: 'string' },
         expected_content_hash: { type: 'string' },
         dry_run: { type: 'boolean', default: false },
@@ -1033,26 +1046,63 @@ export const MCP_TOOLS: McpToolDef[] = [
         const c = decodeContainer(original);
         const source = decodeCodepage(c.source, c.encoding);
         const gSecs = sections(source, 'GLOBAL_VAR');
-        if (typeof args.global_var_text !== 'string') {
+        if (typeof args.global_var_text !== 'string' && !Array.isArray(args.upsert_vars)) {
           const raw = gSecs[0]?.inner ?? '';
           return { success: true, raw, parsed: parseLocalVariables(raw), content_hash: currentHash };
         }
-        const replacement = normalized(args.global_var_text).replace(/\n/g, c.newline);
+        let nextInnerText: string;
+        if (Array.isArray(args.upsert_vars)) {
+          const existing = parseLocalVariables(gSecs[0]?.inner ?? '');
+          const map = new Map(existing.entries.map((e) => [e.identifier, e]));
+          for (const rawItem of args.upsert_vars as Array<Record<string, unknown>>) {
+            const name = String(rawItem.name ?? '').trim();
+            if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name)) {
+              throw new FileTransformError(`Invalid variable identifier: ${name}`);
+            }
+            const varType = String(rawItem.type ?? 'INT').trim().toUpperCase();
+            const addr = rawItem.address ? String(rawItem.address).trim().toUpperCase() : null;
+            const init = rawItem.initial_value !== undefined ? String(rawItem.initial_value) : '';
+            const cls = String(rawItem.class ?? 'VAR_GLOBAL').trim();
+            const cmt = rawItem.comment ? String(rawItem.comment).trim() : null;
+            const initialStr = `${init}${addr ? ` [@${addr}@]` : ''}`.trim();
+            map.set(name, {
+              identifier: name,
+              type: varType,
+              address: addr,
+              class: cls,
+              initial_value: initialStr,
+              comment: cmt,
+            });
+          }
+          const blocks = [...map.values()].map((e) =>
+            [
+              '{',
+              `${e.identifier} : ${e.type} := ${e.initial_value} {${e.class}}`,
+              '(*',
+              e.comment ?? '',
+              '*)',
+              '}',
+            ].join(c.newline),
+          );
+          nextInnerText = ['<VAR>', ...blocks, '</VAR>'].join(c.newline);
+        } else {
+          nextInnerText = normalized(String(args.global_var_text)).replace(/\n/g, c.newline);
+        }
         let updated: string;
         if (gSecs.length >= 1) {
-          updated = source.slice(0, gSecs[0].innerStart) + replacement + source.slice(gSecs[0].innerEnd);
+          updated = source.slice(0, gSecs[0].innerStart) + nextInnerText + source.slice(gSecs[0].innerEnd);
         } else {
           const firstPou = sections(source, 'POU')[0];
-          const block = `<GLOBAL_VAR>${c.newline}${replacement}${c.newline}</GLOBAL_VAR>${c.newline}`;
+          const block = `<GLOBAL_VAR>${c.newline}${nextInnerText}${c.newline}</GLOBAL_VAR>${c.newline}`;
           updated = firstPou ? source.slice(0, firstPou.start) + block + source.slice(firstPou.start) : source + block;
         }
         const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
-        if (args.dry_run) return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, parsed: parseLocalVariables(args.global_var_text) };
+        if (args.dry_run) return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, parsed: parseLocalVariables(nextInnerText) };
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
           : artifactPath(`${path.posix.parse(srcPath).name}-gvars`, '.isp');
         const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes);
-        return { success: true, status: 'GENERATED_UNCOMPILED', candidate: written.target, backup: written.backup, content_hash: computeContentHash('isp', candidateBytes) };
+        return { success: true, status: 'GENERATED_UNCOMPILED', candidate: written.target, backup: written.backup, parsed: parseLocalVariables(nextInnerText), content_hash: computeContentHash('isp', candidateBytes) };
       } catch (e) {
         return { success: false, status: 'CANDIDATE_FAILED', failure_category: 'validation_error', error: errMsg(e) };
       }
@@ -1605,7 +1655,8 @@ export const MCP_TOOLS: McpToolDef[] = [
     handler: (args) => {
       try {
         const p = normalizeVirtualPath(String(args.project_path ?? ''));
-        const c = decodeContainer(readFileBuffer(p));
+        const raw = readFileBuffer(p);
+        const c = decodeContainer(raw);
         const comments = projectCommentMap(decodeCodepage(c.source, c.encoding));
         return {
           success: true,
@@ -1613,7 +1664,7 @@ export const MCP_TOOLS: McpToolDef[] = [
           count: Object.keys(comments).length,
           device_comments: comments,
           content_hash: computeContentHash('comments', JSON.stringify(comments)),
-          project_content_hash: computeContentHash('isp', c.source),
+          project_content_hash: computeContentHash('isp', raw),
         };
       } catch (e) {
         return { success: false, error: errMsg(e) };
@@ -1679,7 +1730,6 @@ export const MCP_TOOLS: McpToolDef[] = [
         const source = decodeCodepage(c.source, c.encoding);
         const re = /(<DEVICE_CMT_START>\r*\n|\[DEVICE_CMT_START\]\r*\n)([\s\S]*?)(<\/DEVICE_CMT_START>|\[DEVICE_CMT_END\])/i;
         const m = re.exec(source);
-        if (!m) throw new FileTransformError('Expected DEVICE_CMT section');
         const comments = projectCommentMap(source);
         for (const [k, v] of Object.entries((args.device_comments as Record<string, string>) ?? {})) {
           comments[k.trim().toUpperCase()] = String(v).trim();
@@ -1688,7 +1738,14 @@ export const MCP_TOOLS: McpToolDef[] = [
           .sort((a, b) => a[0].localeCompare(b[0]))
           .map(([a, txt]) => `${a}::${txt}`)
           .join(c.newline);
-        const updated = source.replace(re, `$1${body}${c.newline}$3`);
+        let updated: string;
+        if (m) {
+          updated = source.replace(re, `$1${body}${c.newline}$3`);
+        } else {
+          const firstPou = sections(source, 'POU')[0];
+          const block = `[DEVICE_CMT_START]${c.newline}${body}${c.newline}[DEVICE_CMT_END]${c.newline}`;
+          updated = firstPou ? source.slice(0, firstPou.start) + block + source.slice(firstPou.start) : source + block;
+        }
         const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
         if (args.dry_run) return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, comment_count: Object.keys(comments).length };
         const target = typeof args.output_path === 'string' && args.output_path.trim()
@@ -1942,22 +1999,47 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_sim_control',
-    description: 'Control Soft-PLC CPU mode: RUN, STOP, STEP (execute N deterministic scan cycles), or RESET.',
+    description: 'Control Soft-PLC CPU mode: RUN (continuous live scanning), STOP, STEP (execute N deterministic scan cycles), RESET, or CLOSE.',
     category: 'Soft-PLC Simulator & Monitor',
     inputSchema: {
       type: 'object',
       required: ['session_id', 'command'],
       properties: {
         session_id: { type: 'string' },
-        command: { type: 'string', enum: ['RUN', 'STOP', 'STEP', 'RESET'] },
+        command: { type: 'string', enum: ['RUN', 'STOP', 'STEP', 'RESET', 'CLOSE'] },
         cycles: { type: 'integer', default: 1 },
       },
     },
     handler: (args) => {
       try {
-        const cmd = String(args.command ?? 'STEP').toUpperCase() as 'RUN' | 'STOP' | 'STEP' | 'RESET';
+        const cmd = String(args.command ?? 'STEP').toUpperCase() as 'RUN' | 'STOP' | 'STEP' | 'RESET' | 'CLOSE';
         const cycles = typeof args.cycles === 'number' ? args.cycles : 1;
         return controlSimulator(String(args.session_id ?? ''), cmd, cycles);
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_sim_reload',
+    description: 'Hot-reload an updated .isp project into an active Soft-PLC simulator session (optionally resetting memory).',
+    category: 'Soft-PLC Simulator & Monitor',
+    inputSchema: {
+      type: 'object',
+      required: ['session_id'],
+      properties: {
+        session_id: { type: 'string' },
+        project_path: { type: 'string', description: 'Optional new .isp path to load into this simulator' },
+        reset_state: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        return reloadSimulatorSession(
+          String(args.session_id ?? ''),
+          typeof args.project_path === 'string' ? args.project_path : undefined,
+          Boolean(args.reset_state),
+        );
       } catch (e) {
         return { success: false, error: errMsg(e) };
       }

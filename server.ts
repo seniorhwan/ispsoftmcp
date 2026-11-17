@@ -43,104 +43,142 @@ app.get(['/mcp', '/.well-known/mcp.json'], (_req: Request, res: Response) => {
   });
 });
 
-app.post('/mcp', (req: Request, res: Response) => {
-  const msg = req.body as {
-    jsonrpc?: string;
-    id?: string | number | null;
-    method?: string;
-    params?: Record<string, unknown>;
-  };
-
-  if (!msg || typeof msg !== 'object' || !msg.method) {
-    res.status(400).json({
-      jsonrpc: '2.0',
-      id: null,
-      error: { code: -32600, message: 'Invalid JSON-RPC request' },
-    });
-    return;
-  }
-
+function handleSingleRpc(msg: {
+  jsonrpc?: string;
+  id?: string | number | null;
+  method?: string;
+  params?: Record<string, unknown>;
+}) {
   const id = msg.id ?? null;
-
-  if (msg.method === 'notifications/initialized') {
-    res.status(204).end();
-    return;
+  if (!msg || typeof msg !== 'object' || !msg.method) {
+    return {
+      status: 400,
+      body: { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid JSON-RPC request' } },
+    };
   }
-
+  if (msg.method.startsWith('notifications/')) {
+    return { status: 204, body: null };
+  }
   if (msg.method === 'ping') {
-    res.json({ jsonrpc: '2.0', id, result: {} });
-    return;
+    return { status: 200, body: { jsonrpc: '2.0', id, result: {} } };
   }
-
   if (msg.method === 'initialize') {
-    res.json({
-      jsonrpc: '2.0',
-      id,
-      result: {
-        protocolVersion: '2025-03-26',
-        capabilities: {
-          tools: { listChanged: false },
-        },
-        serverInfo: {
-          name: 'ispsoft',
-          version: '1.0.0',
+    return {
+      status: 200,
+      body: {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          protocolVersion: '2025-03-26',
+          capabilities: {
+            tools: { listChanged: false },
+          },
+          serverInfo: {
+            name: 'ispsoft',
+            version: '1.0.0',
+          },
         },
       },
-    });
-    return;
+    };
   }
-
   if (msg.method === 'tools/list') {
-    res.json({
-      jsonrpc: '2.0',
-      id,
-      result: {
-        tools: MCP_TOOLS.map((t) => ({
-          name: t.name,
-          description: t.description,
-          inputSchema: t.inputSchema,
-        })),
+    return {
+      status: 200,
+      body: {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          tools: MCP_TOOLS.map((t) => ({
+            name: t.name,
+            description: t.description,
+            inputSchema: t.inputSchema,
+          })),
+        },
       },
-    });
-    return;
+    };
   }
-
+  if (msg.method === 'resources/list') {
+    return { status: 200, body: { jsonrpc: '2.0', id, result: { resources: [] } } };
+  }
+  if (msg.method === 'prompts/list') {
+    return { status: 200, body: { jsonrpc: '2.0', id, result: { prompts: [] } } };
+  }
   if (msg.method === 'tools/call') {
     const params = msg.params ?? {};
     const toolName = String(params.name ?? '');
     const args = (params.arguments as Record<string, unknown>) ?? {};
     const found = MCP_TOOLS.find((t) => t.name === toolName);
     if (!found) {
-      res.json({
-        jsonrpc: '2.0',
-        id,
-        error: { code: -32602, message: `Unknown MCP tool: ${toolName}` },
-      });
-      return;
+      return {
+        status: 200,
+        body: {
+          jsonrpc: '2.0',
+          id,
+          error: { code: -32602, message: `Unknown MCP tool: ${toolName}` },
+        },
+      };
     }
     const output = executeMcpTool(toolName, args);
-    const isError = output.success === false || output.valid === false;
-    res.json({
+    const failStatuses = new Set([
+      'REJECTED_BEFORE_WRITE',
+      'WRITE_FAILED',
+      'UNSUPPORTED_MODEL',
+      'MODEL_NOT_QUALIFIED',
+      'REJECTED_BEFORE_IO',
+      'BLOCKED',
+      'CANDIDATE_FAILED',
+      'CREATE_FAILED',
+    ]);
+    const isError =
+      output.success === false ||
+      output.valid === false ||
+      failStatuses.has(String(output.status ?? ''));
+    return {
+      status: 200,
+      body: {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(output, null, 2),
+            },
+          ],
+          isError,
+        },
+      },
+    };
+  }
+  return {
+    status: 200,
+    body: {
       jsonrpc: '2.0',
       id,
-      result: {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(output, null, 2),
-          },
-        ],
-        isError,
-      },
-    });
+      error: { code: -32601, message: `Method not found: ${msg.method}` },
+    },
+  };
+}
+
+app.post('/mcp', (req: Request, res: Response) => {
+  if (Array.isArray(req.body)) {
+    const responses = req.body
+      .map((item) => handleSingleRpc(item))
+      .filter((r) => r.status !== 204 && r.body !== null)
+      .map((r) => r.body);
+    if (!responses.length) {
+      res.status(204).end();
+      return;
+    }
+    res.json(responses);
     return;
   }
-
-  res.json({
-    jsonrpc: '2.0',
-    id,
-    error: { code: -32601, message: `Method not found: ${msg.method}` },
-  });
+  const outcome = handleSingleRpc(req.body);
+  if (outcome.status === 204 || outcome.body === null) {
+    res.status(204).end();
+    return;
+  }
+  res.status(outcome.status).json(outcome.body);
 });
 
 // ===========================================================================

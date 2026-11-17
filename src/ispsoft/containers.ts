@@ -384,9 +384,6 @@ export function replaceLdPouNetworks(
     throw new FileTransformError('The named POU is not a Ladder Diagram POU.');
   }
   const oldNetworks = ldNetworkMatches(pouBody);
-  if (!oldNetworks.length) {
-    throw new FileTransformError('The target LD POU has no replaceable networks.');
-  }
   for (const item of replacementNetworks) {
     const bodyMatch = /^<NETWORK_START>\r*\n([\s\S]*?)\r*\n<NETWORK_END>$/i.exec(item.trim());
     if (!bodyMatch) {
@@ -397,15 +394,19 @@ export function replaceLdPouNetworks(
       throw new FileTransformError(`Invalid generated LD network: ${errs.join('; ')}`);
     }
   }
-
   const blocks = replacementNetworks
     .map((item) => item.trim().replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n/g, newline))
     .join(newline + newline);
 
-  const updatedPou =
-    pouBody.slice(0, oldNetworks[0].start) +
-    blocks +
-    pouBody.slice(oldNetworks[oldNetworks.length - 1].end);
+  let updatedPou: string;
+  if (oldNetworks.length > 0) {
+    updatedPou =
+      pouBody.slice(0, oldNetworks[0].start) +
+      blocks +
+      pouBody.slice(oldNetworks[oldNetworks.length - 1].end);
+  } else {
+    updatedPou = pouBody.trimEnd() + newline + blocks + newline;
+  }
 
   const updatedSource =
     source.slice(0, pouMatch.innerStart) + updatedPou + source.slice(pouMatch.innerEnd);
@@ -442,6 +443,40 @@ export function parseLocalVariables(sectionText: string): {
   }
   const wrappers = sections(sectionText, 'VAR');
   if (wrappers.length !== 1) {
+    // Fallback: parse standard IEC 61131-3 VAR ... END_VAR blocks (e.g., AS-series projects)
+    const iecEntries: LocalVariableEntry[] = [];
+    const iecErrors: string[] = [];
+    const iecBlockRe = /^\s*(VAR(?:_INPUT|_OUTPUT|_IN_OUT|_GLOBAL)?)\b([\s\S]*?)\bEND_VAR\s*$/gim;
+    let varMatch: RegExpExecArray | null;
+    while ((varMatch = iecBlockRe.exec(sectionText)) !== null) {
+      const varClass = varMatch[1].toUpperCase();
+      for (const rawLine of varMatch[2].split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('(*') || line.startsWith('//')) continue;
+        const decl = /^([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:AT\s+%?[A-Za-z0-9_.]+)?\s*:\s*([^:;]+?)(?:\s*:=\s*([^;]+?))?\s*;\s*(?:\(\*(.*?)\*\))?$/i.exec(line);
+        if (!decl) {
+          iecErrors.push(`unrecognized IEC VAR declaration: ${line}`);
+          continue;
+        }
+        const atMatch = /\bAT\s+%?([A-Za-z][A-Za-z0-9]*\d+)\b/i.exec(line);
+        iecEntries.push({
+          identifier: decl[1],
+          type: decl[2].trim(),
+          address: atMatch ? atMatch[1].toUpperCase() : null,
+          class: varClass,
+          initial_value: (decl[3] ?? '').trim(),
+          comment: decl[4] ? decl[4].trim() : null,
+        });
+      }
+    }
+    if (iecEntries.length > 0 || iecErrors.length > 0) {
+      return {
+        status: iecErrors.length === 0 ? 'PARSED_IEC' : iecEntries.length ? 'PARTIAL' : 'UNPARSED',
+        entries: iecEntries,
+        errors: iecErrors,
+        raw: sectionText,
+      };
+    }
     return {
       status: 'UNPARSED',
       entries: [],
