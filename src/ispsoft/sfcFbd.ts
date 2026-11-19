@@ -54,10 +54,11 @@ export function validateSfcChart(chart: SfcChart): { valid: boolean; errors: str
   const warnings: string[] = [];
   const validQualifiers = new Set<SfcActionQualifier>(['N', 'S', 'R', 'P', 'P1', 'P0', 'L', 'D']);
 
-  if (!chart.steps.length) {
+  if (!chart || !Array.isArray(chart.steps) || !chart.steps.length) {
     errors.push('SFC chart must contain at least one step.');
     return { valid: false, errors, warnings };
   }
+  const transitions = Array.isArray(chart.transitions) ? chart.transitions : [];
 
   const stepNames = new Set<string>();
   const initialSteps: string[] = [];
@@ -92,7 +93,7 @@ export function validateSfcChart(chart: SfcChart): { valid: boolean; errors: str
   const outgoing = new Map<string, string[]>();
   const transNames = new Set<string>();
 
-  for (const tr of chart.transitions) {
+  for (const tr of transitions) {
     if (!tr.name || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(tr.name)) {
       errors.push(`Invalid SFC transition name: ${JSON.stringify(tr.name)}`);
     } else if (transNames.has(tr.name)) {
@@ -212,7 +213,8 @@ export function topologicalSortFbd(diagram: FbdDiagram): { order: FbdBlock[]; cy
 
   for (const b of diagram.blocks) {
     const deps = new Set<string>();
-    for (const src of Object.values(b.inputs ?? {})) {
+    for (const rawSrc of Object.values(b.inputs ?? {})) {
+      const src = typeof rawSrc === 'string' ? rawSrc : String(rawSrc ?? '');
       const m = /^([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z_][A-Za-z0-9_]*$/.exec(src.trim());
       if (m && byId.has(m[1]) && m[1] !== b.id) {
         deps.add(m[1]);
@@ -258,6 +260,11 @@ export function validateFbdDiagram(diagram: FbdDiagram): { valid: boolean; error
   const errors: string[] = [];
   const warnings: string[] = [];
   const ids = new Set<string>();
+
+  if (!diagram || !Array.isArray(diagram.blocks)) {
+    errors.push('FBD diagram must contain a blocks array.');
+    return { valid: false, errors, warnings, execution_order: [] };
+  }
 
   if (!diagram.blocks.length) {
     warnings.push('FBD diagram contains no blocks.');
@@ -567,6 +574,7 @@ export function analyzeDeviceUsageFromTexts(
 
   const devRe = /\b([XYMSTCD])(\d+)\b/gi;
   for (const txt of texts) {
+    devRe.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = devRe.exec(txt)) !== null) {
       const area = m[1].toUpperCase();

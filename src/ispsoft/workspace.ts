@@ -46,12 +46,40 @@ function virtualToDiskPath(virtualKey: string): string {
 }
 
 function persistFileAtomic(virtualKey: string, data: Buffer): void {
+  if (virtualKey === DEFAULT_WORK_DIR) {
+    throw new FileTransformError(`Cannot write a file directly at workspace root ${DEFAULT_WORK_DIR}`);
+  }
   const diskPath = virtualToDiskPath(virtualKey);
   const dir = path.dirname(diskPath);
   fs.mkdirSync(dir, { recursive: true });
   const tmpPath = path.join(dir, `.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
-  fs.writeFileSync(tmpPath, data);
-  fs.renameSync(tmpPath, diskPath);
+  try {
+    fs.writeFileSync(tmpPath, data);
+    fs.renameSync(tmpPath, diskPath);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {
+      // best-effort temp cleanup
+    }
+    throw err;
+  }
+}
+
+export function decodeStrictBase64(b64: string, maxDecodedBytes = MAX_FILE_BYTES): Buffer {
+  const compact = b64.replace(/\s+/g, '');
+  if (!compact) {
+    throw new FileTransformError('content_base64 must be non-empty');
+  }
+  if (compact.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(compact)) {
+    throw new FileTransformError('Invalid base64 encoding in content_base64');
+  }
+  const padding = compact.endsWith('==') ? 2 : compact.endsWith('=') ? 1 : 0;
+  const estBytes = (compact.length / 4) * 3 - padding;
+  if (estBytes > maxDecodedBytes) {
+    throw new FileTransformError(`Decoded base64 payload (${estBytes} bytes) exceeds maximum file size (${maxDecodedBytes} bytes)`);
+  }
+  return Buffer.from(compact, 'base64');
 }
 
 function removeFileFromDisk(virtualKey: string): void {
@@ -156,6 +184,9 @@ export function writeFileBuffer(filePath: string, data: Buffer, allowOverwrite =
     throw new FileTransformError('Output exceeds size limit');
   }
   const key = normalizeVirtualPath(filePath);
+  if (key === DEFAULT_WORK_DIR) {
+    throw new FileTransformError(`Path must name a file inside ${DEFAULT_WORK_DIR}, not the root directory itself`);
+  }
   if (!allowOverwrite && files.has(key)) {
     throw new FileTransformError(`Output must be a new path; overwrites are not supported (${key})`);
   }
@@ -165,6 +196,9 @@ export function writeFileBuffer(filePath: string, data: Buffer, allowOverwrite =
 
 export function deleteWorkspaceFile(filePath: string): boolean {
   const key = normalizeVirtualPath(filePath);
+  if (key === DEFAULT_WORK_DIR) {
+    throw new FileTransformError(`Cannot delete workspace root ${DEFAULT_WORK_DIR}`);
+  }
   return deleteWorkspaceFileInternal(key);
 }
 
@@ -301,12 +335,13 @@ export function getFileMeta(filePath: string) {
 }
 
 export function seedDefaultWorkspace(): void {
-  if (!diskLoaded) {
-    const diskRoot = getDiskWorkspaceRoot();
-    fs.mkdirSync(diskRoot, { recursive: true });
-    scanDiskWorkspace(diskRoot, diskRoot);
-    diskLoaded = true;
+  if (diskLoaded) {
+    return;
   }
+  const diskRoot = getDiskWorkspaceRoot();
+  fs.mkdirSync(diskRoot, { recursive: true });
+  scanDiskWorkspace(diskRoot, diskRoot);
+  diskLoaded = true;
 
   const hasEs2 = files.has('/workspace/sample_es2.isp');
   const hasAs = files.has('/workspace/sample_as228t.isp');

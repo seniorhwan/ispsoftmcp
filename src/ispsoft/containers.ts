@@ -1,6 +1,7 @@
 import {
   FileTransformError,
   MAX_SOURCE_BYTES,
+  assertNoStructuralDelimiters,
   crc32,
   decodeCodepage,
   deflateRawBest,
@@ -179,7 +180,7 @@ export function decodeContainer(data: Buffer): IspContainer {
     }
     offset = candidate;
     const payloadSize = data.readUInt32LE(0x94);
-    if (payloadSize != data.length - (offset - 6)) {
+    if (payloadSize !== data.length - (offset - 6)) {
       throw new FileTransformError('Container payload length mismatch');
     }
     const inflated = inflateRawBounded(data.subarray(offset));
@@ -586,9 +587,7 @@ export function patchSt(
     if (inner.length !== 1) {
       throw new FileTransformError(`Expected exactly one ${tag}; this POU layout is unsupported`);
     }
-    if (/<\/?(?:POU|IL_ST_CODE|LOCAL_VAR)(?:>|\s)/i.test(content)) {
-      throw new FileTransformError('Replacement contains structural container delimiters');
-    }
+    assertNoStructuralDelimiters(content, tag);
     const replacement = normalized(content).replace(/\n/g, container.newline);
     body = body.slice(0, inner[0].innerStart) + replacement + body.slice(inner[0].innerEnd);
   }

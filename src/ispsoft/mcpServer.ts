@@ -15,6 +15,7 @@ export const SERVER_NAME = 'ispsoft';
 export const SERVER_VERSION = '1.2.0';
 export const MCP_PROTOCOL_VERSION = '2025-03-26';
 export const SUPPORTED_PROTOCOL_VERSIONS = new Set(['2025-03-26', '2024-11-05']);
+export const MAX_RPC_BATCH_SIZE = 50;
 
 const MAX_MCP_SESSIONS = 1000;
 const MCP_SESSION_IDLE_TTL_MS = 60 * 60 * 1000;
@@ -262,28 +263,29 @@ export function listStaticAndDynamicResources() {
   ];
   for (const filePath of listAllFiles()) {
     if (/\.isp$/i.test(filePath)) {
-      const name = path.posix.basename(filePath);
+      const relPath = filePath.startsWith('/workspace/') ? filePath.slice('/workspace/'.length) : path.posix.basename(filePath);
+      const encodedName = encodeURIComponent(relPath);
       baseResources.push({
-        uri: `ispsoft://projects/${encodeURIComponent(name)}/overview`,
-        name: `Project Overview: ${name}`,
+        uri: `ispsoft://projects/${encodedName}/overview`,
+        name: `Project Overview: ${relPath}`,
         description: `Structural overview (POUs, tasks, globals, DUTs) for ${filePath}.`,
         mimeType: 'application/json',
       });
       baseResources.push({
-        uri: `ispsoft://projects/${encodeURIComponent(name)}/bundle`,
-        name: `Project JSON Bundle: ${name}`,
+        uri: `ispsoft://projects/${encodedName}/bundle`,
+        name: `Project JSON Bundle: ${relPath}`,
         description: `Complete structured JSON bundle (LD/ST/IL/SFC/FBD code, variables, tasks, DUTs, HWCONFIG, comments) for ${filePath}.`,
         mimeType: 'application/json',
       });
       baseResources.push({
-        uri: `ispsoft://projects/${encodeURIComponent(name)}/hwconfig`,
-        name: `Project HWCONFIG: ${name}`,
+        uri: `ispsoft://projects/${encodedName}/hwconfig`,
+        name: `Project HWCONFIG: ${relPath}`,
         description: `CPU parameters, COM/Ethernet settings, and extension module I/O slots for ${filePath}.`,
         mimeType: 'application/json',
       });
       baseResources.push({
-        uri: `ispsoft://projects/${encodeURIComponent(name)}/device-usage`,
-        name: `Project Device Usage Map: ${name}`,
+        uri: `ispsoft://projects/${encodedName}/device-usage`,
+        name: `Project Device Usage Map: ${relPath}`,
         description: `Allocated and next-free X/Y/M/S/T/C/D device map for ${filePath}.`,
         mimeType: 'application/json',
       });
@@ -338,7 +340,12 @@ export function readMcpResource(uri: string): { contents: Array<{ uri: string; m
   }
   const projMatch = /^ispsoft:\/\/projects\/([^/]+)\/(overview|bundle|source|hwconfig|device-usage)$/.exec(uri);
   if (projMatch) {
-    const fileName = decodeURIComponent(projMatch[1]);
+    let fileName: string;
+    try {
+      fileName = decodeURIComponent(projMatch[1]);
+    } catch {
+      return null;
+    }
     const kind = projMatch[2];
     let data: Record<string, unknown>;
     if (kind === 'hwconfig') {
@@ -359,7 +366,12 @@ export function readMcpResource(uri: string): { contents: Array<{ uri: string; m
   }
   const simMatch = /^ispsoft:\/\/simulator\/([^/]+)\/status$/.exec(uri);
   if (simMatch) {
-    const sid = decodeURIComponent(simMatch[1]);
+    let sid: string;
+    try {
+      sid = decodeURIComponent(simMatch[1]);
+    } catch {
+      return null;
+    }
     try {
       const snap = monitorSimulator(sid, undefined, true);
       return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(snap, null, 2) }] };
@@ -371,6 +383,52 @@ export function readMcpResource(uri: string): { contents: Array<{ uri: string; m
 }
 
 export function handleSingleRpc(
+  msg: RpcMessage,
+  ctx: { requestId: string; idempotencyKeyHeader?: string; mcpSessionId?: string } = {
+    requestId: crypto.randomUUID(),
+  },
+): { status: number; body: Record<string, unknown> | null; newSessionId?: string } {
+  const safeCtx = ctx && typeof ctx.requestId === 'string' ? ctx : { requestId: crypto.randomUUID() };
+  try {
+    return handleSingleRpcInner(msg, safeCtx);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const id = msg && typeof msg === 'object' && !Array.isArray(msg) ? (msg.id ?? null) : null;
+    return {
+      status: 200,
+      body: {
+        jsonrpc: '2.0',
+        id,
+        error: {
+          code: -32603,
+          message: `Internal JSON-RPC error: ${message}`,
+          data: buildStandardizedError({
+            error_code: 'INTERNAL_ERROR',
+            domain: 'INTERNAL',
+            severity: 'CRITICAL',
+            message,
+            retryable: false,
+            remediation: 'Inspect error_detail.message and run ispsoft_doctor to verify server health.',
+            recovery_actions: [
+              {
+                action: 'RUN_DIAGNOSTIC_OR_CHECK',
+                description: 'Run server and workspace diagnostics.',
+                suggested_tool: 'ispsoft_doctor',
+                suggested_arguments: {},
+                automated: true,
+                priority: 1,
+              },
+            ],
+            context: { rpc_code: -32603 },
+            request_id: ctx.requestId,
+          }),
+        },
+      },
+    };
+  }
+}
+
+function handleSingleRpcInner(
   msg: RpcMessage,
   ctx: { requestId: string; idempotencyKeyHeader?: string; mcpSessionId?: string },
 ): { status: number; body: Record<string, unknown> | null; newSessionId?: string } {

@@ -60,6 +60,9 @@ export function unpackPackage(data: Buffer): { prefix: Buffer; members: Record<s
     const cmtLen = archiveBuf.readUInt16LE(cursor + 32);
     const extAttr = archiveBuf.readUInt32LE(cursor + 38);
     const lfhOffset = archiveBuf.readUInt32LE(cursor + 42);
+    if (cursor + 46 + fnLen + exLen + cmtLen > eocdOffset) {
+      throw new FileTransformError('Invalid or unsupported package archive');
+    }
     const rawFilename = archiveBuf.subarray(cursor + 46, cursor + 46 + fnLen).toString('utf-8');
     cursor += 46 + fnLen + exLen + cmtLen;
 
@@ -89,6 +92,9 @@ export function unpackPackage(data: Buffer): { prefix: Buffer; members: Record<s
     const lfhFnLen = archiveBuf.readUInt16LE(lfhOffset + 26);
     const lfhExLen = archiveBuf.readUInt16LE(lfhOffset + 28);
     const dataStart = lfhOffset + 30 + lfhFnLen + lfhExLen;
+    if (dataStart > cdOffset || dataStart + csize > cdOffset) {
+      throw new FileTransformError('Invalid or unsupported package archive');
+    }
     const payload = archiveBuf.subarray(dataStart, dataStart + csize);
     if (payload.length !== csize) {
       throw new FileTransformError('Invalid or unsupported package archive');

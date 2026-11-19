@@ -18,7 +18,7 @@ import {
 import { ilToMpu, mpuToIl, parseIl } from './dvp.js';
 import { API_NUM, CONTACT_AND, CONTACT_LD, CONTACT_OR, COIL, nv } from './il2mpu.js';
 import { parseNetworks, netToIl } from './mpu2il.js';
-import { FileTransformError, decodeCodepage, encodeCodepage } from './limits.js';
+import { FileTransformError, assertNoStructuralDelimiters, decodeCodepage, encodeCodepage } from './limits.js';
 import { unpackPackage } from './packages.js';
 import { ENTRY_NAME } from './mpuCodec.js';
 import {
@@ -805,12 +805,15 @@ export function writeSystemVarsInSource(
   const sysSec = sections(source, 'SYSTEM_VAR')[0];
   let inner = sysSec?.inner ?? '';
   for (const [areaRaw, spanRaw] of Object.entries(ranges)) {
-    const area = areaRaw.toUpperCase();
+    const area = areaRaw.toUpperCase().trim();
+    if (!/^[A-Z]{1,4}$/.test(area)) {
+      throw new FileTransformError(`Invalid SYSTEM_VAR area identifier: ${JSON.stringify(areaRaw)}`);
+    }
     const m = /^(\d+)-(\d+)$/.exec(String(spanRaw).trim());
     if (!m || Number(m[1]) > Number(m[2])) {
       throw new FileTransformError(`Invalid range for ${area}: ${spanRaw}`);
     }
-    const lineRe = new RegExp(`^\\s*<${area}>\\d+-\\d+\\s*$`, 'im');
+    const lineRe = new RegExp(`^\\s*<${escapeRegex(area)}>\\d+-\\d+\\s*$`, 'im');
     if (lineRe.test(inner)) {
       inner = inner.replace(lineRe, `<${area}>${m[1]}-${m[2]}`);
     } else {
@@ -849,10 +852,11 @@ export function upsertDutInSource(source: string, name: string, content: string,
   if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name)) {
     throw new FileTransformError('DUT name must be an ASCII IEC identifier');
   }
+  assertNoStructuralDelimiters(content, 'DUT content');
   const encoded = normalized(content).replace(/\n/g, DUT_NL);
   const existing = sections(source, 'DUT_NODE').find((m) => propertyValue(m.inner, 'DutName') === name);
   if (existing) {
-    const updatedInner = existing.inner.replace(/^DutContent=([^\r\n]*)/m, `DutContent=${encoded}`);
+    const updatedInner = existing.inner.replace(/^DutContent=([^\r\n]*)/m, () => `DutContent=${encoded}`);
     return source.slice(0, existing.innerStart) + updatedInner + source.slice(existing.innerEnd);
   }
   const block = ['<DUT_NODE>', `DutName=${name}`, `DutContent=${encoded}`, '</DUT_NODE>'].join(newline);
@@ -1403,9 +1407,24 @@ export function searchProjectSource(
 ) {
   const q = query.trim();
   if (!q) throw new FileTransformError('query must be non-empty');
+  if (q.length > 256) throw new FileTransformError('search query exceeds 256-character limit');
   const scope = options.scope ?? 'all';
-  const flags = options.caseSensitive ? 'g' : 'gi';
-  const pattern = options.regex ? new RegExp(q, flags) : new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+  // Use non-global regex for .test() so stateful lastIndex never skips matches across items
+  const flags = options.caseSensitive ? '' : 'i';
+  let pattern: RegExp;
+  if (options.regex) {
+    // Reject obvious catastrophic-backtracking (ReDoS) nested quantifier patterns
+    if (/(?:\([^)]*[+*?][^)]*\)|\[[^\]]+\][+*?])\s*[+*?{]/.test(q) || /\{\s*\d{4,}/.test(q)) {
+      throw new FileTransformError('Unsafe regex pattern rejected (nested or oversized quantifiers risk catastrophic backtracking)');
+    }
+    try {
+      pattern = new RegExp(q, flags);
+    } catch (e) {
+      throw new FileTransformError(`Invalid regular expression: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  } else {
+    pattern = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+  }
   const matches: Array<{ scope: string; pou?: string; location: string; text: string }> = [];
 
   if (scope === 'all' || scope === 'comments') {
@@ -1879,6 +1898,7 @@ export function diffProjectsSource(sourceA: string, sourceB: string) {
 }
 
 export function patchIlPouInSource(source: string, pouName: string, ilCode: string, newline = '\r\n'): string {
+  assertNoStructuralDelimiters(ilCode, 'IL code');
   // Validate IL syntax first
   parseIl(ilCode);
   const matches = sections(source, 'POU').filter((m) => propertyValue(m.inner, 'P_Name') === pouName);
@@ -1913,6 +1933,8 @@ export function patchSfcPouInSource(source: string, pouName: string, chart: SfcC
   if (propertyValue(match.inner, 'P_Lang') !== '4') {
     throw new FileTransformError(`POU ${JSON.stringify(pouName)} is not an SFC POU (P_Lang=4)`);
   }
+  const serialized = JSON.stringify(chart);
+  assertNoStructuralDelimiters(serialized, 'SFC chart');
   const block = serializeSfcBody(chart, newline);
   const sfcSecs = sections(match.inner, 'SFC_BODY');
   const newBody =
@@ -1935,6 +1957,8 @@ export function patchFbdPouInSource(source: string, pouName: string, diagram: Fb
   if (propertyValue(match.inner, 'P_Lang') !== '5') {
     throw new FileTransformError(`POU ${JSON.stringify(pouName)} is not an FBD POU (P_Lang=5)`);
   }
+  const serialized = JSON.stringify(diagram);
+  assertNoStructuralDelimiters(serialized, 'FBD diagram');
   const block = serializeFbdBody(diagram, newline);
   const fbdSecs = sections(match.inner, 'FBD_BODY');
   const newBody =
@@ -1942,6 +1966,97 @@ export function patchFbdPouInSource(source: string, pouName: string, diagram: Fb
       ? match.inner.slice(0, fbdSecs[0].start) + block + match.inner.slice(fbdSecs[0].end)
       : match.inner.trimEnd() + newline + block + newline;
   return source.slice(0, match.innerStart) + newBody + source.slice(match.innerEnd);
+}
+
+export function refactorSymbolInSource(
+  source: string,
+  findSymRaw: string,
+  repSymRaw: string,
+): { updatedSource: string; replacementCount: number } {
+  const findSym = findSymRaw.trim();
+  const repSym = repSymRaw.trim();
+  if (!findSym || !repSym) {
+    throw new FileTransformError('find_symbol and replace_symbol must be non-empty');
+  }
+  if (/[\r\n]/.test(repSym)) {
+    throw new FileTransformError('replace_symbol must not contain newline characters');
+  }
+  assertNoStructuralDelimiters(repSym, 'replace_symbol');
+
+  const tokenRe = new RegExp(`(?<![A-Za-z0-9_])${escapeRegex(findSym)}(?![A-Za-z0-9_])`, 'g');
+  let replacementCount = 0;
+
+  const replaceSafeTokens = (chunk: string): string =>
+    chunk.replace(tokenRe, () => {
+      replacementCount += 1;
+      return repSym;
+    });
+
+  // Replace only within user-content sections; never touch <PROJECT>, <POU>, <NETWORK_*>, TYPE=, P_Lang=, etc.
+  const replaceSectionTag = (
+    text: string,
+    tag: string,
+    transform: (inner: string) => string,
+  ): string => {
+    const matches = sections(text, tag);
+    if (!matches.length) return text;
+    let out = text;
+    for (let i = matches.length - 1; i >= 0; i--) {
+      const m = matches[i];
+      const nextInner = transform(m.inner);
+      out = out.slice(0, m.innerStart) + nextInner + out.slice(m.innerEnd);
+    }
+    return out;
+  };
+
+  let updated = source;
+
+  // 1. Code bodies (ST, IL, SFC, FBD)
+  updated = replaceSectionTag(updated, 'IL_ST_CODE', replaceSafeTokens);
+  updated = replaceSectionTag(updated, 'SFC_BODY', replaceSafeTokens);
+  updated = replaceSectionTag(updated, 'FBD_BODY', replaceSafeTokens);
+
+  // 2. Variable declaration sections (preserve <VAR>, </VAR>, {VAR*}, and IEC VAR/END_VAR keywords)
+  const replaceVarSection = (inner: string): string =>
+    inner
+      .split(/(\r?\n)/)
+      .map((part) => {
+        if (part === '\n' || part === '\r\n') return part;
+        const trimmed = part.trim();
+        if (/^<\/?VAR>$/i.test(trimmed) || /^(?:VAR(?:_INPUT|_OUTPUT|_IN_OUT|_GLOBAL)?|END_VAR)$/i.test(trimmed)) {
+          return part;
+        }
+        // Preserve trailing {VAR_GLOBAL} / {VAR} class tag
+        const classMatch = /(\s+\{[A-Za-z_][A-Za-z0-9_]*\}\s*)$/.exec(part);
+        if (classMatch) {
+          const head = part.slice(0, classMatch.index);
+          return replaceSafeTokens(head) + classMatch[1];
+        }
+        return replaceSafeTokens(part);
+      })
+      .join('');
+
+  updated = replaceSectionTag(updated, 'GLOBAL_VAR', replaceVarSection);
+  updated = replaceSectionTag(updated, 'LOCAL_VAR', replaceVarSection);
+
+  // 3. LD networks: only replace values of DEV_NAME=, VAR_NAME=, NET_LABEL= (never TYPE=, API_NUM=, NET_ACTIVE=, SYMB=)
+  const netMatches = ldNetworkMatches(updated);
+  for (let i = netMatches.length - 1; i >= 0; i--) {
+    const nm = netMatches[i];
+    const nextInner = nm.inner.replace(
+      /^((?:DEV_NAME|VAR_NAME|NET_LABEL)=)([^\r\n]*)/gm,
+      (_full, prefix: string, val: string) => prefix + replaceSafeTokens(val),
+    );
+    updated = updated.slice(0, nm.innerStart) + nextInner + updated.slice(nm.innerEnd);
+  }
+
+  // 4. Device comments block: [DEVICE_CMT_START] ... [DEVICE_CMT_END]
+  updated = updated.replace(
+    /(\[DEVICE_CMT_START\]\r*\n)([\s\S]*?)(\r*\n\[DEVICE_CMT_END\])/,
+    (_full, open: string, body: string, close: string) => open + replaceSafeTokens(body) + close,
+  );
+
+  return { updatedSource: updated, replacementCount };
 }
 
 export function importMpuIntoProjectSource(

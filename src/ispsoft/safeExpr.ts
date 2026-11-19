@@ -34,9 +34,12 @@ type Token =
   | { type: 'rparen' };
 
 const AST_CACHE_LIMIT = 2048;
+const MAX_EXPR_LENGTH = 8192;
+const MAX_PARSE_DEPTH = 96;
 const astCache = new Map<string, ExprNode | null>();
 
 function tokenizeExpr(expr: string): Token[] | null {
+  if (expr.length > MAX_EXPR_LENGTH) return null;
   const tokens: Token[] = [];
   let i = 0;
   const n = expr.length;
@@ -96,6 +99,7 @@ function tokenizeExpr(expr: string): Token[] | null {
 
 class ExprParser {
   private pos = 0;
+  private depth = 0;
   constructor(private readonly tokens: Token[]) {}
 
   parse(): ExprNode | null {
@@ -224,7 +228,10 @@ class ExprParser {
   private parseUnary(): ExprNode | null {
     const op = this.matchOp('!', '-', '+');
     if (op) {
+      if (this.depth >= MAX_PARSE_DEPTH) return null;
+      this.depth += 1;
       const arg = this.parseUnary();
+      this.depth -= 1;
       if (!arg) return null;
       return { kind: 'unary', op: op as '!' | '-' | '+', arg };
     }
@@ -239,8 +246,11 @@ class ExprParser {
       return { kind: 'num', value: t.value };
     }
     if (t.type === 'lparen') {
+      if (this.depth >= MAX_PARSE_DEPTH) return null;
       this.pos += 1;
+      this.depth += 1;
       const inner = this.parseLogicalOr();
+      this.depth -= 1;
       const close = this.peek();
       if (!inner || !close || close.type !== 'rparen') return null;
       this.pos += 1;

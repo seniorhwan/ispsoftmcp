@@ -28,6 +28,7 @@ import {
   readDuts,
   readSystemVars,
   readTasks,
+  refactorSymbolInSource,
   renderLdAsciiForPou,
   replaceTasksInSource,
   resolveModel,
@@ -80,6 +81,7 @@ import {
   FileTransformError,
   MAX_ITEM_CHARS,
   MAX_RESPONSE_CHARS,
+  assertNoStructuralDelimiters,
   budgetPayload,
   computeContentHash,
   decodeCodepage,
@@ -138,6 +140,7 @@ import {
   artifactPath,
   cleanupWorkspaceBackups,
   copyOrMoveWorkspaceFile,
+  decodeStrictBase64,
   deleteWorkspaceFile,
   getCachedMeta,
   getFileMeta,
@@ -607,6 +610,8 @@ export const MCP_TOOLS: McpToolDef[] = [
         backup_path: { type: 'string', description: 'Optional explicit backup path for restore_backup (defaults to <name>.latest.before.isp)' },
         overwrite: { type: 'boolean', default: false },
         prefix: { type: 'string', description: 'Optional directory filter for list/cleanup_backups' },
+        offset_bytes: { type: 'integer', minimum: 0, description: 'Optional byte offset for chunked download_base64' },
+        max_bytes: { type: 'integer', minimum: 1, maximum: 131072, description: 'Optional max chunk bytes for download_base64 (default full file up to budget)' },
       },
     },
     handler: (args) => {
@@ -625,7 +630,7 @@ export const MCP_TOOLS: McpToolDef[] = [
           const target = normalizeVirtualPath(String(args.path ?? ''));
           const b64 = String(args.content_base64 ?? '').trim();
           if (!b64) throw new FileTransformError('content_base64 is required for upload_base64');
-          const data = Buffer.from(b64, 'base64');
+          const data = decodeStrictBase64(b64);
           const saved = writeFileBuffer(target, data, Boolean(args.overwrite));
           return {
             success: true,
@@ -639,13 +644,24 @@ export const MCP_TOOLS: McpToolDef[] = [
         if (action === 'download_base64') {
           const target = normalizeVirtualPath(String(args.path ?? ''));
           const data = readFileBuffer(target);
+          const offset = typeof args.offset_bytes === 'number' && Number.isInteger(args.offset_bytes) && args.offset_bytes >= 0 ? args.offset_bytes : 0;
+          const maxBytes = typeof args.max_bytes === 'number' && Number.isInteger(args.max_bytes) && args.max_bytes > 0 ? args.max_bytes : data.length;
+          if (offset > data.length) {
+            throw new FileTransformError(`offset_bytes (${offset}) exceeds file size (${data.length})`);
+          }
+          const slice = data.subarray(offset, Math.min(data.length, offset + maxBytes));
+          const hasMore = offset + slice.length < data.length;
           return {
             success: true,
             action,
             path: target,
             bytes: data.length,
+            offset_bytes: offset,
+            chunk_bytes: slice.length,
+            has_more: hasMore,
+            ...(hasMore ? { next_offset: offset + slice.length } : {}),
             sha256: sha256(data),
-            content_base64: data.toString('base64'),
+            content_base64: slice.toString('base64'),
           };
         }
         if (action === 'copy' || action === 'move') {
@@ -1079,11 +1095,13 @@ export const MCP_TOOLS: McpToolDef[] = [
             );
           } else if (t === 'write_st') {
             const pouName = String(op.pou_name ?? '');
+            const rawCode = String(op.code ?? '');
+            assertNoStructuralDelimiters(rawCode, 'ST code');
             const pouMatch = sections(source, 'POU').find((m) => propertyValue(m.inner, 'P_Name') === pouName);
             if (!pouMatch) throw new FileTransformError(`POU ${pouName} not found`);
             const stSec = sections(pouMatch.inner, 'IL_ST_CODE')[0];
             if (!stSec) throw new FileTransformError(`POU ${pouName} is missing IL_ST_CODE`);
-            const repCode = normalized(String(op.code ?? '')).replace(/\n/g, c.newline);
+            const repCode = normalized(rawCode).replace(/\n/g, c.newline);
             const newInner = pouMatch.inner.slice(0, stSec.innerStart) + repCode + pouMatch.inner.slice(stSec.innerEnd);
             source = source.slice(0, pouMatch.innerStart) + newInner + source.slice(pouMatch.innerEnd);
           } else if (t === 'write_il') {
@@ -1131,11 +1149,11 @@ export const MCP_TOOLS: McpToolDef[] = [
               Boolean(op.replace_all),
             ).updatedSource;
           } else if (t === 'rename_symbol') {
-            const findSym = String(op.find_symbol ?? '').trim();
-            const repSym = String(op.replace_symbol ?? '').trim();
-            if (!findSym || !repSym) throw new FileTransformError('rename_symbol requires find_symbol and replace_symbol');
-            const tokenRe = new RegExp(`(?<![A-Za-z0-9_])${findSym.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_])`, 'g');
-            source = source.replace(tokenRe, repSym);
+            source = refactorSymbolInSource(
+              source,
+              String(op.find_symbol ?? ''),
+              String(op.replace_symbol ?? ''),
+            ).updatedSource;
           } else {
             throw new FileTransformError(`Unsupported transaction op type: ${t}`);
           }
@@ -2126,12 +2144,10 @@ export const MCP_TOOLS: McpToolDef[] = [
         }
         const c = decodeContainer(original);
         const source = decodeCodepage(c.source, c.encoding);
-        const tokenRe = new RegExp(`(?<![A-Za-z0-9_])${findSym.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_])`, 'g');
-        const matches = source.match(tokenRe) ?? [];
-        const updated = source.replace(tokenRe, repSym);
+        const { updatedSource: updated, replacementCount } = refactorSymbolInSource(source, findSym, repSym);
         const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
         if (args.dry_run) {
-          return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, replacement_count: matches.length, current_content_hash: currentHash };
+          return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, replacement_count: replacementCount, current_content_hash: currentHash };
         }
         const target = typeof args.output_path === 'string' && args.output_path.trim()
           ? normalizeVirtualPath(args.output_path)
@@ -2142,7 +2158,7 @@ export const MCP_TOOLS: McpToolDef[] = [
           status: 'GENERATED_UNCOMPILED',
           candidate: written.target,
           backup: written.backup,
-          replacement_count: matches.length,
+          replacement_count: replacementCount,
           content_hash: computeContentHash('isp', candidateBytes),
         };
       } catch (e) {

@@ -133,7 +133,27 @@ export function encodeCodepage(text: string, encoding: string): Buffer {
     }
     return Buffer.from(bytes);
   }
-  return Buffer.from(text, 'latin1');
+  // For unsupported multi-byte codepages (e.g. cp936/cp950), allow pure ASCII but refuse silent corruption
+  const bytes = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code > 0x7f) {
+      throw new FileTransformError(`Character U+${code.toString(16)} cannot be safely encoded in ${encoding}`);
+    }
+    bytes[i] = code;
+  }
+  return Buffer.from(bytes);
+}
+
+const STRUCTURAL_DELIMITER_RE =
+  /<\/?(?:PROJECT|POU|TASK|GLOBAL_VAR|LOCAL_VAR|IL_ST_CODE|SFC_BODY|FBD_BODY|HWCONFIG|RETAIN_RANGE|DEVICE_INIT|DATA_EXCHANGE|SYSTEM_VAR|DUT|NETWORK_START|NETWORK_END)(?:>|\s)|\[DEVICE_CMT_(?:START|END)\]/i;
+
+export function assertNoStructuralDelimiters(text: string, label = 'content'): void {
+  if (STRUCTURAL_DELIMITER_RE.test(text)) {
+    throw new FileTransformError(
+      `${label} contains reserved ISPSoft container structural delimiter tags that would corrupt the .isp project`,
+    );
+  }
 }
 
 export function enforceValueBudget(
@@ -162,28 +182,73 @@ export function budgetPayload(
 ): Record<string, unknown> {
   const result: Record<string, unknown> = { ...payload };
   for (const [k, v] of Object.entries(result)) {
-    if (typeof v === 'string' && v.length > maxItemChars) {
-      result[k] = enforceValueBudget(v, k, maxItemChars);
+    if (typeof v === 'string') {
+      // Allow explicit base64 binary transfer up to the total response budget (chunk via offset_bytes/max_bytes for larger files)
+      const cap = k === 'content_base64' ? Math.max(maxItemChars, maxResponseChars - 4096) : maxItemChars;
+      if (v.length > cap) {
+        result[k] = enforceValueBudget(
+          v,
+          k,
+          cap,
+          k === 'content_base64'
+            ? 'Binary file exceeds single-response base64 budget; pass offset_bytes and max_bytes (e.g. 98304) to download in chunks.'
+            : undefined,
+        );
+      }
     }
   }
-  const serialized = JSON.stringify(result);
-  if (serialized.length > maxResponseChars) {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(result);
+  } catch {
+    return {
+      success: false,
+      error_code: 'INTERNAL_ERROR',
+      error: 'Response payload could not be serialized to JSON',
+    };
+  }
+  let guard = 0;
+  while (serialized.length > maxResponseChars && guard++ < 8) {
     let largestField: string | null = null;
     let largestLen = 0;
     for (const [k, v] of Object.entries(result)) {
-      if (typeof v === 'string' && v.length > largestLen) {
+      if (k === 'success' || k === 'status' || k === 'error_code' || k === 'error_detail') continue;
+      const len = typeof v === 'string' ? v.length : JSON.stringify(v)?.length ?? 0;
+      if (len > largestLen) {
         largestField = k;
-        largestLen = v.length;
+        largestLen = len;
       }
     }
-    if (largestField && largestLen > 1000) {
+    if (!largestField || largestLen <= 1000) break;
+    const val = result[largestField];
+    if (typeof val === 'string') {
       result[largestField] = enforceValueBudget(
-        result[largestField] as string,
+        val,
         largestField,
         1000,
         'Response size exceeded total response budget limit (180k chars).',
       );
+    } else if (Array.isArray(val) && val.length > 10) {
+      const kept = Math.max(5, Math.floor(val.length / 4));
+      result[largestField] = {
+        _truncated: true,
+        field: largestField,
+        original_count: val.length,
+        shown_count: kept,
+        items: val.slice(0, kept),
+        reason: `Array '${largestField}' truncated to keep response within ${maxResponseChars} chars.`,
+      };
+    } else {
+      result[largestField] = {
+        _omitted: true,
+        field: largestField,
+        character_count: largestLen,
+        budget_limit: maxResponseChars,
+        reason: `Structured field '${largestField}' (${largestLen} chars) omitted to stay within total response budget (${maxResponseChars} chars).`,
+        narrowing_guidance: `Use filters, pagination, compact=true, or section-specific read tools to inspect '${largestField}'.`,
+      };
     }
+    serialized = JSON.stringify(result);
   }
   return result;
 }

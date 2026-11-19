@@ -300,6 +300,99 @@ function matchesJsonType(val: unknown, expectedType: string): boolean {
   }
 }
 
+function validateSchemaValue(
+  propSchema: Record<string, unknown>,
+  val: unknown,
+  fieldPath: string,
+  errors: ValidationIssue[],
+  depth = 0,
+): void {
+  if (depth > 16 || errors.length >= 25) return;
+
+  const expectedType = propSchema.type;
+  if (typeof expectedType === 'string') {
+    if (!matchesJsonType(val, expectedType)) {
+      errors.push({
+        field: fieldPath,
+        message: `Parameter '${fieldPath}' expected type '${expectedType}', got '${val === null ? 'null' : Array.isArray(val) ? 'array' : typeof val}'`,
+      });
+      return;
+    }
+  } else if (Array.isArray(expectedType)) {
+    const ok = expectedType.some((t) => typeof t === 'string' && matchesJsonType(val, t));
+    if (!ok) {
+      errors.push({
+        field: fieldPath,
+        message: `Parameter '${fieldPath}' expected one of [${expectedType.join(', ')}]`,
+      });
+      return;
+    }
+  }
+
+  if (Array.isArray(propSchema.enum) && !propSchema.enum.includes(val)) {
+    errors.push({
+      field: fieldPath,
+      message: `Parameter '${fieldPath}' must be one of [${propSchema.enum.map((x) => JSON.stringify(x)).join(', ')}]`,
+    });
+  }
+
+  if (typeof val === 'string') {
+    if (typeof propSchema.minLength === 'number' && val.length < propSchema.minLength) {
+      errors.push({ field: fieldPath, message: `Parameter '${fieldPath}' length must be >= ${propSchema.minLength}` });
+    }
+    if (typeof propSchema.maxLength === 'number' && val.length > propSchema.maxLength) {
+      errors.push({ field: fieldPath, message: `Parameter '${fieldPath}' length must be <= ${propSchema.maxLength}` });
+    }
+  }
+
+  if (typeof val === 'number') {
+    if (typeof propSchema.minimum === 'number' && val < propSchema.minimum) {
+      errors.push({ field: fieldPath, message: `Parameter '${fieldPath}' must be >= ${propSchema.minimum}` });
+    }
+    if (typeof propSchema.maximum === 'number' && val > propSchema.maximum) {
+      errors.push({ field: fieldPath, message: `Parameter '${fieldPath}' must be <= ${propSchema.maximum}` });
+    }
+  }
+
+  if (Array.isArray(val)) {
+    if (typeof propSchema.minItems === 'number' && val.length < propSchema.minItems) {
+      errors.push({ field: fieldPath, message: `Parameter '${fieldPath}' must contain at least ${propSchema.minItems} item(s)` });
+    }
+    if (typeof propSchema.maxItems === 'number' && val.length > propSchema.maxItems) {
+      errors.push({ field: fieldPath, message: `Parameter '${fieldPath}' must contain at most ${propSchema.maxItems} item(s)` });
+    }
+    if (propSchema.items && typeof propSchema.items === 'object' && !Array.isArray(propSchema.items)) {
+      const itemSchema = propSchema.items as Record<string, unknown>;
+      for (let i = 0; i < val.length; i++) {
+        const prevLen = errors.length;
+        validateSchemaValue(itemSchema, val[i], `${fieldPath}[${i}]`, errors, depth + 1);
+        if (errors.length > prevLen && errors.length >= 10) break;
+      }
+    }
+  }
+
+  if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
+    const obj = val as Record<string, unknown>;
+    const required = Array.isArray(propSchema.required) ? propSchema.required.map(String) : [];
+    for (const reqKey of required) {
+      const v = obj[reqKey];
+      const childPath = fieldPath ? `${fieldPath}.${reqKey}` : reqKey;
+      if (v === undefined || v === null || (typeof v === 'string' && !v.trim() && reqKey !== 'query' && reqKey !== 'code')) {
+        errors.push({ field: childPath, message: `Missing required parameter '${childPath}'` });
+      }
+    }
+    const nestedProps = (propSchema.properties && typeof propSchema.properties === 'object'
+      ? propSchema.properties
+      : null) as Record<string, Record<string, unknown>> | null;
+    if (nestedProps) {
+      for (const [k, childSchema] of Object.entries(nestedProps)) {
+        if (!(k in obj) || obj[k] === undefined) continue;
+        validateSchemaValue(childSchema, obj[k], fieldPath ? `${fieldPath}.${k}` : k, errors, depth + 1);
+      }
+    }
+  }
+}
+
 export function validateToolArguments(
   schema: Record<string, unknown>,
   args: unknown,
@@ -308,77 +401,7 @@ export function validateToolArguments(
   if (args === null || typeof args !== 'object' || Array.isArray(args)) {
     return { valid: false, errors: [{ field: '$', message: 'arguments must be a JSON object' }] };
   }
-  const obj = args as Record<string, unknown>;
-  const required = Array.isArray(schema.required) ? schema.required.map(String) : [];
-  for (const reqKey of required) {
-    const v = obj[reqKey];
-    if (v === undefined || v === null || (typeof v === 'string' && !v.trim() && reqKey !== 'query' && reqKey !== 'code')) {
-      errors.push({ field: reqKey, message: `Missing required parameter '${reqKey}'` });
-    }
-  }
-
-  const props = (schema.properties && typeof schema.properties === 'object' ? schema.properties : {}) as Record<
-    string,
-    Record<string, unknown>
-  >;
-
-  for (const [key, propSchema] of Object.entries(props)) {
-    if (!(key in obj) || obj[key] === undefined) continue;
-    const val = obj[key];
-    if (val === null) continue;
-
-    const expectedType = propSchema.type;
-    if (typeof expectedType === 'string') {
-      if (!matchesJsonType(val, expectedType)) {
-        errors.push({
-          field: key,
-          message: `Parameter '${key}' expected type '${expectedType}', got '${Array.isArray(val) ? 'array' : typeof val}'`,
-        });
-        continue;
-      }
-    } else if (Array.isArray(expectedType)) {
-      const ok = expectedType.some((t) => typeof t === 'string' && matchesJsonType(val, t));
-      if (!ok) {
-        errors.push({
-          field: key,
-          message: `Parameter '${key}' expected one of [${expectedType.join(', ')}]`,
-        });
-        continue;
-      }
-    }
-
-    if (Array.isArray(propSchema.enum) && !propSchema.enum.includes(val)) {
-      errors.push({
-        field: key,
-        message: `Parameter '${key}' must be one of [${propSchema.enum.map((x) => JSON.stringify(x)).join(', ')}]`,
-      });
-    }
-
-    if (typeof val === 'number') {
-      if (typeof propSchema.minimum === 'number' && val < propSchema.minimum) {
-        errors.push({ field: key, message: `Parameter '${key}' must be >= ${propSchema.minimum}` });
-      }
-      if (typeof propSchema.maximum === 'number' && val > propSchema.maximum) {
-        errors.push({ field: key, message: `Parameter '${key}' must be <= ${propSchema.maximum}` });
-      }
-    }
-
-    if (Array.isArray(val) && propSchema.items && typeof propSchema.items === 'object') {
-      const itemType = (propSchema.items as Record<string, unknown>).type;
-      if (typeof itemType === 'string') {
-        for (let i = 0; i < val.length; i++) {
-          if (!matchesJsonType(val[i], itemType)) {
-            errors.push({
-              field: `${key}[${i}]`,
-              message: `Element '${key}[${i}]' expected type '${itemType}'`,
-            });
-            break;
-          }
-        }
-      }
-    }
-  }
-
+  validateSchemaValue(schema, args, '', errors, 0);
   return { valid: errors.length === 0, errors };
 }
 
@@ -990,6 +1013,13 @@ interface IdempotencyEntry {
   response: Record<string, unknown>;
 }
 
+function canonicalJson(val: unknown): string {
+  if (val === null || typeof val !== 'object') return JSON.stringify(val);
+  if (Array.isArray(val)) return '[' + val.map((v) => canonicalJson(v)).join(',') + ']';
+  const keys = Object.keys(val as Record<string, unknown>).sort();
+  return '{' + keys.map((k) => `${JSON.stringify(k)}:${canonicalJson((val as Record<string, unknown>)[k])}`).join(',') + '}';
+}
+
 export class IdempotencyCache {
   private readonly entries = new Map<string, IdempotencyEntry>();
   constructor(
@@ -998,7 +1028,7 @@ export class IdempotencyCache {
   ) {}
 
   private hashArgs(args: Record<string, unknown>): string {
-    return crypto.createHash('sha256').update(JSON.stringify(args)).digest('hex');
+    return crypto.createHash('sha256').update(canonicalJson(args)).digest('hex');
   }
 
   get(
@@ -1017,7 +1047,7 @@ export class IdempotencyCache {
     if (entry.argsHash !== reqHash) {
       return { hit: true, conflict: true };
     }
-    return { hit: true, conflict: false, response: entry.response };
+    return { hit: true, conflict: false, response: structuredClone(entry.response) };
   }
 
   set(toolName: string, key: string, args: Record<string, unknown>, response: Record<string, unknown>): void {
@@ -1029,7 +1059,7 @@ export class IdempotencyCache {
     this.entries.set(composite, {
       argsHash: this.hashArgs(args),
       expiresAt: Date.now() + this.ttlMs,
-      response,
+      response: structuredClone(response),
     });
   }
 

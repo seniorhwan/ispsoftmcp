@@ -10,6 +10,7 @@ import {
   mcpTelemetry,
 } from './src/ispsoft/mcpProtocol.js';
 import {
+  MAX_RPC_BATCH_SIZE,
   MCP_PROTOCOL_VERSION,
   SERVER_NAME,
   SERVER_VERSION,
@@ -20,6 +21,7 @@ import {
 import { listSimulatorSessions, shutdownAllSimulators } from './src/ispsoft/simulator.js';
 import { MCP_TOOLS, executeMcpTool, getAnnotatedTools, getToolDef, isToolResultError } from './src/ispsoft/tools.js';
 import {
+  decodeStrictBase64,
   getWorkspaceStorageStats,
   listAllFiles,
   normalizeVirtualPath,
@@ -74,7 +76,11 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     return;
   }
   const authHeader = req.headers.authorization ?? '';
-  if (authHeader !== `Bearer ${token}`) {
+  const expectedBuf = Buffer.from(`Bearer ${token}`, 'utf8');
+  const receivedBuf = Buffer.from(authHeader, 'utf8');
+  const authed =
+    receivedBuf.length === expectedBuf.length && crypto.timingSafeEqual(receivedBuf, expectedBuf);
+  if (!authed) {
     const reqId = String(res.locals.requestId ?? '');
     const msg = 'Unauthorized: missing or invalid Bearer token';
     const detail = buildStandardizedError({
@@ -214,19 +220,52 @@ app.get('/', (req: Request, res: Response) => {
   res.json(buildServerManifest(req));
 });
 
+const MAX_SSE_CLIENTS = 64;
+let activeSseClients = 0;
+
 app.get(['/mcp', '/.well-known/mcp.json'], (req: Request, res: Response) => {
   const accept = String(req.headers.accept ?? '');
   if (req.path === '/mcp' && accept.includes('text/event-stream')) {
+    if (activeSseClients >= MAX_SSE_CLIENTS) {
+      res.status(503).json({
+        success: false,
+        error_code: 'RESOURCE_LIMIT',
+        error: `Maximum concurrent SSE connections (${MAX_SSE_CLIENTS}) reached`,
+      });
+      return;
+    }
+    activeSseClients += 1;
+    let cleaned = false;
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Mcp-Protocol-Version', MCP_PROTOCOL_VERSION);
     res.flushHeaders?.();
-    res.write(`event: endpoint\ndata: ${JSON.stringify({ endpoint: '/mcp', protocolVersion: MCP_PROTOCOL_VERSION })}\n\n`);
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      clearInterval(heartbeat);
+      activeSseClients = Math.max(0, activeSseClients - 1);
+    };
     const heartbeat = setInterval(() => {
-      res.write(`: heartbeat ${Date.now()}\n\n`);
+      if (res.writableEnded || res.destroyed) {
+        cleanup();
+        return;
+      }
+      try {
+        res.write(`: heartbeat ${Date.now()}\n\n`);
+      } catch {
+        cleanup();
+      }
     }, 15_000);
-    const cleanup = () => clearInterval(heartbeat);
+    try {
+      res.write(`event: endpoint\ndata: ${JSON.stringify({ endpoint: '/mcp', protocolVersion: MCP_PROTOCOL_VERSION })}\n\n`);
+    } catch {
+      cleanup();
+      return;
+    }
     req.on('close', cleanup);
     res.on('close', cleanup);
+    res.on('error', cleanup);
     return;
   }
 
@@ -278,30 +317,34 @@ app.post('/mcp', (req: Request, res: Response) => {
   const idemHeader = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'].trim() : '';
   const mcpSessionId = typeof req.headers['mcp-session-id'] === 'string' ? req.headers['mcp-session-id'].trim() : '';
 
+  res.setHeader('Mcp-Protocol-Version', MCP_PROTOCOL_VERSION);
   if (mcpSessionId && mcpSessions.has(mcpSessionId)) {
     mcpSessions.get(mcpSessionId)!.lastSeenAt = Date.now();
     res.setHeader('Mcp-Session-Id', mcpSessionId);
   }
 
   if (Array.isArray(req.body)) {
-    if (req.body.length === 0) {
-      const msg = 'Invalid empty JSON-RPC batch';
+    if (req.body.length === 0 || req.body.length > MAX_RPC_BATCH_SIZE) {
+      const msg =
+        req.body.length === 0
+          ? 'Invalid empty JSON-RPC batch'
+          : `JSON-RPC batch size (${req.body.length}) exceeds maximum allowed (${MAX_RPC_BATCH_SIZE})`;
       const detail = buildStandardizedError({
-        error_code: 'PROTOCOL_INVALID_REQUEST',
-        domain: 'MCP_PROTOCOL',
+        error_code: req.body.length === 0 ? 'PROTOCOL_INVALID_REQUEST' : 'RESOURCE_LIMIT',
+        domain: req.body.length === 0 ? 'MCP_PROTOCOL' : 'QUOTA_LIMIT',
         severity: 'ERROR',
         message: msg,
         retryable: false,
-        remediation: 'Send at least one JSON-RPC 2.0 request object inside the batch array.',
+        remediation: `Send between 1 and ${MAX_RPC_BATCH_SIZE} JSON-RPC 2.0 request objects per batch.`,
         recovery_actions: [
           {
             action: 'FIX_INPUT_PARAMETERS',
-            description: 'Include one or more JSON-RPC 2.0 requests in the POST /mcp array.',
+            description: `Split batch requests into chunks of at most ${MAX_RPC_BATCH_SIZE} items.`,
             automated: true,
             priority: 1,
           },
         ],
-        context: { http_status: 400, rpc_code: -32600 },
+        context: { http_status: 400, rpc_code: -32600, batch_size: req.body.length, max_batch_size: MAX_RPC_BATCH_SIZE },
         request_id: reqId,
       });
       res.status(400).json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: msg, data: detail }, error_detail: detail });
@@ -513,7 +556,7 @@ app.post('/api/projects/upload', (req: Request, res: Response) => {
       return;
     }
     const target = normalizeVirtualPath(body.filename);
-    const data = Buffer.from(body.content_base64, 'base64');
+    const data = decodeStrictBase64(body.content_base64);
     const saved = writeFileBuffer(target, data, Boolean(body.overwrite));
     res.json({ success: true, path: saved, bytes: data.length, files: listAllFiles() });
   } catch (err) {
@@ -537,8 +580,9 @@ app.get('/api/projects/download', (req: Request, res: Response) => {
     const filePath = String(req.query.path ?? '');
     const norm = normalizeVirtualPath(filePath);
     const data = readFileBuffer(norm);
+    const safeFilename = path.posix.basename(norm).replace(/["\r\n\\]/g, '_');
     res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${path.posix.basename(norm)}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
     res.send(data);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

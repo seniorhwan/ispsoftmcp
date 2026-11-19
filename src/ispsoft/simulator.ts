@@ -29,7 +29,13 @@ import {
 } from './hwConfig.js';
 import { netToIl, parseNetworks } from './mpu2il.js';
 import { Instruction, splitNets } from './il2mpu.js';
-import { FileTransformError, computeContentHash, decodeCodepage, encodeCodepage } from './limits.js';
+import {
+  FileTransformError,
+  assertNoStructuralDelimiters,
+  computeContentHash,
+  decodeCodepage,
+  encodeCodepage,
+} from './limits.js';
 import { evaluateSafeNumericExpr } from './safeExpr.js';
 import {
   FbdDiagram,
@@ -37,6 +43,8 @@ import {
   parseFbdFromPouBody,
   parseSfcFromPouBody,
   topologicalSortFbd,
+  validateFbdDiagram,
+  validateSfcChart,
 } from './sfcFbd.js';
 import {
   MemoryBreakdown,
@@ -1864,10 +1872,15 @@ interface LdExecStats {
   networkMetrics?: Map<string, NetworkTimingSummary>;
 }
 
+const MAX_ST_STATEMENTS_PER_SCAN = 50_000;
+const MAX_STEP_WALL_MS = 4_000;
+
 interface StExecStats {
   loopIterations: number;
   loopCapHits: number;
   callDepthMax: number;
+  totalStatements?: number;
+  budgetExceeded?: boolean;
 }
 
 function recordNetworkMetric(
@@ -2570,7 +2583,8 @@ function evalStBuiltinOrCall(
         break;
       }
     }
-    current = current.slice(0, m.index) + String(val) + current.slice(m.index + m[0].length);
+    const safeVal = typeof val === 'number' && Number.isFinite(val) ? val : 0;
+    current = current.slice(0, m.index) + String(safeVal) + current.slice(m.index + m[0].length);
   }
   return current;
 }
@@ -2887,6 +2901,14 @@ function executeStStatements(
   let statementsExecuted = 0;
 
   while (idx < stmts.length) {
+    if (execStats) {
+      execStats.totalStatements = (execStats.totalStatements ?? 0) + 1;
+      if (execStats.totalStatements > MAX_ST_STATEMENTS_PER_SCAN) {
+        execStats.loopCapHits += 1;
+        execStats.budgetExceeded = true;
+        return { nextIdx: stmts.length, statementsExecuted, exited: true, returned: true };
+      }
+    }
     const raw = stmts[idx].trim();
     const upper = raw.toUpperCase().replace(/;$/, '').trim();
     if (endTokens.has(upper) || (endTokens.has('CASE_LABEL') && upper.startsWith('CASE_LABEL:'))) {
@@ -3114,7 +3136,8 @@ function executeStBlock(
   const stmts = tokenizeStStatements(stCode);
   const outputsWritten: Record<string, boolean | number> = {};
   const loopVars = new Map<string, number>();
-  const res = executeStStatements(stmts, 0, sess, outputsWritten, loopVars, new Set(), callDepth, execStats);
+  const stats: StExecStats = execStats ?? { loopIterations: 0, loopCapHits: 0, callDepthMax: 0, totalStatements: 0 };
+  const res = executeStStatements(stmts, 0, sess, outputsWritten, loopVars, new Set(), callDepth, stats);
   return Object.assign({}, outputsWritten, { __count: res.statementsExecuted, outputs: outputsWritten });
 }
 
@@ -3212,7 +3235,7 @@ function executeSfcPou(sess: SimulatorSession, pou: SimPouProgram): SimSfcTrace 
   }
 
   // Evaluate transitions sorted by priority (lower number = higher priority)
-  const sortedTrans = [...chart.transitions].sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
+  const sortedTrans = [...(chart.transitions ?? [])].sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
   const fired: string[] = [];
   const consumedFrom = new Set<string>();
   const toActivate = new Set<string>();
@@ -3455,8 +3478,14 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
   const sess = getSession(sessionId);
   const count = Math.max(1, Math.min(10_000, cycles));
   sess.lastBreakpointHit = null;
+  const wallStartMs = Date.now();
 
   for (let c = 0; c < count; c++) {
+    if (c > 0 && Date.now() - wallStartMs > MAX_STEP_WALL_MS) {
+      throw new FileTransformError(
+        `Simulator step execution exceeded wall-clock limit (${MAX_STEP_WALL_MS}ms after ${c}/${count} cycles); reduce cycle count or optimize hot loops via ispsoft_sim_diagnostics.`,
+      );
+    }
     const scanT0 = process.hrtime.bigint();
     sess.scan_count += 1;
     sess.elapsed_ms += sess.scan_interval_ms;
@@ -3984,7 +4013,13 @@ export function stepSimulatorUntil(sessionId: string, expr: string, maxCycles = 
   let cyclesExecuted = 0;
   let conditionMet = false;
 
+  const wallStartMs = Date.now();
   for (let i = 0; i < limit; i++) {
+    if (i > 0 && Date.now() - wallStartMs > MAX_STEP_WALL_MS) {
+      throw new FileTransformError(
+        `step_until exceeded wall-clock limit (${MAX_STEP_WALL_MS}ms after ${cyclesExecuted} cycles) waiting for: ${expr}`,
+      );
+    }
     stepSimulator(sessionId, 1);
     cyclesExecuted += 1;
     if (evaluateConditionExpr(sess, expr)) {
@@ -4066,7 +4101,14 @@ export function runSimulatorSequence(
           actual = readWord(sess, k);
         }
         observed[k] = actual;
-        if (actual !== expected) {
+        const isFloatCompare =
+          typeof actual === 'number' &&
+          typeof expected === 'number' &&
+          (!Number.isInteger(expected) || !Number.isInteger(actual) || (sym ? isFloatType(sym.entry.type) : false));
+        const matches = isFloatCompare
+          ? Math.abs((actual as number) - (expected as number)) <= 1e-5
+          : actual === expected;
+        if (!matches) {
           assertionFailures.push(`${k}: expected ${String(expected)}, got ${String(actual)}`);
         }
       }
@@ -4350,36 +4392,67 @@ export function onlineEditSimulatorPou(
     throw new FileTransformError(`POU ${JSON.stringify(options.pouName)} not found in simulator session`);
   }
 
+  // Validate and stage everything BEFORE mutating live simulator state (transactional safety)
   let updatedKind = '';
+  let nextLang = pou.lang;
+  let nextStCode = pou.stCode;
+  let nextNetworks = pou.networks;
+  let nextSfcChart = pou.sfcChart;
+  let nextFbdDiagram = pou.fbdDiagram;
+
   if (typeof options.stCode === 'string') {
-    pou.lang = '2';
-    pou.stCode = options.stCode;
+    assertNoStructuralDelimiters(options.stCode, 'ST code');
+    if (options.persistToDisk && pou.lang !== '2') {
+      throw new FileTransformError(`Cannot persist ST online edit to non-ST POU ${JSON.stringify(pou.name)} (P_Lang=${pou.lang})`);
+    }
+    nextLang = '2';
+    nextStCode = options.stCode;
     updatedKind = 'ST';
   } else if (typeof options.ilCode === 'string') {
+    assertNoStructuralDelimiters(options.ilCode, 'IL code');
     const nets = parseIlCodeToNetworks(options.ilCode);
     if (!nets.length && options.ilCode.trim()) {
       throw new FileTransformError('Online Edit failed: unable to parse IL code.');
     }
-    pou.lang = pou.lang === '1' ? '1' : '3';
-    pou.networks = nets;
-    pou.stCode = options.ilCode;
-    updatedKind = pou.lang === '1' ? 'LD' : 'IL';
+    if (options.persistToDisk && pou.lang !== '1' && pou.lang !== '3') {
+      throw new FileTransformError(`Cannot persist IL/LD online edit to POU ${JSON.stringify(pou.name)} (P_Lang=${pou.lang})`);
+    }
+    nextLang = pou.lang === '1' ? '1' : '3';
+    nextNetworks = nets;
+    nextStCode = options.ilCode;
+    updatedKind = nextLang === '1' ? 'LD' : 'IL';
   } else if (options.sfcChart) {
-    pou.lang = '4';
-    pou.sfcChart = options.sfcChart;
+    const check = validateSfcChart(options.sfcChart);
+    if (!check.valid) {
+      throw new FileTransformError(`Invalid SFC chart in online edit: ${check.errors.join('; ')}`);
+    }
+    assertNoStructuralDelimiters(JSON.stringify(options.sfcChart), 'SFC chart');
+    if (options.persistToDisk && pou.lang !== '4') {
+      throw new FileTransformError(`Cannot persist SFC online edit to non-SFC POU ${JSON.stringify(pou.name)} (P_Lang=${pou.lang})`);
+    }
+    nextLang = '4';
+    nextSfcChart = options.sfcChart;
     updatedKind = 'SFC';
   } else if (options.fbdDiagram) {
-    pou.lang = '5';
-    pou.fbdDiagram = options.fbdDiagram;
+    const check = validateFbdDiagram(options.fbdDiagram);
+    if (!check.valid) {
+      throw new FileTransformError(`Invalid FBD diagram in online edit: ${check.errors.join('; ')}`);
+    }
+    assertNoStructuralDelimiters(JSON.stringify(options.fbdDiagram), 'FBD diagram');
+    if (options.persistToDisk && pou.lang !== '5') {
+      throw new FileTransformError(`Cannot persist FBD online edit to non-FBD POU ${JSON.stringify(pou.name)} (P_Lang=${pou.lang})`);
+    }
+    nextLang = '5';
+    nextFbdDiagram = options.fbdDiagram;
     updatedKind = 'FBD';
   } else {
     throw new FileTransformError('Online Edit requires one of ilCode, stCode, sfcChart, or fbdDiagram.');
   }
 
   let persisted = false;
+  let nextBytes: Buffer | null = null;
   if (options.persistToDisk) {
     const c = decodeContainer(sess.raw_isp_bytes);
-    let nextBytes: Buffer;
     if (updatedKind === 'ST' && typeof options.stCode === 'string') {
       nextBytes = patchSt(c, pou.name, options.stCode, null);
     } else {
@@ -4397,9 +4470,18 @@ export function onlineEditSimulatorPou(
       nextBytes = c.rebuild(encodeCodepage(src, c.encoding));
     }
     writeFileBuffer(sess.project_path, nextBytes, true);
+    persisted = true;
+  }
+
+  // Commit staged updates atomically
+  pou.lang = nextLang;
+  pou.stCode = nextStCode;
+  pou.networks = nextNetworks;
+  pou.sfcChart = nextSfcChart;
+  pou.fbdDiagram = nextFbdDiagram;
+  if (nextBytes) {
     sess.raw_isp_bytes = nextBytes;
     sess.project_hash = computeContentHash('isp', nextBytes);
-    persisted = true;
   }
 
   return {

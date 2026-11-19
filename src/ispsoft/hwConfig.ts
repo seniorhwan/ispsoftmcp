@@ -1,4 +1,5 @@
 import { sections, propertyValue, escapeRegex } from './containers.js';
+import { assertNoStructuralDelimiters } from './limits.js';
 import { findExtensionModuleSpec } from './referenceCatalog.js';
 
 export interface SerialPortConfig {
@@ -157,6 +158,7 @@ export function defaultRetainConfig(model = 'ES2'): RetainConfigDocument {
 
 function upsertCustomSection(source: string, tag: string, jsonPayload: unknown, newline = '\r\n'): string {
   const body = JSON.stringify(jsonPayload, null, 2).replace(/\n/g, newline);
+  assertNoStructuralDelimiters(body, tag);
   const block = `<${tag}>${newline}${body}${newline}</${tag}>`;
   const existing = sections(source, tag);
   if (existing.length > 0) {
