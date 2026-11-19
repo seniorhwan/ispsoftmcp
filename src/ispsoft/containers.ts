@@ -11,7 +11,18 @@ import {
 
 export type ContainerLayout = 'ispsoft-3.24-v8' | 'as-v3010' | 'legacy';
 
+export interface ContainerInspectSummary {
+  stream_offset: number;
+  layout: ContainerLayout;
+  source_bytes: number;
+  encoding: string;
+  project_model: string | null;
+  pous: Array<{ name: string | null; language: string | null; pou_type: string | null }>;
+}
+
 export class IspContainer {
+  public _cachedInspect?: ContainerInspectSummary;
+
   constructor(
     public readonly data: Buffer,
     public readonly offset: number,
@@ -20,6 +31,7 @@ export class IspContainer {
     public readonly newline: string,
     public readonly layout: ContainerLayout = 'legacy',
     public readonly trailerOffset: number | null = null,
+    public readonly decodedText?: string,
   ) {}
 
   rebuild(newSource: Buffer): Buffer {
@@ -121,9 +133,20 @@ export function ldNetworks(text: string): string[] {
   return ldNetworkMatches(text).map((m) => m.inner);
 }
 
+const DECODE_CACHE_LIMIT = 64;
+const decodedContainerCache = new Map<string, IspContainer>();
+
 export function decodeContainer(data: Buffer): IspContainer {
   if (data.length <= 0xaa) {
     throw new FileTransformError('Truncated ISP container');
+  }
+  const cacheKey = `${data.length}:${crc32(data)}`;
+  const cached = decodedContainerCache.get(cacheKey);
+  if (cached && cached.data.equals(data)) {
+    // Refresh LRU order
+    decodedContainerCache.delete(cacheKey);
+    decodedContainerCache.set(cacheKey, cached);
+    return cached;
   }
   const fileVersion = data.readUInt32LE(0x0c);
   const formatVersion = data.readUInt32LE(0x10);
@@ -235,22 +258,36 @@ export function decodeContainer(data: Buffer): IspContainer {
   }
 
   const newline = source.includes('\r\r\n') ? '\r\r\n' : source.includes('\r\n') ? '\r\n' : '\n';
-  return new IspContainer(data, offset, source, encoding, newline, layout, trailerOffset);
+  // Store an immutable snapshot of input bytes for exact cache equality verification
+  const container = new IspContainer(Buffer.from(data), offset, source, encoding, newline, layout, trailerOffset, text);
+  if (decodedContainerCache.size >= DECODE_CACHE_LIMIT) {
+    const oldest = decodedContainerCache.keys().next().value;
+    if (oldest !== undefined) decodedContainerCache.delete(oldest);
+  }
+  decodedContainerCache.set(cacheKey, container);
+  return container;
 }
 
-export function inspectContainer(container: IspContainer) {
-  const text = decodeCodepage(container.source, container.encoding);
+export function inspectContainer(container: IspContainer): ContainerInspectSummary {
+  if (!container._cachedInspect) {
+    const text = container.decodedText ?? decodeCodepage(container.source, container.encoding);
+    container._cachedInspect = {
+      stream_offset: container.offset,
+      layout: container.layout,
+      source_bytes: container.source.length,
+      encoding: container.encoding,
+      project_model: propertyValue(text, 'Prj_DT'),
+      pous: sections(text, 'POU').map((m) => ({
+        name: propertyValue(m.inner, 'P_Name'),
+        language: propertyValue(m.inner, 'P_Lang'),
+        pou_type: propertyValue(m.inner, 'P_type'),
+      })),
+    };
+  }
+  const c = container._cachedInspect;
   return {
-    stream_offset: container.offset,
-    layout: container.layout,
-    source_bytes: container.source.length,
-    encoding: container.encoding,
-    project_model: propertyValue(text, 'Prj_DT'),
-    pous: sections(text, 'POU').map((m) => ({
-      name: propertyValue(m.inner, 'P_Name'),
-      language: propertyValue(m.inner, 'P_Lang'),
-      pou_type: propertyValue(m.inner, 'P_type'),
-    })),
+    ...c,
+    pous: c.pous.map((p) => ({ ...p })),
   };
 }
 

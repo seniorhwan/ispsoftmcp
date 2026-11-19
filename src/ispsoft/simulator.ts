@@ -36,10 +36,13 @@ import {
   decodeCodepage,
   encodeCodepage,
 } from './limits.js';
-import { evaluateSafeNumericExpr } from './safeExpr.js';
+import { ExprNode, compileSymbolicStExpr, evaluateSafeNumericExpr, evaluateSymbolicStAst } from './safeExpr.js';
 import {
+  FbdBlock,
   FbdDiagram,
   SfcChart,
+  SfcStep,
+  SfcTransition,
   parseFbdFromPouBody,
   parseSfcFromPouBody,
   topologicalSortFbd,
@@ -159,6 +162,8 @@ export interface SimPouProgram {
   stCode: string;
   sfcChart?: SfcChart | null;
   fbdDiagram?: FbdDiagram | null;
+  _cachedFbdOrder?: FbdBlock[];
+  _cachedSfcPlan?: { stepByName: Map<string, SfcStep>; sortedTrans: SfcTransition[] };
 }
 
 export interface SimulatorDiagnosticsState {
@@ -196,6 +201,10 @@ export interface SimulatorSession {
   timers: Map<string, TimerState>;
   counters: Map<string, CounterState>;
   symbols: Map<string, { address: string | null; type: string; value: number | boolean; initial: number | boolean }>;
+  symbolsByUpper: Map<
+    string,
+    { key: string; entry: { address: string | null; type: string; value: number | boolean; initial: number | boolean } }
+  >;
   dutFields: Map<string, string[]>;
   hwConfig: HwConfigDocument;
   retainConfig: RetainConfigDocument;
@@ -207,7 +216,10 @@ export interface SimulatorSession {
   taskLastRunMs: Map<string, number>;
   interruptsEnabled: boolean;
   tasks: ReturnType<typeof readTasks>;
+  sortedActiveTasks: ReturnType<typeof readTasks>;
   pouPrograms: SimPouProgram[];
+  pouByName: Map<string, SimPouProgram>;
+  pouByUpperName: Map<string, SimPouProgram>;
   lastRungTrace: SimNetworkTrace[];
   lastStTrace: SimStTrace[];
   lastSfcTrace: SimSfcTrace[];
@@ -322,6 +334,7 @@ function is32BitCounter(addr: string): boolean {
 }
 
 function parseBitOfWord(addr: string): { wordAddr: string; bitIdx: number } | null {
+  if (!addr.includes('.')) return null;
   const m = /^([DRVZ]\d+)\.([0-9]|1[0-5]|[A-Fa-f])$/i.exec(addr.trim());
   if (!m) return null;
   const rawBit = m[2];
@@ -330,18 +343,34 @@ function parseBitOfWord(addr: string): { wordAddr: string; bitIdx: number } | nu
   return { wordAddr: m[1].toUpperCase(), bitIdx };
 }
 
+function buildSymbolUpperIndex(
+  symbols: SimulatorSession['symbols'],
+): SimulatorSession['symbolsByUpper'] {
+  const idx: SimulatorSession['symbolsByUpper'] = new Map();
+  for (const [k, v] of symbols.entries()) {
+    const up = k.toUpperCase();
+    if (!idx.has(up)) idx.set(up, { key: k, entry: v });
+  }
+  return idx;
+}
+
+function rebuildScheduleIndexes(sess: SimulatorSession): void {
+  sess.sortedActiveTasks = sess.tasks.filter((t) => t.active).sort((a, b) => a.priority - b.priority);
+  sess.pouByName = new Map();
+  sess.pouByUpperName = new Map();
+  for (const p of sess.pouPrograms) {
+    sess.pouByName.set(p.name, p);
+    sess.pouByUpperName.set(p.name.toUpperCase(), p);
+  }
+}
+
 function resolveSymbol(sess: SimulatorSession, name: string) {
   const trimmed = name.trim();
-  if (sess.symbols.has(trimmed)) {
-    return { key: trimmed, entry: sess.symbols.get(trimmed)! };
+  const exact = sess.symbols.get(trimmed);
+  if (exact !== undefined) {
+    return { key: trimmed, entry: exact };
   }
-  const upper = trimmed.toUpperCase();
-  for (const [k, v] of sess.symbols.entries()) {
-    if (k.toUpperCase() === upper) {
-      return { key: k, entry: v };
-    }
-  }
-  return null;
+  return sess.symbolsByUpper.get(trimmed.toUpperCase()) ?? null;
 }
 
 const _f32Buf = new ArrayBuffer(4);
@@ -367,12 +396,17 @@ const STANDARD_IEC_FBS = new Set([
 ]);
 
 function resolveIndexRegisterAddr(sess: SimulatorSession, rawAddr: string): string {
-  const m = /^([XYMSTCDR])(\d+)([VZE])(\d+)$/i.exec(rawAddr.trim());
-  if (!m) return normAddr(rawAddr);
-  const area = m[1].toUpperCase();
+  const up = normAddr(rawAddr);
+  // Fast-path: indexed addressing always has V, Z, or E after digits (e.g. D10Z0, X0V1)
+  if (up.length < 4 || (!up.includes('V') && !up.includes('Z') && !up.includes('E'))) {
+    return up;
+  }
+  const m = /^([XYMSTCDR])(\d+)([VZE])(\d+)$/.exec(up);
+  if (!m) return up;
+  const area = m[1];
   const isOctal = area === 'X' || area === 'Y';
   const base = parseInt(m[2], isOctal ? 8 : 10);
-  const idxReg = `${m[3].toUpperCase()}${m[4]}`;
+  const idxReg = `${m[3]}${m[4]}`;
   const offset = Math.trunc(sess.words.get(idxReg) ?? 0);
   const effective = Math.max(0, base + offset);
   return isOctal ? `${area}${effective.toString(8).toUpperCase()}` : `${area}${effective}`;
@@ -388,7 +422,15 @@ function resolveHardwareOrWordKey(sess: SimulatorSession, rawName: string): stri
 
 function isBitAddress(addr: string): boolean {
   const t = addr.trim();
-  return /^(X|Y|M|S|SM)\d+$/i.test(t) || /^(X|Y)\d+\.\d+$/i.test(t) || /^(X|Y|M|S)\d+[VZE]\d+$/i.test(t) || parseBitOfWord(t) !== null;
+  if (!t) return false;
+  if (t.includes('.')) {
+    return /^(X|Y)\d+\.\d+$/i.test(t) || parseBitOfWord(t) !== null;
+  }
+  const c0 = t.charCodeAt(0);
+  if (c0 !== 88 && c0 !== 120 && c0 !== 89 && c0 !== 121 && c0 !== 77 && c0 !== 109 && c0 !== 83 && c0 !== 115) {
+    return false;
+  }
+  return /^(X|Y|M|S|SM)\d+$/i.test(t) || /^(X|Y|M|S)\d+[VZE]\d+$/i.test(t);
 }
 
 function parseConst(token: string, sess: SimulatorSession): number {
@@ -417,23 +459,24 @@ function parseConst(token: string, sess: SimulatorSession): number {
 
 function readBit(sess: SimulatorSession, rawAddr: string): boolean {
   const addr = resolveIndexRegisterAddr(sess, rawAddr);
-  if (sess.forcedBits.has(addr)) return sess.forcedBits.get(addr)!;
+  if (sess.forcedBits.size > 0 && sess.forcedBits.has(addr)) return sess.forcedBits.get(addr)!;
 
-  const bow = parseBitOfWord(addr);
-  if (bow) {
-    const w = readWord(sess, bow.wordAddr);
-    return ((w >>> bow.bitIdx) & 1) === 1;
-  }
-
-  const dotT = /^(T\d+)\.(Q|DONE)$/i.exec(addr);
-  if (dotT) {
-    if (sess.forcedBits.has(dotT[1])) return sess.forcedBits.get(dotT[1])!;
-    return sess.timers.get(dotT[1])?.done ?? false;
-  }
-  const dotC = /^(C\d+)\.(Q|DONE)$/i.exec(addr);
-  if (dotC) {
-    if (sess.forcedBits.has(dotC[1])) return sess.forcedBits.get(dotC[1])!;
-    return sess.counters.get(dotC[1])?.done ?? false;
+  if (addr.includes('.')) {
+    const bow = parseBitOfWord(addr);
+    if (bow) {
+      const w = readWord(sess, bow.wordAddr);
+      return ((w >>> bow.bitIdx) & 1) === 1;
+    }
+    const dotT = /^(T\d+)\.(Q|DONE)$/i.exec(addr);
+    if (dotT) {
+      if (sess.forcedBits.has(dotT[1])) return sess.forcedBits.get(dotT[1])!;
+      return sess.timers.get(dotT[1])?.done ?? false;
+    }
+    const dotC = /^(C\d+)\.(Q|DONE)$/i.exec(addr);
+    if (dotC) {
+      if (sess.forcedBits.has(dotC[1])) return sess.forcedBits.get(dotC[1])!;
+      return sess.counters.get(dotC[1])?.done ?? false;
+    }
   }
 
   const sym = resolveSymbol(sess, rawAddr);
@@ -441,10 +484,11 @@ function readBit(sess: SimulatorSession, rawAddr: string): boolean {
     if (sym.entry.address) return readBit(sess, sym.entry.address);
     return Boolean(sym.entry.value);
   }
-  if (/^T\d+$/.test(addr)) {
+  const c0 = addr.charCodeAt(0);
+  if (c0 === 84 && /^T\d+$/.test(addr)) {
     return sess.timers.get(addr)?.done ?? false;
   }
-  if (/^C\d+$/.test(addr)) {
+  if (c0 === 67 && /^C\d+$/.test(addr)) {
     return sess.counters.get(addr)?.done ?? false;
   }
   return sess.bits.get(addr) ?? false;
@@ -452,14 +496,16 @@ function readBit(sess: SimulatorSession, rawAddr: string): boolean {
 
 function writeBit(sess: SimulatorSession, rawAddr: string, val: boolean): void {
   const addr = resolveIndexRegisterAddr(sess, rawAddr);
-  if (sess.forcedBits.has(addr)) return;
+  if (sess.forcedBits.size > 0 && sess.forcedBits.has(addr)) return;
 
-  const bow = parseBitOfWord(addr);
-  if (bow) {
-    const cur = readWord(sess, bow.wordAddr) & 0xffff;
-    const next = val ? (cur | (1 << bow.bitIdx)) : (cur & ~(1 << bow.bitIdx));
-    writeWord(sess, bow.wordAddr, toInt16(next));
-    return;
+  if (addr.includes('.')) {
+    const bow = parseBitOfWord(addr);
+    if (bow) {
+      const cur = readWord(sess, bow.wordAddr) & 0xffff;
+      const next = val ? (cur | (1 << bow.bitIdx)) : (cur & ~(1 << bow.bitIdx));
+      writeWord(sess, bow.wordAddr, toInt16(next));
+      return;
+    }
   }
 
   const sym = resolveSymbol(sess, rawAddr);
@@ -472,7 +518,8 @@ function writeBit(sess: SimulatorSession, rawAddr: string, val: boolean): void {
     sess.bits.set(normAddr(sym.key), val);
     return;
   }
-  if (/^T\d+$/.test(addr)) {
+  const c0 = addr.charCodeAt(0);
+  if (c0 === 84 && /^T\d+$/.test(addr)) {
     const t = sess.timers.get(addr) ?? {
       pv: 0,
       sv: 0,
@@ -485,7 +532,7 @@ function writeBit(sess: SimulatorSession, rawAddr: string, val: boolean): void {
     sess.timers.set(addr, t);
     return;
   }
-  if (/^C\d+$/.test(addr)) {
+  if (c0 === 67 && /^C\d+$/.test(addr)) {
     const c = sess.counters.get(addr) ?? { pv: 0, sv: 0, done: false, prevIn: false };
     c.done = val;
     sess.counters.set(addr, c);
@@ -499,17 +546,19 @@ function writeBit(sess: SimulatorSession, rawAddr: string, val: boolean): void {
 
 function readWord(sess: SimulatorSession, rawAddr: string): number {
   const addr = resolveIndexRegisterAddr(sess, rawAddr);
-  if (sess.forcedWords.has(addr)) return sess.forcedWords.get(addr)!;
+  if (sess.forcedWords.size > 0 && sess.forcedWords.has(addr)) return sess.forcedWords.get(addr)!;
 
-  const dotT = /^(T\d+)\.PV$/i.exec(addr);
-  if (dotT) {
-    if (sess.forcedWords.has(dotT[1])) return sess.forcedWords.get(dotT[1])!;
-    return sess.timers.get(dotT[1])?.pv ?? 0;
-  }
-  const dotC = /^(C\d+)\.PV$/i.exec(addr);
-  if (dotC) {
-    if (sess.forcedWords.has(dotC[1])) return sess.forcedWords.get(dotC[1])!;
-    return sess.counters.get(dotC[1])?.pv ?? 0;
+  if (addr.includes('.')) {
+    const dotT = /^(T\d+)\.PV$/i.exec(addr);
+    if (dotT) {
+      if (sess.forcedWords.has(dotT[1])) return sess.forcedWords.get(dotT[1])!;
+      return sess.timers.get(dotT[1])?.pv ?? 0;
+    }
+    const dotC = /^(C\d+)\.PV$/i.exec(addr);
+    if (dotC) {
+      if (sess.forcedWords.has(dotC[1])) return sess.forcedWords.get(dotC[1])!;
+      return sess.counters.get(dotC[1])?.pv ?? 0;
+    }
   }
 
   const sym = resolveSymbol(sess, rawAddr);
@@ -520,10 +569,11 @@ function readWord(sess: SimulatorSession, rawAddr: string): number {
     }
     return Number(sym.entry.value) || 0;
   }
-  if (/^T\d+$/.test(addr)) {
+  const c0 = addr.charCodeAt(0);
+  if (c0 === 84 && /^T\d+$/.test(addr)) {
     return sess.timers.get(addr)?.pv ?? 0;
   }
-  if (/^C\d+$/.test(addr)) {
+  if (c0 === 67 && /^C\d+$/.test(addr)) {
     return sess.counters.get(addr)?.pv ?? 0;
   }
   return sess.words.get(addr) ?? 0;
@@ -531,7 +581,7 @@ function readWord(sess: SimulatorSession, rawAddr: string): number {
 
 function writeWord(sess: SimulatorSession, rawAddr: string, val: number): void {
   const addr = resolveIndexRegisterAddr(sess, rawAddr);
-  if (sess.forcedWords.has(addr)) return;
+  if (sess.forcedWords.size > 0 && sess.forcedWords.has(addr)) return;
   const sym = resolveSymbol(sess, rawAddr);
   if (sym) {
     if (isFloatType(sym.entry.type)) {
@@ -554,7 +604,8 @@ function writeWord(sess: SimulatorSession, rawAddr: string, val: number): void {
     return;
   }
   const intVal = Math.trunc(val);
-  if (/^T\d+$/.test(addr)) {
+  const c0 = addr.charCodeAt(0);
+  if (c0 === 84 && /^T\d+$/.test(addr)) {
     const t = sess.timers.get(addr) ?? {
       pv: 0,
       sv: 0,
@@ -567,7 +618,7 @@ function writeWord(sess: SimulatorSession, rawAddr: string, val: number): void {
     sess.timers.set(addr, t);
     return;
   }
-  if (/^C\d+$/.test(addr)) {
+  if (c0 === 67 && /^C\d+$/.test(addr)) {
     const c = sess.counters.get(addr) ?? { pv: 0, sv: 0, done: false, prevIn: false };
     c.pv = intVal;
     sess.counters.set(addr, c);
@@ -1024,6 +1075,7 @@ export function startSimulatorSession(projectPath: string, scanIntervalMs = 100)
     timers: new Map(),
     counters: new Map(),
     symbols,
+    symbolsByUpper: buildSymbolUpperIndex(symbols),
     dutFields,
     hwConfig,
     retainConfig,
@@ -1035,7 +1087,10 @@ export function startSimulatorSession(projectPath: string, scanIntervalMs = 100)
     taskLastRunMs: new Map(),
     interruptsEnabled: true,
     tasks,
+    sortedActiveTasks: [],
     pouPrograms,
+    pouByName: new Map(),
+    pouByUpperName: new Map(),
     lastRungTrace: [],
     lastStTrace: [],
     lastSfcTrace: [],
@@ -1049,6 +1104,7 @@ export function startSimulatorSession(projectPath: string, scanIntervalMs = 100)
     last_scan_at: null,
     last_touched_at_ms: nowMs,
   };
+  rebuildScheduleIndexes(session);
   seedInitialSymbolMemory(session);
   captureDiagnosticsBaseline(session);
   sessions.set(sessionId, session);
@@ -1070,6 +1126,8 @@ export function reloadSimulatorSession(sessionId: string, projectPath?: string, 
   sess.pouPrograms = pouPrograms;
   sess.dutFields = dutFields;
   sess.symbols = symbols;
+  sess.symbolsByUpper = buildSymbolUpperIndex(symbols);
+  rebuildScheduleIndexes(sess);
   sess.hwConfig = hwConfig;
   sess.retainConfig = retainConfig;
   sess.deviceInit = deviceInit;
@@ -2371,12 +2429,14 @@ function syncFbInstanceFieldsToSymbols(sess: SimulatorSession, instName: string,
     if (sym) {
       sym.entry.value = fv;
     } else {
-      sess.symbols.set(dotted, {
+      const entry = {
         address: null,
         type: typeof fv === 'boolean' ? 'BOOL' : Number.isInteger(fv) ? 'INT' : 'REAL',
         value: fv,
         initial: fv,
-      });
+      };
+      sess.symbols.set(dotted, entry);
+      sess.symbolsByUpper.set(dotted.toUpperCase(), { key: dotted, entry });
     }
     const up = normAddr(dotted);
     if (typeof fv === 'boolean') sess.bits.set(up, fv);
@@ -2664,6 +2724,69 @@ function resolveArrayAccess(
   return out;
 }
 
+function resolveStTokenNumericValue(
+  tok: string,
+  sess: SimulatorSession,
+  loopVars: Map<string, number>,
+): number {
+  if (loopVars.size > 0) {
+    const lv = loopVars.get(tok);
+    if (lv !== undefined) return lv;
+  }
+  const dotIdx = tok.indexOf('.');
+  if (dotIdx !== -1) {
+    const tcMatch = /^((?:T|C)\d+)\.(Q|DONE|PV)$/i.exec(tok);
+    if (tcMatch) {
+      const upProp = tcMatch[2].toUpperCase();
+      if (upProp === 'PV') return readWord(sess, tcMatch[1]);
+      return readBit(sess, tcMatch[1]) ? 1 : 0;
+    }
+    if (/^[DRVZ]\d+\.(?:1[0-5]|[0-9]|[A-Fa-f])$/i.test(tok)) {
+      return readBit(sess, tok) ? 1 : 0;
+    }
+    const sym = resolveSymbol(sess, tok);
+    if (sym) {
+      return typeof sym.entry.value === 'boolean' ? (sym.entry.value ? 1 : 0) : Number(sym.entry.value) || 0;
+    }
+    const up = tok.toUpperCase();
+    if (sess.bits.has(up)) return sess.bits.get(up) ? 1 : 0;
+    if (sess.words.has(up)) return sess.words.get(up) ?? 0;
+    return 0;
+  }
+
+  const c0 = tok.charCodeAt(0);
+  const c1 = tok.length > 1 ? tok.charCodeAt(1) : 0;
+  if (c1 >= 48 && c1 <= 57) {
+    // Fast-path for standard Delta hardware addresses (X/Y/M/S/T/C/D)
+    if (
+      (c0 === 68 || c0 === 100) &&
+      /^D\d+$/i.test(tok)
+    ) {
+      return readWord(sess, tok);
+    }
+    if (
+      (c0 === 88 || c0 === 120 || c0 === 89 || c0 === 121 || c0 === 77 || c0 === 109 || c0 === 83 || c0 === 115 || c0 === 84 || c0 === 116 || c0 === 67 || c0 === 99) &&
+      /^(X|Y|M|S|T|C)\d+$/i.test(tok)
+    ) {
+      return readBit(sess, tok) ? 1 : 0;
+    }
+  }
+
+  const sym = resolveSymbol(sess, tok);
+  if (sym) {
+    if (sym.entry.address) {
+      return isBitAddress(sym.entry.address)
+        ? (readBit(sess, sym.entry.address) ? 1 : 0)
+        : readWord(sess, sym.entry.address);
+    }
+    return typeof sym.entry.value === 'boolean' ? (sym.entry.value ? 1 : 0) : Number(sym.entry.value) || 0;
+  }
+  const up = tok.toUpperCase();
+  if (sess.bits.has(up)) return sess.bits.get(up) ? 1 : 0;
+  if (sess.words.has(up)) return sess.words.get(up) ?? 0;
+  return 0;
+}
+
 function evalStExpression(
   expr: string,
   sess: SimulatorSession,
@@ -2671,35 +2794,56 @@ function evalStExpression(
   callDepth = 0,
   execStats?: StExecStats,
 ): number {
-  let clean = expr.trim().replace(/\bTRUE\b/gi, '1').replace(/\bFALSE\b/gi, '0');
-  clean = clean.replace(/16#([0-9A-Fa-f_]+)/g, (_m, h) => String(parseInt(String(h).replace(/_/g, ''), 16)));
-  clean = clean.replace(/2#([01_]+)/g, (_m, b) => String(parseInt(String(b).replace(/_/g, ''), 2)));
-  clean = clean.replace(/8#([0-7_]+)/g, (_m, o) => String(parseInt(String(o).replace(/_/g, ''), 8)));
-  clean = evalStBuiltinOrCall(clean, sess, loopVars, callDepth, execStats);
-  clean = resolveArrayAccess(clean, sess, loopVars, callDepth, execStats);
+  const trimmed = expr.trim();
+  if (!trimmed) return 0;
 
-  // Replace T0.Q / T0.PV / C0.Q / C0.PV / D0.0 first
-  let withDots = clean.replace(/\b((?:T|C)\d+)\.(Q|DONE|PV)\b/gi, (_m, dev, prop) => {
-    const upProp = String(prop).toUpperCase();
-    if (upProp === 'PV') return String(readWord(sess, String(dev)));
-    return readBit(sess, String(dev)) ? '1' : '0';
-  });
-
-  withDots = withDots.replace(/\b([DRVZ]\d+\.(?:1[0-5]|[0-9]|[A-Fa-f]))\b/gi, (_m, bitAddr) => {
-    return readBit(sess, String(bitAddr)) ? '1' : '0';
-  });
-
-  // Replace struct fields like Pump.Speed
-  withDots = withDots.replace(/\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\b/g, (tok) => {
-    const sym = resolveSymbol(sess, tok);
-    if (sym) {
-      return typeof sym.entry.value === 'boolean' ? (sym.entry.value ? '1' : '0') : String(sym.entry.value);
+  // Fast-path 1: Symbolic cached AST (handles 95%+ of ST expressions, loops, conditions, and breakpoints with zero regex work)
+  if (!trimmed.includes('[')) {
+    const symAst = compileSymbolicStExpr(trimmed);
+    if (symAst !== null) {
+      return evaluateSymbolicStAst(symAst, (name) => resolveStTokenNumericValue(name, sess, loopVars));
     }
-    const up = tok.toUpperCase();
-    if (sess.bits.has(up)) return sess.bits.get(up) ? '1' : '0';
-    if (sess.words.has(up)) return String(sess.words.get(up) ?? 0);
-    return '0';
-  });
+  }
+
+  // Fallback path for function/FB calls and array indexing expressions
+  let clean = trimmed.replace(/\bTRUE\b/gi, '1').replace(/\bFALSE\b/gi, '0');
+  if (clean.includes('#')) {
+    clean = clean.replace(/16#([0-9A-Fa-f_]+)/g, (_m, h) => String(parseInt(String(h).replace(/_/g, ''), 16)));
+    clean = clean.replace(/2#([01_]+)/g, (_m, b) => String(parseInt(String(b).replace(/_/g, ''), 2)));
+    clean = clean.replace(/8#([0-7_]+)/g, (_m, o) => String(parseInt(String(o).replace(/_/g, ''), 8)));
+  }
+  if (clean.includes('(')) {
+    clean = evalStBuiltinOrCall(clean, sess, loopVars, callDepth, execStats);
+  }
+  if (clean.includes('[')) {
+    clean = resolveArrayAccess(clean, sess, loopVars, callDepth, execStats);
+  }
+
+  let withDots = clean;
+  if (withDots.includes('.')) {
+    // Replace T0.Q / T0.PV / C0.Q / C0.PV / D0.0 first
+    withDots = withDots.replace(/\b((?:T|C)\d+)\.(Q|DONE|PV)\b/gi, (_m, dev, prop) => {
+      const upProp = String(prop).toUpperCase();
+      if (upProp === 'PV') return String(readWord(sess, String(dev)));
+      return readBit(sess, String(dev)) ? '1' : '0';
+    });
+
+    withDots = withDots.replace(/\b([DRVZ]\d+\.(?:1[0-5]|[0-9]|[A-Fa-f]))\b/gi, (_m, bitAddr) => {
+      return readBit(sess, String(bitAddr)) ? '1' : '0';
+    });
+
+    // Replace struct fields like Pump.Speed
+    withDots = withDots.replace(/\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\b/g, (tok) => {
+      const sym = resolveSymbol(sess, tok);
+      if (sym) {
+        return typeof sym.entry.value === 'boolean' ? (sym.entry.value ? '1' : '0') : String(sym.entry.value);
+      }
+      const up = tok.toUpperCase();
+      if (sess.bits.has(up)) return sess.bits.get(up) ? '1' : '0';
+      if (sess.words.has(up)) return String(sess.words.get(up) ?? 0);
+      return '0';
+    });
+  }
 
   const replaced = withDots.replace(/\b([A-Za-z_][A-Za-z0-9_]*)\b/g, (tok) => {
     const up = tok.toUpperCase();
@@ -2708,27 +2852,7 @@ function evalStExpression(
     if (up === 'XOR') return '^';
     if (up === 'NOT') return '!';
     if (up === 'MOD') return '%';
-    if (loopVars.has(tok)) {
-      return String(loopVars.get(tok)!);
-    }
-    if (/^(X|Y|M|S|T|C)\d+$/i.test(tok)) {
-      return readBit(sess, tok) ? '1' : '0';
-    }
-    if (/^D\d+$/i.test(tok)) {
-      return String(readWord(sess, tok));
-    }
-    const sym = resolveSymbol(sess, tok);
-    if (sym) {
-      if (sym.entry.address) {
-        return isBitAddress(sym.entry.address)
-          ? readBit(sess, sym.entry.address) ? '1' : '0'
-          : String(readWord(sess, sym.entry.address));
-      }
-      return typeof sym.entry.value === 'boolean' ? (sym.entry.value ? '1' : '0') : String(sym.entry.value);
-    }
-    if (sess.bits.has(up)) return sess.bits.get(up) ? '1' : '0';
-    if (sess.words.has(up)) return String(sess.words.get(up) ?? 0);
-    return tok;
+    return String(resolveStTokenNumericValue(tok, sess, loopVars));
   });
 
   const jsExpr = replaced
@@ -2739,6 +2863,23 @@ function evalStExpression(
     return 0;
   }
   return evaluateSafeNumericExpr(jsExpr);
+}
+
+const ST_TOKEN_CACHE_LIMIT = 1024;
+const stTokenCache = new Map<string, string[]>();
+const END_TOKENS_IF = new Set(['ELSIF', 'ELSE', 'END_IF']);
+const EMPTY_END_TOKENS = new Set<string>();
+
+function getTokenizedStStatements(stCode: string): string[] {
+  const cached = stTokenCache.get(stCode);
+  if (cached !== undefined) return cached;
+  const stmts = tokenizeStStatements(stCode);
+  if (stTokenCache.size >= ST_TOKEN_CACHE_LIMIT) {
+    const first = stTokenCache.keys().next().value;
+    if (first !== undefined) stTokenCache.delete(first);
+  }
+  stTokenCache.set(stCode, stmts);
+  return stmts;
 }
 
 function tokenizeStStatements(stCode: string): string[] {
@@ -2819,17 +2960,19 @@ function assignStLhs(
   outputsWritten: Record<string, boolean | number>,
   loopVars?: Map<string, number>,
 ): void {
-  const arrMatch = /^([A-Za-z_][A-Za-z0-9_]*)\[([^\[\]]+)\]$/.exec(lhs.trim());
-  if (arrMatch) {
-    const idx = Math.trunc(evalStExpression(arrMatch[2], sess, loopVars ?? new Map()));
-    const key = `${arrMatch[1].toUpperCase()}[${idx}]`;
-    const intVal = Math.trunc(rhsVal);
-    if (!sess.words.has(key) && sess.words.size >= MAX_SIM_MEMORY_KEYS) {
-      throw new FileTransformError(`Simulator word memory limit reached (${MAX_SIM_MEMORY_KEYS} keys)`);
+  if (lhs.includes('[')) {
+    const arrMatch = /^([A-Za-z_][A-Za-z0-9_]*)\[([^\[\]]+)\]$/.exec(lhs.trim());
+    if (arrMatch) {
+      const idx = Math.trunc(evalStExpression(arrMatch[2], sess, loopVars ?? new Map()));
+      const key = `${arrMatch[1].toUpperCase()}[${idx}]`;
+      const intVal = Math.trunc(rhsVal);
+      if (!sess.words.has(key) && sess.words.size >= MAX_SIM_MEMORY_KEYS) {
+        throw new FileTransformError(`Simulator word memory limit reached (${MAX_SIM_MEMORY_KEYS} keys)`);
+      }
+      sess.words.set(key, intVal);
+      outputsWritten[key] = intVal;
+      return;
     }
-    sess.words.set(key, intVal);
-    outputsWritten[key] = intVal;
-    return;
   }
 
   if (loopVars && loopVars.has(lhs)) {
@@ -2854,21 +2997,6 @@ function assignStLhs(
   }
 }
 
-function matchCaseSelector(selector: string, val: number): boolean {
-  for (const part of selector.split(',')) {
-    const p = part.trim();
-    const range = /^(-?\d+)\s*\.\.\s*(-?\d+)$/.exec(p);
-    if (range) {
-      const a = parseInt(range[1], 10);
-      const b = parseInt(range[2], 10);
-      if (val >= a && val <= b) return true;
-    } else if (/^-?\d+$/.test(p) && val === parseInt(p, 10)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 function findMatchingEnd(stmts: string[], startIdx: number, openPrefix: RegExp, closeTok: string): number {
   let depth = 0;
   let i = startIdx + 1;
@@ -2884,178 +3012,165 @@ function findMatchingEnd(stmts: string[], startIdx: number, openPrefix: RegExp, 
   return i;
 }
 
-function executeStStatements(
+interface CompiledExpr {
+  raw: string;
+  ast: ExprNode | null;
+}
+
+type CompiledStStmt =
+  | { kind: 'exit' }
+  | { kind: 'return' }
+  | { kind: 'assign'; lhs: string; rhs: CompiledExpr }
+  | { kind: 'call'; raw: string }
+  | { kind: 'if'; branches: Array<{ cond: CompiledExpr; body: CompiledStStmt[] }>; elseBody: CompiledStStmt[] }
+  | { kind: 'for'; varName: string; start: CompiledExpr; end: CompiledExpr; step: CompiledExpr | null; body: CompiledStStmt[] }
+  | { kind: 'while'; cond: CompiledExpr; body: CompiledStStmt[] }
+  | { kind: 'repeat'; body: CompiledStStmt[]; until: CompiledExpr }
+  | { kind: 'case'; selector: CompiledExpr; branches: Array<{ ranges: Array<[number, number]>; body: CompiledStStmt[] }>; elseBody: CompiledStStmt[] };
+
+function compileStExprOnce(expr: string): CompiledExpr {
+  const raw = expr.trim();
+  const ast = raw && !raw.includes('[') ? compileSymbolicStExpr(raw) : null;
+  return { raw, ast };
+}
+
+function parseCaseRanges(selector: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  for (const part of selector.split(',')) {
+    const p = part.trim();
+    const range = /^(-?\d+)\s*\.\.\s*(-?\d+)$/.exec(p);
+    if (range) {
+      ranges.push([parseInt(range[1], 10), parseInt(range[2], 10)]);
+    } else if (/^-?\d+$/.test(p)) {
+      const v = parseInt(p, 10);
+      ranges.push([v, v]);
+    }
+  }
+  return ranges;
+}
+
+function compileStTokenSlice(
   stmts: string[],
   startIdx: number,
-  sess: SimulatorSession,
-  outputsWritten: Record<string, boolean | number>,
-  loopVars: Map<string, number>,
   endTokens: Set<string>,
-  callDepth = 0,
-  execStats?: StExecStats,
-): { nextIdx: number; statementsExecuted: number; exited: boolean; returned?: boolean } {
-  if (execStats && callDepth > execStats.callDepthMax) {
-    execStats.callDepthMax = callDepth;
-  }
+): { nodes: CompiledStStmt[]; nextIdx: number } {
+  const nodes: CompiledStStmt[] = [];
   let idx = startIdx;
-  let statementsExecuted = 0;
 
   while (idx < stmts.length) {
-    if (execStats) {
-      execStats.totalStatements = (execStats.totalStatements ?? 0) + 1;
-      if (execStats.totalStatements > MAX_ST_STATEMENTS_PER_SCAN) {
-        execStats.loopCapHits += 1;
-        execStats.budgetExceeded = true;
-        return { nextIdx: stmts.length, statementsExecuted, exited: true, returned: true };
-      }
-    }
     const raw = stmts[idx].trim();
     const upper = raw.toUpperCase().replace(/;$/, '').trim();
     if (endTokens.has(upper) || (endTokens.has('CASE_LABEL') && upper.startsWith('CASE_LABEL:'))) {
-      return { nextIdx: idx, statementsExecuted, exited: false };
+      return { nodes, nextIdx: idx };
     }
     if (endTokens.has('UNTIL') && upper.startsWith('UNTIL ')) {
-      return { nextIdx: idx, statementsExecuted, exited: false };
+      return { nodes, nextIdx: idx };
+    }
+    if (endTokens.has('ELSIF') && upper.startsWith('ELSIF ')) {
+      return { nodes, nextIdx: idx };
     }
     if (upper === 'EXIT') {
-      return { nextIdx: idx + 1, statementsExecuted: statementsExecuted + 1, exited: true };
+      nodes.push({ kind: 'exit' });
+      idx += 1;
+      continue;
     }
     if (upper === 'RETURN') {
-      return { nextIdx: stmts.length, statementsExecuted: statementsExecuted + 1, exited: true, returned: true };
+      nodes.push({ kind: 'return' });
+      idx += 1;
+      continue;
     }
 
     if (upper.startsWith('IF ') && upper.endsWith(' THEN')) {
-      let branchTaken = Boolean(evalStExpression(raw.slice(3, -5), sess, loopVars, callDepth, execStats));
+      const branches: Array<{ cond: CompiledExpr; body: CompiledStStmt[] }> = [];
+      let elseBody: CompiledStStmt[] = [];
+      let curCond = compileStExprOnce(raw.slice(3, -5));
       let curIdx = idx + 1;
-      let doneIf = false;
-      let shouldRunBranch = branchTaken;
+      let inElse = false;
 
-      while (curIdx < stmts.length && !doneIf) {
-        if (shouldRunBranch) {
-          const res = executeStStatements(stmts, curIdx, sess, outputsWritten, loopVars, new Set(['ELSIF', 'ELSE', 'END_IF']), callDepth, execStats);
-          statementsExecuted += res.statementsExecuted;
-          curIdx = res.nextIdx;
-          if (res.exited) return { nextIdx: curIdx, statementsExecuted, exited: true, returned: res.returned };
+      while (curIdx <= stmts.length) {
+        const sub = compileStTokenSlice(stmts, curIdx, END_TOKENS_IF);
+        if (inElse) {
+          elseBody = sub.nodes;
         } else {
-          let depth = 0;
-          while (curIdx < stmts.length) {
-            const u = stmts[curIdx].trim().toUpperCase().replace(/;$/, '').trim();
-            if (
-              (u.startsWith('IF ') && u.endsWith(' THEN')) ||
-              (u.startsWith('FOR ') && u.endsWith(' DO')) ||
-              (u.startsWith('WHILE ') && u.endsWith(' DO')) ||
-              (u.startsWith('CASE ') && u.endsWith(' OF')) ||
-              u === 'REPEAT'
-            ) {
-              depth += 1;
-            } else if (u === 'END_IF' || u === 'END_FOR' || u === 'END_WHILE' || u === 'END_CASE' || u === 'END_REPEAT') {
-              if (depth === 0 && u === 'END_IF') break;
-              depth = Math.max(0, depth - 1);
-            } else if (depth === 0 && (u.startsWith('ELSIF ') || u === 'ELSE')) {
-              break;
-            }
-            curIdx += 1;
-          }
+          branches.push({ cond: curCond, body: sub.nodes });
         }
-
+        curIdx = sub.nextIdx;
         if (curIdx >= stmts.length) break;
         const tokRaw = stmts[curIdx].trim();
         const tokUp = tokRaw.toUpperCase().replace(/;$/, '').trim();
         if (tokUp === 'END_IF') {
           curIdx += 1;
-          doneIf = true;
+          break;
         } else if (tokUp.startsWith('ELSIF ') && tokUp.endsWith(' THEN')) {
-          if (!branchTaken) {
-            branchTaken = Boolean(evalStExpression(tokRaw.slice(6, -5), sess, loopVars, callDepth, execStats));
-            shouldRunBranch = branchTaken;
-          } else {
-            shouldRunBranch = false;
-          }
+          inElse = false;
+          curCond = compileStExprOnce(tokRaw.slice(6, -5));
           curIdx += 1;
         } else if (tokUp === 'ELSE') {
-          shouldRunBranch = !branchTaken;
-          branchTaken = true;
+          inElse = true;
           curIdx += 1;
         } else {
           curIdx += 1;
         }
       }
+      nodes.push({ kind: 'if', branches, elseBody });
       idx = curIdx;
       continue;
     }
 
     const caseMatch = /^CASE\s+(.+?)\s+OF$/i.exec(raw);
     if (caseMatch) {
-      const selectorVal = Math.trunc(evalStExpression(caseMatch[1], sess, loopVars, callDepth, execStats));
       const endCaseIdx = findMatchingEnd(stmts, idx, /^CASE\b.+\bOF$/i, 'END_CASE');
       const inner = stmts.slice(idx + 1, endCaseIdx);
+      const branches: Array<{ ranges: Array<[number, number]>; body: CompiledStStmt[] }> = [];
+      let elseBody: CompiledStStmt[] = [];
       let cIdx = 0;
-      let matched = false;
       while (cIdx < inner.length) {
         const cur = inner[cIdx].trim();
         const curUp = cur.toUpperCase();
         if (curUp.startsWith('CASE_LABEL:')) {
           const sel = cur.slice('CASE_LABEL:'.length);
-          const nextBranchIdx = (() => {
-            let d = 0;
-            let j = cIdx + 1;
-            while (j < inner.length) {
-              const iu = inner[j].trim().toUpperCase();
-              if (/^CASE\b.+\bOF$/i.test(iu)) d++;
-              else if (iu === 'END_CASE') d--;
-              else if (d === 0 && (iu.startsWith('CASE_LABEL:') || iu === 'ELSE')) break;
-              j++;
-            }
-            return j;
-          })();
-          if (!matched && matchCaseSelector(sel, selectorVal)) {
-            matched = true;
-            const res = executeStStatements(inner.slice(cIdx + 1, nextBranchIdx), 0, sess, outputsWritten, loopVars, new Set(), callDepth, execStats);
-            statementsExecuted += res.statementsExecuted;
-            if (res.exited) return { nextIdx: endCaseIdx + 1, statementsExecuted, exited: true, returned: res.returned };
-            break;
+          let d = 0;
+          let j = cIdx + 1;
+          while (j < inner.length) {
+            const iu = inner[j].trim().toUpperCase();
+            if (/^CASE\b.+\bOF$/i.test(iu)) d++;
+            else if (iu === 'END_CASE') d--;
+            else if (d === 0 && (iu.startsWith('CASE_LABEL:') || iu === 'ELSE')) break;
+            j++;
           }
-          cIdx = nextBranchIdx;
+          const sub = compileStTokenSlice(inner.slice(cIdx + 1, j), 0, EMPTY_END_TOKENS);
+          branches.push({ ranges: parseCaseRanges(sel), body: sub.nodes });
+          cIdx = j;
           continue;
         }
         if (curUp === 'ELSE') {
-          if (!matched) {
-            const res = executeStStatements(inner.slice(cIdx + 1), 0, sess, outputsWritten, loopVars, new Set(), callDepth, execStats);
-            statementsExecuted += res.statementsExecuted;
-            if (res.exited) return { nextIdx: endCaseIdx + 1, statementsExecuted, exited: true, returned: res.returned };
-          }
+          elseBody = compileStTokenSlice(inner.slice(cIdx + 1), 0, EMPTY_END_TOKENS).nodes;
           break;
         }
         cIdx += 1;
       }
+      nodes.push({
+        kind: 'case',
+        selector: compileStExprOnce(caseMatch[1]),
+        branches,
+        elseBody,
+      });
       idx = endCaseIdx + 1;
       continue;
     }
 
     const forMatch = /^FOR\s+([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*(.+?)\s+TO\s+(.+?)(?:\s+BY\s+(.+?))?\s+DO$/i.exec(raw);
     if (forMatch) {
-      const varName = forMatch[1];
-      const startVal = Math.trunc(evalStExpression(forMatch[2], sess, loopVars, callDepth, execStats));
-      const endVal = Math.trunc(evalStExpression(forMatch[3], sess, loopVars, callDepth, execStats));
-      const stepVal = forMatch[4] ? Math.trunc(evalStExpression(forMatch[4], sess, loopVars, callDepth, execStats)) : 1;
       const endIdx = findMatchingEnd(stmts, idx, /^FOR\b.+\bDO$/i, 'END_FOR');
       const bodyStmts = stmts.slice(idx + 1, endIdx);
-      if (stepVal !== 0) {
-        let iter = 0;
-        for (let v = startVal; stepVal > 0 ? v <= endVal : v >= endVal; v += stepVal) {
-          if (++iter > 10_000) {
-            if (execStats) execStats.loopCapHits += 1;
-            break;
-          }
-          if (execStats) execStats.loopIterations += 1;
-          loopVars.set(varName, v);
-          assignStLhs(sess, varName, v, outputsWritten, loopVars);
-          const res = executeStStatements(bodyStmts, 0, sess, outputsWritten, loopVars, new Set(), callDepth, execStats);
-          statementsExecuted += res.statementsExecuted;
-          if (res.returned) return { nextIdx: endIdx + 1, statementsExecuted, exited: true, returned: true };
-          if (res.exited) break;
-        }
-      }
+      nodes.push({
+        kind: 'for',
+        varName: forMatch[1],
+        start: compileStExprOnce(forMatch[2]),
+        end: compileStExprOnce(forMatch[3]),
+        step: forMatch[4] ? compileStExprOnce(forMatch[4]) : null,
+        body: compileStTokenSlice(bodyStmts, 0, EMPTY_END_TOKENS).nodes,
+      });
       idx = endIdx + 1;
       continue;
     }
@@ -3064,18 +3179,11 @@ function executeStStatements(
     if (whileMatch) {
       const endIdx = findMatchingEnd(stmts, idx, /^WHILE\b.+\bDO$/i, 'END_WHILE');
       const bodyStmts = stmts.slice(idx + 1, endIdx);
-      let iter = 0;
-      while (Boolean(evalStExpression(whileMatch[1], sess, loopVars, callDepth, execStats))) {
-        if (++iter > 10_000) {
-          if (execStats) execStats.loopCapHits += 1;
-          break;
-        }
-        if (execStats) execStats.loopIterations += 1;
-        const res = executeStStatements(bodyStmts, 0, sess, outputsWritten, loopVars, new Set(), callDepth, execStats);
-        statementsExecuted += res.statementsExecuted;
-        if (res.returned) return { nextIdx: endIdx + 1, statementsExecuted, exited: true, returned: true };
-        if (res.exited) break;
-      }
+      nodes.push({
+        kind: 'while',
+        cond: compileStExprOnce(whileMatch[1]),
+        body: compileStTokenSlice(bodyStmts, 0, EMPTY_END_TOKENS).nodes,
+      });
       idx = endIdx + 1;
       continue;
     }
@@ -3086,45 +3194,209 @@ function executeStStatements(
       const bodyEnd = untilIdx !== -1 ? untilIdx : endIdx;
       const untilExpr = untilIdx !== -1 ? stmts[untilIdx].trim().replace(/^UNTIL\s+/i, '') : 'TRUE';
       const bodyStmts = stmts.slice(idx + 1, bodyEnd);
-      let iter = 0;
-      while (true) {
-        if (++iter > 10_000) {
-          if (execStats) execStats.loopCapHits += 1;
-          break;
-        }
-        if (execStats) execStats.loopIterations += 1;
-        const res = executeStStatements(bodyStmts, 0, sess, outputsWritten, loopVars, new Set(), callDepth, execStats);
-        statementsExecuted += res.statementsExecuted;
-        if (res.returned) return { nextIdx: endIdx + 1, statementsExecuted, exited: true, returned: true };
-        if (res.exited) break;
-        if (Boolean(evalStExpression(untilExpr, sess, loopVars, callDepth, execStats))) break;
-      }
+      nodes.push({
+        kind: 'repeat',
+        body: compileStTokenSlice(bodyStmts, 0, EMPTY_END_TOKENS).nodes,
+        until: compileStExprOnce(untilExpr),
+      });
       idx = endIdx + 1;
       continue;
     }
 
-    if (endTokens.has('ELSIF') && upper.startsWith('ELSIF ')) {
-      return { nextIdx: idx, statementsExecuted, exited: false };
-    }
-
     const assign = /^([A-Za-z_][A-Za-z0-9_.\[\]]*)\s*:=\s*(.+?);?\s*$/.exec(raw);
     if (assign) {
-      const rhsVal = evalStExpression(assign[2], sess, loopVars, callDepth, execStats);
-      assignStLhs(sess, assign[1], rhsVal, outputsWritten, loopVars);
-      statementsExecuted += 1;
+      nodes.push({
+        kind: 'assign',
+        lhs: assign[1],
+        rhs: compileStExprOnce(assign[2]),
+      });
       idx += 1;
       continue;
     }
 
-    // Standalone procedure / FB call statement: `MyPou(a := 1, b => X);`
     const procCall = /^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\);?\s*$/.exec(raw);
     if (procCall) {
-      evalStBuiltinOrCall(raw, sess, loopVars, callDepth, execStats);
-      statementsExecuted += 1;
+      nodes.push({ kind: 'call', raw });
     }
     idx += 1;
   }
-  return { nextIdx: idx, statementsExecuted, exited: false };
+
+  return { nodes, nextIdx: idx };
+}
+
+const stCompiledCache = new Map<string, CompiledStStmt[]>();
+
+function getCompiledStProgram(stCode: string): CompiledStStmt[] {
+  const cached = stCompiledCache.get(stCode);
+  if (cached !== undefined) return cached;
+  const stmts = getTokenizedStStatements(stCode);
+  const compiled = compileStTokenSlice(stmts, 0, EMPTY_END_TOKENS).nodes;
+  if (stCompiledCache.size >= ST_TOKEN_CACHE_LIMIT) {
+    const first = stCompiledCache.keys().next().value;
+    if (first !== undefined) stCompiledCache.delete(first);
+  }
+  stCompiledCache.set(stCode, compiled);
+  return compiled;
+}
+
+function evalCompiledExpr(
+  ce: CompiledExpr,
+  sess: SimulatorSession,
+  loopVars: Map<string, number>,
+  resolveVar: (name: string) => number,
+  callDepth: number,
+  execStats?: StExecStats,
+): number {
+  if (ce.ast !== null) {
+    return evaluateSymbolicStAst(ce.ast, resolveVar);
+  }
+  return evalStExpression(ce.raw, sess, loopVars, callDepth, execStats);
+}
+
+function executeCompiledStStmts(
+  nodes: CompiledStStmt[],
+  sess: SimulatorSession,
+  outputsWritten: Record<string, boolean | number>,
+  loopVars: Map<string, number>,
+  resolveVar: (name: string) => number,
+  callDepth = 0,
+  execStats?: StExecStats,
+): { statementsExecuted: number; exited: boolean; returned?: boolean } {
+  if (execStats && callDepth > execStats.callDepthMax) {
+    execStats.callDepthMax = callDepth;
+  }
+  let statementsExecuted = 0;
+
+  for (let i = 0; i < nodes.length; i++) {
+    if (execStats) {
+      execStats.totalStatements = (execStats.totalStatements ?? 0) + 1;
+      if (execStats.totalStatements > MAX_ST_STATEMENTS_PER_SCAN) {
+        execStats.loopCapHits += 1;
+        execStats.budgetExceeded = true;
+        return { statementsExecuted, exited: true, returned: true };
+      }
+    }
+    const stmt = nodes[i];
+    switch (stmt.kind) {
+      case 'assign': {
+        const rhsVal = evalCompiledExpr(stmt.rhs, sess, loopVars, resolveVar, callDepth, execStats);
+        assignStLhs(sess, stmt.lhs, rhsVal, outputsWritten, loopVars);
+        statementsExecuted += 1;
+        break;
+      }
+      case 'if': {
+        let matched = false;
+        for (let b = 0; b < stmt.branches.length; b++) {
+          const br = stmt.branches[b];
+          if (Boolean(evalCompiledExpr(br.cond, sess, loopVars, resolveVar, callDepth, execStats))) {
+            matched = true;
+            const res = executeCompiledStStmts(br.body, sess, outputsWritten, loopVars, resolveVar, callDepth, execStats);
+            statementsExecuted += res.statementsExecuted;
+            if (res.exited) return { statementsExecuted, exited: true, returned: res.returned };
+            break;
+          }
+        }
+        if (!matched && stmt.elseBody.length > 0) {
+          const res = executeCompiledStStmts(stmt.elseBody, sess, outputsWritten, loopVars, resolveVar, callDepth, execStats);
+          statementsExecuted += res.statementsExecuted;
+          if (res.exited) return { statementsExecuted, exited: true, returned: res.returned };
+        }
+        break;
+      }
+      case 'for': {
+        const startVal = Math.trunc(evalCompiledExpr(stmt.start, sess, loopVars, resolveVar, callDepth, execStats));
+        const endVal = Math.trunc(evalCompiledExpr(stmt.end, sess, loopVars, resolveVar, callDepth, execStats));
+        const stepVal = stmt.step ? Math.trunc(evalCompiledExpr(stmt.step, sess, loopVars, resolveVar, callDepth, execStats)) : 1;
+        if (stepVal !== 0) {
+          let iter = 0;
+          for (let v = startVal; stepVal > 0 ? v <= endVal : v >= endVal; v += stepVal) {
+            if (++iter > 10_000) {
+              if (execStats) execStats.loopCapHits += 1;
+              break;
+            }
+            if (execStats) execStats.loopIterations += 1;
+            loopVars.set(stmt.varName, v);
+            assignStLhs(sess, stmt.varName, v, outputsWritten, loopVars);
+            const res = executeCompiledStStmts(stmt.body, sess, outputsWritten, loopVars, resolveVar, callDepth, execStats);
+            statementsExecuted += res.statementsExecuted;
+            if (res.returned) return { statementsExecuted, exited: true, returned: true };
+            if (res.exited) break;
+          }
+        }
+        break;
+      }
+      case 'while': {
+        let iter = 0;
+        while (Boolean(evalCompiledExpr(stmt.cond, sess, loopVars, resolveVar, callDepth, execStats))) {
+          if (++iter > 10_000) {
+            if (execStats) execStats.loopCapHits += 1;
+            break;
+          }
+          if (execStats) execStats.loopIterations += 1;
+          const res = executeCompiledStStmts(stmt.body, sess, outputsWritten, loopVars, resolveVar, callDepth, execStats);
+          statementsExecuted += res.statementsExecuted;
+          if (res.returned) return { statementsExecuted, exited: true, returned: true };
+          if (res.exited) break;
+        }
+        break;
+      }
+      case 'repeat': {
+        let iter = 0;
+        while (true) {
+          if (++iter > 10_000) {
+            if (execStats) execStats.loopCapHits += 1;
+            break;
+          }
+          if (execStats) execStats.loopIterations += 1;
+          const res = executeCompiledStStmts(stmt.body, sess, outputsWritten, loopVars, resolveVar, callDepth, execStats);
+          statementsExecuted += res.statementsExecuted;
+          if (res.returned) return { statementsExecuted, exited: true, returned: true };
+          if (res.exited) break;
+          if (Boolean(evalCompiledExpr(stmt.until, sess, loopVars, resolveVar, callDepth, execStats))) break;
+        }
+        break;
+      }
+      case 'case': {
+        const selectorVal = Math.trunc(evalCompiledExpr(stmt.selector, sess, loopVars, resolveVar, callDepth, execStats));
+        let matched = false;
+        for (let b = 0; b < stmt.branches.length; b++) {
+          const br = stmt.branches[b];
+          let hit = false;
+          for (let r = 0; r < br.ranges.length; r++) {
+            const [lo, hi] = br.ranges[r];
+            if (selectorVal >= lo && selectorVal <= hi) {
+              hit = true;
+              break;
+            }
+          }
+          if (hit) {
+            matched = true;
+            const res = executeCompiledStStmts(br.body, sess, outputsWritten, loopVars, resolveVar, callDepth, execStats);
+            statementsExecuted += res.statementsExecuted;
+            if (res.exited) return { statementsExecuted, exited: true, returned: res.returned };
+            break;
+          }
+        }
+        if (!matched && stmt.elseBody.length > 0) {
+          const res = executeCompiledStStmts(stmt.elseBody, sess, outputsWritten, loopVars, resolveVar, callDepth, execStats);
+          statementsExecuted += res.statementsExecuted;
+          if (res.exited) return { statementsExecuted, exited: true, returned: res.returned };
+        }
+        break;
+      }
+      case 'call': {
+        evalStBuiltinOrCall(stmt.raw, sess, loopVars, callDepth, execStats);
+        statementsExecuted += 1;
+        break;
+      }
+      case 'exit':
+        return { statementsExecuted: statementsExecuted + 1, exited: true };
+      case 'return':
+        return { statementsExecuted: statementsExecuted + 1, exited: true, returned: true };
+    }
+  }
+
+  return { statementsExecuted, exited: false };
 }
 
 function executeStBlock(
@@ -3133,11 +3405,12 @@ function executeStBlock(
   callDepth = 0,
   execStats?: StExecStats,
 ): SimStTrace['outputs_written'] & { __count: number; outputs: Record<string, boolean | number> } {
-  const stmts = tokenizeStStatements(stCode);
+  const program = getCompiledStProgram(stCode);
   const outputsWritten: Record<string, boolean | number> = {};
   const loopVars = new Map<string, number>();
+  const resolveVar = (name: string) => resolveStTokenNumericValue(name, sess, loopVars);
   const stats: StExecStats = execStats ?? { loopIterations: 0, loopCapHits: 0, callDepthMax: 0, totalStatements: 0 };
-  const res = executeStStatements(stmts, 0, sess, outputsWritten, loopVars, new Set(), callDepth, stats);
+  const res = executeCompiledStStmts(program, sess, outputsWritten, loopVars, resolveVar, callDepth, stats);
   return Object.assign({}, outputsWritten, { __count: res.statementsExecuted, outputs: outputsWritten });
 }
 
@@ -3187,7 +3460,13 @@ function executeSfcPou(sess: SimulatorSession, pou: SimPouProgram): SimSfcTrace 
 
   syncStepVars();
   const outputsWritten: Record<string, boolean | number> = {};
-  const stepByName = new Map(chart.steps.map((s) => [s.name, s]));
+  if (!pou._cachedSfcPlan) {
+    pou._cachedSfcPlan = {
+      stepByName: new Map(chart.steps.map((s) => [s.name, s])),
+      sortedTrans: [...(chart.transitions ?? [])].sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0)),
+    };
+  }
+  const { stepByName, sortedTrans } = pou._cachedSfcPlan;
 
   // Execute active step actions
   for (const [stepName, st] of state.steps.entries()) {
@@ -3234,8 +3513,7 @@ function executeSfcPou(sess: SimulatorSession, pou: SimPouProgram): SimSfcTrace 
     Object.assign(outputsWritten, res.outputs);
   }
 
-  // Evaluate transitions sorted by priority (lower number = higher priority)
-  const sortedTrans = [...(chart.transitions ?? [])].sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
+  // Evaluate cached priority-sorted transitions
   const fired: string[] = [];
   const consumedFrom = new Set<string>();
   const toActivate = new Set<string>();
@@ -3303,7 +3581,10 @@ function executeFbdPou(sess: SimulatorSession, pou: SimPouProgram): SimFbdTrace 
     return { pou: pou.name, blocks_evaluated: 0, outputs_written: {} };
   }
 
-  const { order } = topologicalSortFbd(diagram);
+  if (!pou._cachedFbdOrder) {
+    pou._cachedFbdOrder = topologicalSortFbd(diagram).order;
+  }
+  const order = pou._cachedFbdOrder;
   const pinValues = new Map<string, number>();
   const outputsWritten: Record<string, boolean | number> = {};
 
@@ -3479,9 +3760,25 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
   const count = Math.max(1, Math.min(10_000, cycles));
   sess.lastBreakpointHit = null;
   const wallStartMs = Date.now();
+  const rtcNow = new Date(wallStartMs);
+  const rtcYear = rtcNow.getFullYear();
+  const rtcMonth = rtcNow.getMonth() + 1;
+  const rtcDate = rtcNow.getDate();
+  const rtcHours = rtcNow.getHours();
+  const rtcMinutes = rtcNow.getMinutes();
+  const rtcSeconds = rtcNow.getSeconds();
+  const rtcDay = rtcNow.getDay();
+  let sampledHeapUsed = process.memoryUsage().heapUsed;
 
   for (let c = 0; c < count; c++) {
-    if (c > 0 && Date.now() - wallStartMs > MAX_STEP_WALL_MS) {
+    if (c > 0 && (c & 15) === 0) {
+      if (Date.now() - wallStartMs > MAX_STEP_WALL_MS) {
+        throw new FileTransformError(
+          `Simulator step execution exceeded wall-clock limit (${MAX_STEP_WALL_MS}ms after ${c}/${count} cycles); reduce cycle count or optimize hot loops via ispsoft_sim_diagnostics.`,
+        );
+      }
+      sampledHeapUsed = process.memoryUsage().heapUsed;
+    } else if (c > 0 && Date.now() - wallStartMs > MAX_STEP_WALL_MS) {
       throw new FileTransformError(
         `Simulator step execution exceeded wall-clock limit (${MAX_STEP_WALL_MS}ms after ${c}/${count} cycles); reduce cycle count or optimize hot loops via ispsoft_sim_diagnostics.`,
       );
@@ -3515,14 +3812,13 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
     sess.bits.set('SM413', clk1000);
     sess.bits.set('SM414', clk60000);
     // RTC & module count special registers
-    const now = new Date();
-    sess.words.set('D1013', now.getFullYear());
-    sess.words.set('D1014', now.getMonth() + 1);
-    sess.words.set('D1015', now.getDate());
-    sess.words.set('D1016', now.getHours());
-    sess.words.set('D1017', now.getMinutes());
-    sess.words.set('D1018', now.getSeconds());
-    sess.words.set('D1019', now.getDay());
+    sess.words.set('D1013', rtcYear);
+    sess.words.set('D1014', rtcMonth);
+    sess.words.set('D1015', rtcDate);
+    sess.words.set('D1016', rtcHours);
+    sess.words.set('D1017', rtcMinutes);
+    sess.words.set('D1018', rtcSeconds);
+    sess.words.set('D1019', rtcDay);
     sess.words.set('D1220', sess.hwConfig.modules.length);
 
     const trace: SimNetworkTrace[] = [];
@@ -3533,12 +3829,8 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
 
     let orderedPous: SimPouProgram[];
     if (sess.tasks.length > 0) {
-      const activeTasks = [...sess.tasks]
-        .filter((t) => t.active)
-        .sort((a, b) => a.priority - b.priority);
-      const pouByName = new Map(sess.pouPrograms.map((p) => [p.name, p]));
       orderedPous = [];
-      for (const t of activeTasks) {
+      for (const t of sess.sortedActiveTasks) {
         if (t.type >= 2) {
           // Interrupt / event tasks run via triggerSimulatorInterrupt
           continue;
@@ -3549,7 +3841,7 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
           if (sess.elapsed_ms - lastRun < interval) continue;
           sess.taskLastRunMs.set(t.name, sess.elapsed_ms);
         }
-        const pou = pouByName.get(t.program);
+        const pou = sess.pouByName.get(t.program);
         if (pou && pou.active) orderedPous.push(pou);
       }
     } else {
@@ -3648,15 +3940,18 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
     sess.lastSfcTrace = sfcTrace;
     sess.lastFbdTrace = fbdTrace;
 
-    // Snapshot prevBits for next scan edge detection
-    const allBitKeys = new Set([
-      ...sess.bits.keys(),
-      ...sess.forcedBits.keys(),
-      ...sess.timers.keys(),
-      ...sess.counters.keys(),
-    ]);
-    for (const key of allBitKeys) {
-      sess.prevBits.set(key, readBit(sess, key));
+    // Fast snapshot of prevBits for next scan edge detection (no temporary Set allocation or symbol scan)
+    for (const [key, val] of sess.bits.entries()) {
+      sess.prevBits.set(key, val);
+    }
+    for (const [key, t] of sess.timers.entries()) {
+      sess.prevBits.set(key, t.done);
+    }
+    for (const [key, cnt] of sess.counters.entries()) {
+      sess.prevBits.set(key, cnt.done);
+    }
+    for (const [key, fVal] of sess.forcedBits.entries()) {
+      sess.prevBits.set(key, fVal);
     }
 
     // Record default watch sample
@@ -3684,7 +3979,6 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
     if (sess.traceBuffer.length > 200) {
       sess.traceBuffer.shift();
     }
-    sess.last_scan_at = new Date().toISOString();
 
     const scanDurationMs = Number(process.hrtime.bigint() - scanT0) / 1_000_000;
     const diag = sess.diagnostics;
@@ -3719,7 +4013,7 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
       over_budget: overBudget,
       words_count: sess.words.size,
       bits_count: sess.bits.size,
-      heap_used_bytes: process.memoryUsage().heapUsed,
+      heap_used_bytes: sampledHeapUsed,
       pou_timings: scanPouTimings,
     });
     if (diag.scan_history.length > 500) {
@@ -3743,6 +4037,7 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
       break;
     }
   }
+  sess.last_scan_at = new Date().toISOString();
   return sess;
 }
 
@@ -4473,12 +4768,14 @@ export function onlineEditSimulatorPou(
     persisted = true;
   }
 
-  // Commit staged updates atomically
+  // Commit staged updates atomically and invalidate cached SFC/FBD execution plans
   pou.lang = nextLang;
   pou.stCode = nextStCode;
   pou.networks = nextNetworks;
   pou.sfcChart = nextSfcChart;
   pou.fbdDiagram = nextFbdDiagram;
+  pou._cachedFbdOrder = undefined;
+  pou._cachedSfcPlan = undefined;
   if (nextBytes) {
     sess.raw_isp_bytes = nextBytes;
     sess.project_hash = computeContentHash('isp', nextBytes);

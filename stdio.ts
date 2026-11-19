@@ -9,7 +9,23 @@ seedDefaultWorkspace();
 
 const MAX_STDIO_BUFFER_BYTES = 20 * 1024 * 1024;
 const MAX_CONTENT_LENGTH_BYTES = 16 * 1024 * 1024;
-let buffer = Buffer.alloc(0);
+let buffer: Buffer = Buffer.alloc(0);
+let pendingChunks: Buffer[] = [];
+let pendingBytes = 0;
+let expectedFrameBytes = 0;
+
+function flushPendingChunks(): void {
+  if (pendingChunks.length === 0) return;
+  if (buffer.length === 0 && pendingChunks.length === 1) {
+    buffer = pendingChunks[0];
+  } else if (buffer.length === 0) {
+    buffer = Buffer.concat(pendingChunks, pendingBytes);
+  } else {
+    buffer = Buffer.concat([buffer, ...pendingChunks], buffer.length + pendingBytes);
+  }
+  pendingChunks = [];
+  pendingBytes = 0;
+}
 
 function writeMessage(payload: Record<string, unknown> | Record<string, unknown>[]): void {
   try {
@@ -139,8 +155,10 @@ function processBuffer(): void {
         return;
       }
       if (buffer.length < headerByteLen + contentLen) {
+        expectedFrameBytes = headerByteLen + contentLen;
         return;
       }
+      expectedFrameBytes = 0;
       const bodyStr = buffer.subarray(headerByteLen, headerByteLen + contentLen).toString('utf8');
       buffer = buffer.subarray(headerByteLen + contentLen);
       dispatchRawJson(bodyStr);
@@ -170,8 +188,12 @@ process.stdout.on('error', (err: NodeJS.ErrnoException) => {
 });
 
 process.stdin.on('data', (chunk: Buffer) => {
-  if (buffer.length + chunk.length > MAX_STDIO_BUFFER_BYTES) {
+  const totalBytes = buffer.length + pendingBytes + chunk.length;
+  if (totalBytes > MAX_STDIO_BUFFER_BYTES) {
     buffer = Buffer.alloc(0);
+    pendingChunks = [];
+    pendingBytes = 0;
+    expectedFrameBytes = 0;
     emitFramingError(
       -32700,
       'RESOURCE_LIMIT',
@@ -179,11 +201,22 @@ process.stdin.on('data', (chunk: Buffer) => {
     );
     return;
   }
-  buffer = Buffer.concat([buffer, chunk]);
+  pendingChunks.push(chunk);
+  pendingBytes += chunk.length;
+  // Avoid O(N^2) Buffer.concat when waiting for the remainder of a large Content-Length payload
+  if (expectedFrameBytes > 0) {
+    if (buffer.length + pendingBytes < expectedFrameBytes) {
+      return;
+    }
+  } else if (buffer.length === 0 && pendingChunks.length > 1 && chunk.indexOf(0x0a) === -1) {
+    return;
+  }
+  flushPendingChunks();
   processBuffer();
 });
 
 process.stdin.on('end', () => {
+  flushPendingChunks();
   if (buffer.length > 0) {
     dispatchRawJson(buffer.toString('utf8'));
     buffer = Buffer.alloc(0);

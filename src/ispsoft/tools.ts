@@ -4511,14 +4511,25 @@ export function isToolResultError(output: Record<string, unknown>): boolean {
   );
 }
 
+let cachedAnnotatedTools: Array<{
+  name: string;
+  category: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  annotations: ToolAnnotations;
+}> | null = null;
+
 export function getAnnotatedTools() {
-  return MCP_TOOLS.map((t) => ({
-    name: t.name,
-    category: t.category,
-    description: t.description,
-    inputSchema: t.inputSchema,
-    annotations: t.annotations ?? deriveToolAnnotations(t.name),
-  }));
+  if (!cachedAnnotatedTools) {
+    cachedAnnotatedTools = MCP_TOOLS.map((t) => ({
+      name: t.name,
+      category: t.category,
+      description: t.description,
+      inputSchema: t.inputSchema,
+      annotations: t.annotations ?? deriveToolAnnotations(t.name),
+    }));
+  }
+  return cachedAnnotatedTools;
 }
 
 export function getToolDef(name: string): McpToolDef | undefined {

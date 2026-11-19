@@ -4,16 +4,19 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { performance } from 'node:perf_hooks';
 import { decodeContainer, inspectContainer } from './containers.js';
 import { FileTransformError, budgetPayload, encodeCodepage } from './limits.js';
 import { IdempotencyCache, validateToolArguments } from './mcpProtocol.js';
 import { handleSingleRpc } from './mcpServer.js';
-import { evaluateSafeNumericExpr } from './safeExpr.js';
+import { compileSymbolicStExpr, evaluateSafeNumericExpr, evaluateSymbolicStAst } from './safeExpr.js';
 import { topologicalSortFbd, validateFbdDiagram, validateSfcChart } from './sfcFbd.js';
-import { executeMcpTool as invokeTool } from './tools.js';
+import { executeMcpTool as invokeTool, getAnnotatedTools } from './tools.js';
 import {
   deleteWorkspaceFile,
+  getWorkspaceStorageStats,
   listAllFiles,
+  readFileBuffer,
   resetWorkspaceMemoryCacheForTests,
   writeFileBuffer,
 } from './workspace.js';
@@ -564,9 +567,138 @@ test('stdio.ts rejects oversized Content-Length and oversized JSON-RPC batches c
       await waitForCount(3);
       assert.equal(lines[2].id, 999);
       assert.deepEqual(lines[2].result, {});
+
+      // 4. Multi-chunk split Content-Length frame must assemble cleanly via O(N) chunk queue
+      const payload = JSON.stringify({ jsonrpc: '2.0', id: 1000, method: 'ping' });
+      const frame = `Content-Length: ${Buffer.byteLength(payload, 'utf-8')}\r\n\r\n${payload}`;
+      for (let i = 0; i < frame.length; i += 7) {
+        child.stdin.write(frame.slice(i, i + 7));
+      }
+      await waitForCount(4);
+      assert.equal(lines[3].id, 1000);
+      assert.deepEqual(lines[3].result, {});
     } finally {
       child.stdin.end();
       child.kill('SIGTERM');
     }
   });
 });
+
+// =============================================================================
+// 10. Performance & Cache Safety: symbolic ST AST, container LRU, workspace byte accounting, Soft-PLC speed
+// =============================================================================
+test('compileSymbolicStExpr handles IEC radix/keywords/dotted tokens and bails out cleanly on calls/arrays', () => {
+  const env: Record<string, number> = {
+    i: 4,
+    D100: 10,
+    'T0.Q': 1,
+    'D0.0': 1,
+    'Pump.Speed': 75,
+  };
+  const resolver = (name: string) => env[name] ?? 0;
+
+  const ast1 = compileSymbolicStExpr('(i MOD 2) = 0 AND TRUE AND NOT(D100 <> 10)');
+  assert.ok(ast1 !== null);
+  assert.equal(evaluateSymbolicStAst(ast1, resolver), 1);
+
+  const ast2 = compileSymbolicStExpr('16#FF + 2#1010 + 8#10 + Pump.Speed + T0.Q + D0.0');
+  assert.ok(ast2 !== null);
+  assert.equal(evaluateSymbolicStAst(ast2, resolver), 255 + 10 + 8 + 75 + 1 + 1);
+
+  const ast3 = compileSymbolicStExpr('(1 XOR 0) OR FALSE');
+  assert.ok(ast3 !== null);
+  assert.equal(evaluateSymbolicStAst(ast3, resolver), 1);
+
+  // Must return null so full ST evaluator handles function calls and array indexing
+  assert.equal(compileSymbolicStExpr('ABS(-5) + 1'), null);
+  assert.equal(compileSymbolicStExpr('arr[i] + 1'), null);
+});
+
+test('container LRU cache, inspectContainer defensive copy, tools/list memoization, and workspace byte tracking stay isolated and consistent', async () => {
+  await withIsolatedWorkspace(async () => {
+    // getAnnotatedTools returns stable memoized reference
+    const toolsA = getAnnotatedTools();
+    const toolsB = getAnnotatedTools();
+    assert.strictEqual(toolsA, toolsB);
+    assert.ok(toolsA.length >= 70);
+
+    // Create two distinct blank projects and ensure decodeContainer LRU never conflates them
+    assert.equal(invokeTool('ispsoft_create_blank_project', { model: 'ES2', output_path: '/workspace/a.isp', project_name: 'ProjA' }).success, true);
+    assert.equal(invokeTool('ispsoft_create_blank_project', { model: 'SA2', output_path: '/workspace/b.isp', project_name: 'ProjB' }).success, true);
+
+    const bufA = Buffer.from(readFileBuffer('/workspace/a.isp'));
+    const bufB = Buffer.from(readFileBuffer('/workspace/b.isp'));
+
+    const cA1 = decodeContainer(bufA);
+    const cB1 = decodeContainer(bufB);
+    const iA1 = inspectContainer(cA1);
+    const iB1 = inspectContainer(cB1);
+    assert.equal(iA1.project_model, 'ES2');
+    assert.equal(iB1.project_model, 'SA2');
+
+    // Mutating returned inspect summary pous must NOT poison cached inspect summary
+    iA1.pous.push({ name: 'Injected', pou_type: 'PRG', language: 'ST' });
+    const iA2 = inspectContainer(decodeContainer(bufA));
+    assert.equal(iA2.pous.some((p) => p.name === 'Injected'), false);
+
+    // O(1) incremental workspace byte tracking matches actual file sizes across write/overwrite/delete
+    const statsBefore = getWorkspaceStorageStats();
+    const payload = Buffer.alloc(1024, 0x41);
+    writeFileBuffer('/workspace/bytes_test.bin', payload);
+    const statsAfterWrite = getWorkspaceStorageStats();
+    assert.equal(statsAfterWrite.total_bytes - statsBefore.total_bytes, 1024);
+
+    writeFileBuffer('/workspace/bytes_test.bin', Buffer.alloc(256, 0x42), true);
+    const statsAfterOverwrite = getWorkspaceStorageStats();
+    assert.equal(statsAfterOverwrite.total_bytes - statsBefore.total_bytes, 256);
+
+    deleteWorkspaceFile('/workspace/bytes_test.bin');
+    const statsAfterDelete = getWorkspaceStorageStats();
+    assert.equal(statsAfterDelete.total_bytes, statsBefore.total_bytes);
+  });
+});
+
+test('Soft-PLC compiled ST AST executes 200 scans of 150-symbol + 100-iteration loop accurately and without bottleneck', async () => {
+  await withIsolatedWorkspace(async () => {
+    const p = '/workspace/perf_regression.isp';
+    assert.equal(invokeTool('ispsoft_create_blank_project', { model: 'ES2', output_path: p, project_name: 'PerfReg' }).success, true);
+    const syms = Array.from({ length: 150 }, (_, i) => ({
+      name: `Var${i}`,
+      type: 'INT',
+      address: `D${200 + i}`,
+      initial_value: String(i),
+    }));
+    assert.equal(invokeTool('ispsoft_edit_global_variables', { project_path: p, upsert_vars: syms, in_place: true }).success, true);
+    const stCode = [
+      'D100 := 0;',
+      'FOR i := 1 TO 100 DO',
+      '  IF (i MOD 2) = 0 THEN',
+      '    D100 := D100 + i + Var10 + Var140;',
+      '  ELSE',
+      '    D100 := D100 + 1;',
+      '  END_IF;',
+      'END_FOR;',
+    ].join('\n');
+    assert.equal(
+      invokeTool('ispsoft_create_pou', { project_path: p, pou_name: 'PerfMain', language: 'ST', code: stCode, assign_to_task: true, in_place: true }).success,
+      true,
+    );
+
+    const started = invokeTool('ispsoft_sim_start', { project_path: p });
+    assert.equal(started.success, true);
+    const sid = String(started.session_id);
+
+    const t0 = performance.now();
+    const stepped = invokeTool('ispsoft_sim_control', { session_id: sid, command: 'STEP', cycles: 200 });
+    const elapsedMs = performance.now() - t0;
+    assert.equal(stepped.success, true);
+    assert.ok(elapsedMs < 600, `Expected 200 scans < 600ms, got ${elapsedMs.toFixed(1)}ms`);
+
+    const mon = invokeTool('ispsoft_sim_monitor', { session_id: sid, addresses: ['D100'], compact: true });
+    const qa = (mon.queried_addresses ?? {}) as Record<string, { value: number }>;
+    assert.equal(qa.D100?.value, 10100);
+
+    invokeTool('ispsoft_sim_control', { session_id: sid, command: 'CLOSE' });
+  });
+});
+

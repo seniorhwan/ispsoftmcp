@@ -10,6 +10,7 @@ export const MAX_WORKSPACE_TOTAL_BYTES = 256 * 1024 * 1024;
 
 const files = new Map<string, Buffer>();
 const metaCache = new Map<string, { sha: string; summary: Record<string, unknown> }>();
+let cachedTotalBytes = 0;
 let diskLoaded = false;
 
 export function getDiskWorkspaceRoot(): string {
@@ -94,11 +95,9 @@ function removeFileFromDisk(virtualKey: string): void {
 }
 
 function totalWorkspaceBytes(excludeKey?: string): number {
-  let sum = 0;
-  for (const [k, v] of files.entries()) {
-    if (k !== excludeKey) sum += v.length;
-  }
-  return sum;
+  if (!excludeKey) return cachedTotalBytes;
+  const existing = files.get(excludeKey);
+  return existing ? cachedTotalBytes - existing.length : cachedTotalBytes;
 }
 
 function assertWorkspaceQuota(targetKey: string, nextBytes: number): void {
@@ -115,13 +114,17 @@ function setWorkspaceFile(virtualKey: string, data: Buffer): void {
   assertWorkspaceQuota(virtualKey, data.length);
   const copy = Buffer.from(data);
   persistFileAtomic(virtualKey, copy);
+  const prev = files.get(virtualKey);
+  cachedTotalBytes += copy.length - (prev ? prev.length : 0);
   files.set(virtualKey, copy);
   metaCache.delete(virtualKey);
 }
 
 function deleteWorkspaceFileInternal(virtualKey: string): boolean {
   metaCache.delete(virtualKey);
+  const prev = files.get(virtualKey);
   const existed = files.delete(virtualKey);
+  if (prev) cachedTotalBytes = Math.max(0, cachedTotalBytes - prev.length);
   removeFileFromDisk(virtualKey);
   return existed;
 }
@@ -138,7 +141,10 @@ function scanDiskWorkspace(dir: string, root: string): void {
       const vKey = `${DEFAULT_WORK_DIR}/${relPosix}`;
       const stat = fs.statSync(full);
       if (stat.size <= MAX_FILE_BYTES && files.size < MAX_WORKSPACE_FILES) {
-        files.set(vKey, fs.readFileSync(full));
+        const buf = fs.readFileSync(full);
+        const prev = files.get(vKey);
+        cachedTotalBytes += buf.length - (prev ? prev.length : 0);
+        files.set(vKey, buf);
       }
     }
   }
@@ -147,6 +153,7 @@ function scanDiskWorkspace(dir: string, root: string): void {
 export function resetWorkspaceMemoryCacheForTests(): void {
   files.clear();
   metaCache.clear();
+  cachedTotalBytes = 0;
   diskLoaded = false;
 }
 

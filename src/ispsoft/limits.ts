@@ -87,17 +87,24 @@ const CP1252_EXTRA: Record<number, number> = {
   0x017e: 0x9e, 0x0178: 0x9f,
 };
 
+const textDecoderCache = new Map<string, TextDecoder>();
+
 export function decodeCodepage(data: Buffer, encoding: string): string {
   const norm = encoding.toLowerCase().replace(/^cp/, 'windows-');
+  if (norm === 'utf-8' || norm === 'utf8') {
+    return data.toString('utf-8');
+  }
+  const label = norm === 'windows-936' ? 'gbk' : norm;
   try {
-    const decoder = new TextDecoder(norm === 'windows-936' ? 'gbk' : norm, { fatal: true });
+    let decoder = textDecoderCache.get(label);
+    if (!decoder) {
+      decoder = new TextDecoder(label, { fatal: true });
+      textDecoderCache.set(label, decoder);
+    }
     return decoder.decode(data);
   } catch {
     if (norm === 'latin-1' || norm === 'latin1' || norm === 'iso-8859-1') {
       return data.toString('latin1');
-    }
-    if (norm === 'utf-8' || norm === 'utf8') {
-      return data.toString('utf-8');
     }
     throw new FileTransformError(`Invalid source encoding: ${encoding}`);
   }
@@ -108,41 +115,42 @@ export function encodeCodepage(text: string, encoding: string): Buffer {
   if (norm === 'utf-8' || norm === 'utf8') {
     return Buffer.from(text, 'utf-8');
   }
+  const len = text.length;
   if (norm === 'latin-1' || norm === 'latin1' || norm === 'iso-8859-1') {
-    const bytes = new Uint8Array(text.length);
-    for (let i = 0; i < text.length; i++) {
+    const out = Buffer.allocUnsafe(len);
+    for (let i = 0; i < len; i++) {
       const code = text.charCodeAt(i);
       if (code > 0xff) {
         throw new FileTransformError(`Character U+${code.toString(16)} unsupported by ${encoding}`);
       }
-      bytes[i] = code;
+      out[i] = code;
     }
-    return Buffer.from(bytes);
+    return out;
   }
   if (norm === 'cp1252' || norm === 'windows-1252') {
-    const bytes = new Uint8Array(text.length);
-    for (let i = 0; i < text.length; i++) {
+    const out = Buffer.allocUnsafe(len);
+    for (let i = 0; i < len; i++) {
       const code = text.charCodeAt(i);
       if (code <= 0x7f || (code >= 0xa0 && code <= 0xff)) {
-        bytes[i] = code;
+        out[i] = code;
       } else if (CP1252_EXTRA[code] !== undefined) {
-        bytes[i] = CP1252_EXTRA[code];
+        out[i] = CP1252_EXTRA[code];
       } else {
         throw new FileTransformError(`Character U+${code.toString(16)} unsupported by ${encoding}`);
       }
     }
-    return Buffer.from(bytes);
+    return out;
   }
   // For unsupported multi-byte codepages (e.g. cp936/cp950), allow pure ASCII but refuse silent corruption
-  const bytes = new Uint8Array(text.length);
-  for (let i = 0; i < text.length; i++) {
+  const out = Buffer.allocUnsafe(len);
+  for (let i = 0; i < len; i++) {
     const code = text.charCodeAt(i);
     if (code > 0x7f) {
       throw new FileTransformError(`Character U+${code.toString(16)} cannot be safely encoded in ${encoding}`);
     }
-    bytes[i] = code;
+    out[i] = code;
   }
-  return Buffer.from(bytes);
+  return out;
 }
 
 const STRUCTURAL_DELIMITER_RE =
