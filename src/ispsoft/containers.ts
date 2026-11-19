@@ -213,13 +213,23 @@ export function decodeContainer(data: Buffer): IspContainer {
   }
   if (layout === 'ispsoft-3.24-v8') {
     const model = propertyValue(text, 'Prj_DT');
-    if (!model || !['ES2', 'ES2-E', 'EH3', 'SA2', 'SX2', 'SS2', 'EX2'].includes(model)) {
+    const dvpModels = [
+      'ES2', 'ES2-E', 'ES3', 'EX2', 'EX3', 'EH3', 'SA2', 'SX2', 'SS2', 'SE', 'SV2',
+      'DVP12SE11R', 'DVP12SE11T',
+    ];
+    if (!model || !dvpModels.includes(model)) {
       throw new FileTransformError(`ISPSoft 3.24 pointer/footer layout is not qualified for project series ${JSON.stringify(model)}`);
     }
   } else if (offset !== 0xaa && offset !== 0xac) {
     const model = propertyValue(text, 'Prj_DT');
-    if (!model || !['AS228T', 'AS228P', 'AS228R'].includes(model)) {
-      throw new FileTransformError('AS v3010 pointer layout is qualified only for AS228T/P/R source metadata');
+    const asAhModels = [
+      'AS218PX', 'AS218RX', 'AS218TX',
+      'AS228T', 'AS228P', 'AS228R',
+      'AS300', 'AS320T', 'AS320P', 'AS332T', 'AS332P',
+      'AHCPU500', 'AHCPU510', 'AHCPU520', 'AHCPU530',
+    ];
+    if (!model || !asAhModels.includes(model)) {
+      throw new FileTransformError(`AS/AH v3010 pointer layout is not qualified for project series ${JSON.stringify(model)}`);
     }
   }
 

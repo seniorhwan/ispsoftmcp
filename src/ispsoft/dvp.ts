@@ -52,7 +52,7 @@ export function parseIl(text: string): il2mpu.Instruction[] {
     if (ended) {
       throw new FileTransformError('Instructions after END would be discarded');
     }
-    if (operands.some((p) => !/^(?:[A-Za-z_][A-Za-z_0-9.]*|-?\d+|[Kk]-?\d+|[Hh][0-9A-Fa-f]+)$/.test(p))) {
+    if (operands.some((p) => !/^(?:[A-Za-z_][A-Za-z_0-9.]*|-?\d+(?:\.\d+)?|[Kk]-?\d+|[Hh][0-9A-Fa-f]+|[Ff]-?\d+(?:\.\d+)?)$/.test(p))) {
       throw new FileTransformError(`Unsupported operand syntax on IL line ${number}`);
     }
     ended = op === 'END';

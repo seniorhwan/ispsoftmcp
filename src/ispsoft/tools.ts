@@ -1,6 +1,7 @@
 import path from 'node:path';
 import {
   MODEL_PROFILES,
+  PouLanguage,
   ProjectBundleInput,
   TaskConfig,
   auditProjectDeep,
@@ -14,8 +15,15 @@ import {
   editGlobalVarsInSource,
   editLdRungsInSource,
   editLocalVarsInSource,
+  exportLdPouToMpuBytes,
   exportProjectBundle,
   extractCrossRefsFromText,
+  importMpuIntoProjectSource,
+  langCodeToName,
+  migrateProjectModel,
+  patchFbdPouInSource,
+  patchIlPouInSource,
+  patchSfcPouInSource,
   readDeviceComments,
   readDuts,
   readSystemVars,
@@ -31,6 +39,7 @@ import {
 } from './authoring.js';
 import {
   decodeContainer,
+  escapeRegex,
   inspectContainer,
   ldNetworkMatches,
   ldNetworks,
@@ -44,7 +53,29 @@ import {
   validateLdNetwork,
 } from './containers.js';
 import { ilToMpu, mpuToIl, parseIl } from './dvp.js';
-import { mapDevice } from './dvpModbus.js';
+import { mapDevice, planModbusRequest, reverseMapModbus } from './dvpModbus.js';
+import {
+  DataExchangeRow,
+  DeviceInitEntry,
+  HwConfigDocument,
+  RetainZone,
+  exportProjectToIecStText,
+  exportProjectToPlcopenXml,
+  formatCommentsCsv,
+  formatSymbolsCsv,
+  parseCommentsCsv,
+  parseSymbolsCsv,
+  readDataExchangeFromSource,
+  readDeviceInitFromSource,
+  readHwConfigFromSource,
+  readRetainConfigFromSource,
+  setIniKeySafe,
+  validateHwConfig,
+  writeDataExchangeToSource,
+  writeDeviceInitToSource,
+  writeHwConfigToSource,
+  writeRetainConfigToSource,
+} from './hwConfig.js';
 import {
   FileTransformError,
   MAX_ITEM_CHARS,
@@ -58,20 +89,39 @@ import {
 } from './limits.js';
 import { ENTRY_NAME } from './mpuCodec.js';
 import { packPackage, unpackPackage } from './packages.js';
+import { lookupDeltaReference } from './referenceCatalog.js';
 import {
+  FbdDiagram,
+  SfcChart,
+  allocateFreeDevices,
+  analyzeDeviceUsageFromTexts,
+  convertIlInstructionsToSt,
+  convertSimpleStToIl,
+  parseFbdFromPouBody,
+  parseSfcFromPouBody,
+  renderFbdAscii,
+  renderSfcAscii,
+  validateFbdDiagram,
+  validateSfcChart,
+} from './sfcFbd.js';
+import {
+  analyzeSimulatorTrace,
   compareSimulatorWithProject,
   controlSimulator,
   dumpSimulatorMemory,
   forceAndWriteSimulator,
   listSimulatorSessions,
   manageBreakpoints,
+  manageSimIoModules,
   manageWatchTable,
   monitorSimulator,
+  onlineEditSimulatorPou,
   profileSimulatorSession,
   reloadSimulatorSession,
   runSimulatorSequence,
   startSimulatorSession,
   stepSimulatorUntil,
+  triggerSimulatorInterrupt,
 } from './simulator.js';
 import {
   STANDARD_ERROR_CODES,
@@ -143,35 +193,59 @@ function capabilityMatrix() {
         'full_bundle_export_import',
         'atomic_multi_edit_transactions_and_in_place_updates',
         'workspace_file_management_and_backup_rollback',
-        'pou_create_rename_delete',
-        'st_code_patching',
+        'pou_create_rename_delete_all_5_iec_languages',
+        'st_il_sfc_fbd_code_patching',
         'ld_rung_edit_stack_ops_and_ascii_render',
-        'il_to_ld_program_authoring',
-        'local_and_global_var_upsert_delete',
+        'il_to_ld_and_ld_il_to_st_conversion',
+        'local_and_global_var_upsert_delete_and_csv_exchange',
         'dut_struct_enum_management',
-        'task_and_system_var_config',
-        'device_comment_merge',
+        'task_hwconfig_retain_device_init_and_data_exchange',
+        'device_usage_map_and_free_address_allocator',
+        'plcopen_xml_iec_st_and_mpu_import_export',
+        'cross_model_and_cross_family_project_migration',
+        'delta_instruction_special_device_and_extension_module_catalog',
+        'device_comment_merge_and_csv_exchange',
         'project_wide_symbol_refactor_and_search',
         'deep_engineering_audit_and_project_diff',
       ],
     },
     offline_static_check_and_compile: {
       status: 'QUALIFIED',
-      checks: ['syntax', 'double_coil', 'coil_conflict', 'floating_contacts', 'system_var_bounds', 'task_integrity', 'variable_wrappers'],
+      checks: [
+        'syntax',
+        'double_coil',
+        'coil_conflict',
+        'floating_contacts',
+        'system_var_bounds',
+        'task_integrity',
+        'variable_wrappers',
+        'sfc_graph_validation',
+        'fbd_dag_validation',
+        'hwconfig_validation',
+      ],
     },
     soft_plc_simulator_and_monitor: {
       status: 'QUALIFIED_SIMULATOR',
       features: [
         'run_stop_step_step_until_warm_cold_reset',
-        'true_iec_ladder_stack_machine_anb_orb_mps_mrd_mpp',
-        '32bit_dword_math_and_bit_of_word',
-        'subroutines_call_sret_fend_and_cj_jumps',
-        'st_case_repeat_arrays_structs_fc_fb_calls',
+        'all_5_iec_languages_ld_st_il_sfc_fbd',
+        'true_iec_ladder_stack_machine_anb_orb_mps_mrd_mpp_inv',
+        '32bit_dword_float_real_index_registers_v_z_e_and_bit_of_word',
+        'standard_iec_fbs_ton_tof_tp_ctu_ctd_ctud_r_trig_f_trig_sr_rs_pid_scale',
+        'multi_instance_user_fbs_subroutines_call_sret_fend_for_next_cj',
+        'special_module_bfm_from_to_and_sim_io_injection',
+        'online_edit_without_stop_and_interrupt_trigger',
+        'retentive_memory_on_warm_reset_and_device_init_on_cold_reset',
         'multi_step_sequence_testbench_and_breakpoints',
-        'memory_table_dump_watch_tables_trace_compact_monitor',
+        'memory_table_dump_watch_tables_trace_analytics_csv_and_diagnostics',
       ],
     },
-    dvp_modbus_address_mapping: { status: 'QUALIFIED', models: ['ES2'], device_io: 'NOT_RUN' },
+    dvp_modbus_address_mapping: {
+      status: 'QUALIFIED',
+      models: Object.keys(MODEL_PROFILES),
+      features: ['forward_mapping', 'reverse_mapping', 'rtu_crc16_and_tcp_mbap_frame_planner'],
+      device_io: 'NOT_RUN',
+    },
     native_windows_ide_automation: { status: process.platform === 'win32' ? 'AVAILABLE' : 'UNAVAILABLE_ON_LINUX' },
     physical_plc_connection: { status: 'NOT_QUALIFIED', write_guard: LIVE_WRITES_ENV },
   };
@@ -180,6 +254,186 @@ function capabilityMatrix() {
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
+
+const SFC_CHART_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  required: ['steps', 'transitions'],
+  properties: {
+    steps: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['name'],
+        properties: {
+          name: { type: 'string' },
+          initial: { type: 'boolean' },
+          comment: { type: 'string' },
+          actions: {
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['qualifier', 'code'],
+              properties: {
+                qualifier: { type: 'string', enum: ['N', 'S', 'R', 'P', 'P1', 'P0', 'L', 'D'] },
+                name: { type: 'string' },
+                time_ms: { type: 'integer', minimum: 0 },
+                code: { type: 'string' },
+              },
+            },
+          },
+        },
+      },
+    },
+    transitions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['name', 'from', 'to', 'condition'],
+        properties: {
+          name: { type: 'string' },
+          from: { type: 'array', items: { type: 'string' } },
+          to: { type: 'array', items: { type: 'string' } },
+          condition: { type: 'string' },
+          priority: { type: 'integer' },
+        },
+      },
+    },
+  },
+};
+
+const FBD_DIAGRAM_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  required: ['blocks'],
+  properties: {
+    blocks: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['id', 'op'],
+        properties: {
+          id: { type: 'string' },
+          op: { type: 'string' },
+          instance: { type: 'string' },
+          inputs: { type: 'object', additionalProperties: { type: 'string' } },
+          outputs: { type: 'object', additionalProperties: { type: 'string' } },
+          comment: { type: 'string' },
+        },
+      },
+    },
+  },
+};
+
+const HW_CONFIG_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    cpu: {
+      type: 'object',
+      properties: {
+        watchdog_ms: { type: 'integer', minimum: 10, maximum: 10000 },
+        constant_scan_ms: { type: 'integer', minimum: 0, maximum: 2000 },
+        run_stop_input: { type: 'string' },
+        retain_outputs_on_stop: { type: 'boolean' },
+        input_filter_ms: { type: 'integer', minimum: 0, maximum: 100 },
+        comment: { type: 'string' },
+      },
+    },
+    serial_ports: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['port'],
+        properties: {
+          port: { type: 'string', enum: ['COM1', 'COM2', 'COM3'] },
+          baud_rate: { type: 'integer' },
+          data_bits: { type: 'integer', enum: [7, 8] },
+          parity: { type: 'string', enum: ['NONE', 'EVEN', 'ODD'] },
+          stop_bits: { type: 'integer', enum: [1, 2] },
+          protocol: { type: 'string', enum: ['MODBUS_RTU', 'MODBUS_ASCII', 'PLC_LINK', 'USER_DEFINED'] },
+          station_address: { type: 'integer', minimum: 1, maximum: 254 },
+          timeout_ms: { type: 'integer', minimum: 10, maximum: 30000 },
+        },
+      },
+    },
+    ethernet: {
+      type: 'object',
+      properties: {
+        enabled: { type: 'boolean' },
+        ip_address: { type: 'string' },
+        subnet_mask: { type: 'string' },
+        gateway: { type: 'string' },
+        modbus_tcp_port: { type: 'integer', minimum: 1, maximum: 65535 },
+        modbus_tcp_enabled: { type: 'boolean' },
+        ethernet_ip_enabled: { type: 'boolean' },
+        dhcp: { type: 'boolean' },
+      },
+    },
+    modules: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['slot', 'model'],
+        properties: {
+          slot: { type: 'integer', minimum: 0, maximum: 31 },
+          model: { type: 'string' },
+          description: { type: 'string' },
+          x_start: { type: 'string' },
+          x_points: { type: 'integer', minimum: 0 },
+          y_start: { type: 'string' },
+          y_points: { type: 'integer', minimum: 0 },
+          cr_init: { type: 'object', additionalProperties: { type: 'number' } },
+        },
+      },
+    },
+  },
+};
+
+const RETAIN_ZONES_SCHEMA: Record<string, unknown> = {
+  type: 'array',
+  items: {
+    type: 'object',
+    required: ['area', 'start', 'end'],
+    properties: {
+      area: { type: 'string', enum: ['M', 'S', 'T', 'C', 'D'] },
+      start: { type: 'integer', minimum: 0 },
+      end: { type: 'integer', minimum: 0 },
+    },
+  },
+};
+
+const DEVICE_INIT_ENTRIES_SCHEMA: Record<string, unknown> = {
+  type: 'array',
+  items: {
+    type: 'object',
+    required: ['device', 'data_type', 'value'],
+    properties: {
+      device: { type: 'string' },
+      data_type: { type: 'string', enum: ['BOOL', 'INT', 'WORD', 'DINT', 'DWORD', 'REAL', 'STRING'] },
+      value: { description: 'Initial scalar value (number, boolean, or string)' },
+      comment: { type: 'string' },
+    },
+  },
+};
+
+const DATA_EXCHANGE_ROWS_SCHEMA: Record<string, unknown> = {
+  type: 'array',
+  items: {
+    type: 'object',
+    required: ['index', 'enabled', 'interface', 'slave_id', 'function_code', 'remote_address', 'local_device', 'length'],
+    properties: {
+      index: { type: 'integer', minimum: 0 },
+      enabled: { type: 'boolean' },
+      interface: { type: 'string', enum: ['COM2', 'COM3', 'ETHERNET'] },
+      slave_id: { type: 'integer', minimum: 1, maximum: 247 },
+      slave_ip: { type: 'string' },
+      function_code: { type: 'integer', enum: [1, 2, 3, 4, 5, 6, 15, 16] },
+      remote_address: { type: 'string' },
+      local_device: { type: 'string' },
+      length: { type: 'integer', minimum: 1, maximum: 125 },
+      poll_interval_ms: { type: 'integer', minimum: 10, maximum: 60000 },
+      comment: { type: 'string' },
+    },
+  },
+};
 
 export const MCP_TOOLS: McpToolDef[] = [
   // =========================================================================
@@ -525,17 +779,39 @@ export const MCP_TOOLS: McpToolDef[] = [
               },
             },
             device_comments: { type: 'object', additionalProperties: { type: 'string' } },
+            hw_config: HW_CONFIG_SCHEMA,
+            retain_config: {
+              type: 'object',
+              properties: { zones: RETAIN_ZONES_SCHEMA },
+            },
+            device_init: DEVICE_INIT_ENTRIES_SCHEMA,
+            data_exchange: DATA_EXCHANGE_ROWS_SCHEMA,
             pous: {
               type: 'array',
               items: {
                 type: 'object',
                 properties: {
                   name: { type: 'string' },
-                  language: { type: 'string', enum: ['LD', 'ST', 'IL'] },
+                  language: { type: 'string', enum: ['LD', 'ST', 'IL', 'SFC', 'FBD'] },
                   pou_type: { type: 'string', enum: ['PRG', 'FB', 'FC'] },
+                  return_type: { type: 'string' },
                   active: { type: 'boolean' },
-                  code: { type: 'string', description: 'ST source code' },
+                  code: { type: 'string', description: 'ST or IL source code (or IL for LD POUs)' },
                   il: { type: 'string', description: 'DVP IL program text for LD POUs' },
+                  sfc: SFC_CHART_SCHEMA,
+                  fbd: FBD_DIAGRAM_SCHEMA,
+                  networks: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        il: { type: 'string' },
+                        active: { type: 'boolean' },
+                        bookmark: { type: 'boolean' },
+                        label: { type: 'string' },
+                      },
+                    },
+                  },
                   local_vars: {
                     type: 'array',
                     items: {
@@ -620,7 +896,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         project_path: { type: 'string' },
         operations: {
           type: 'array',
-          description: 'Sequence of ops: { type: "edit_properties"|"configure_tasks"|"configure_hardware_io"|"create_pou"|"manage_pou"|"write_st"|"write_ld"|"edit_ld_rungs"|"edit_local_vars"|"edit_global_vars"|"manage_dut"|"write_comments"|"rename_symbol", ... }',
+          description: 'Sequence of ops: edit_properties, configure_tasks, configure_hardware_io, configure_hwconfig, configure_retain_ranges, configure_device_init, configure_data_exchange, create_pou, manage_pou, write_st, write_ld, write_il, write_sfc, write_fbd, edit_ld_rungs, edit_local_vars, edit_global_vars, manage_dut, write_comments, rename_symbol',
           items: {
             type: 'object',
             properties: {
@@ -630,10 +906,17 @@ export const MCP_TOOLS: McpToolDef[] = [
                   'edit_properties',
                   'configure_tasks',
                   'configure_hardware_io',
+                  'configure_hwconfig',
+                  'configure_retain_ranges',
+                  'configure_device_init',
+                  'configure_data_exchange',
                   'create_pou',
                   'manage_pou',
                   'write_st',
                   'write_ld',
+                  'write_il',
+                  'write_sfc',
+                  'write_fbd',
                   'edit_ld_rungs',
                   'edit_local_vars',
                   'edit_global_vars',
@@ -645,8 +928,15 @@ export const MCP_TOOLS: McpToolDef[] = [
               pou_name: { type: 'string' },
               code: { type: 'string' },
               program: { type: 'string' },
-              language: { type: 'string' },
-              pou_type: { type: 'string' },
+              language: { type: 'string', enum: ['LD', 'ST', 'IL', 'SFC', 'FBD'] },
+              pou_type: { type: 'string', enum: ['PRG', 'FB', 'FC'] },
+              return_type: { type: 'string' },
+              sfc_chart: SFC_CHART_SCHEMA,
+              fbd_diagram: FBD_DIAGRAM_SCHEMA,
+              hw_config: HW_CONFIG_SCHEMA,
+              retain_zones: RETAIN_ZONES_SCHEMA,
+              device_init: DEVICE_INIT_ENTRIES_SCHEMA,
+              data_exchange: DATA_EXCHANGE_ROWS_SCHEMA,
               action: { type: 'string' },
               new_name: { type: 'string' },
               properties: { type: 'object', additionalProperties: { type: 'string' } },
@@ -738,7 +1028,7 @@ export const MCP_TOOLS: McpToolDef[] = [
             if (!projSec) throw new FileTransformError('Missing <PROJECT> section');
             let inner = projSec.inner;
             for (const [k, v] of Object.entries((op.properties as Record<string, string>) ?? {})) {
-              const re = new RegExp(`^${k}=[^\\r\\n]*`, 'm');
+              const re = new RegExp(`^${escapeRegex(k)}=[^\\r\\n]*`, 'm');
               inner = re.test(inner) ? inner.replace(re, `${k}=${v}`) : inner.trimEnd() + c.newline + `${k}=${v}` + c.newline;
             }
             source = source.slice(0, projSec.innerStart) + inner + source.slice(projSec.innerEnd);
@@ -746,14 +1036,35 @@ export const MCP_TOOLS: McpToolDef[] = [
             source = replaceTasksInSource(source, (op.tasks as TaskConfig[]) ?? [], c.newline);
           } else if (t === 'configure_hardware_io') {
             source = writeSystemVarsInSource(source, (op.ranges as Record<string, string>) ?? {}, c.newline);
+          } else if (t === 'configure_hwconfig') {
+            const cur = readHwConfigFromSource(source);
+            const patch = (op.hw_config as Partial<HwConfigDocument>) ?? {};
+            const merged: HwConfigDocument = {
+              cpu: { ...cur.cpu, ...(patch.cpu ?? {}) },
+              serial_ports: Array.isArray(patch.serial_ports) ? patch.serial_ports : cur.serial_ports,
+              ethernet: { ...cur.ethernet, ...(patch.ethernet ?? {}) },
+              modules: Array.isArray(patch.modules) ? patch.modules : cur.modules,
+            };
+            const errs = validateHwConfig(merged);
+            if (errs.length) throw new FileTransformError(`HWCONFIG validation failed: ${errs.join('; ')}`);
+            source = writeHwConfigToSource(source, merged, c.newline);
+          } else if (t === 'configure_retain_ranges') {
+            source = writeRetainConfigToSource(source, { zones: (op.retain_zones as RetainZone[]) ?? [] }, c.newline);
+          } else if (t === 'configure_device_init') {
+            source = writeDeviceInitToSource(source, (op.device_init as DeviceInitEntry[]) ?? [], c.newline);
+          } else if (t === 'configure_data_exchange') {
+            source = writeDataExchangeToSource(source, (op.data_exchange as DataExchangeRow[]) ?? [], c.newline);
           } else if (t === 'create_pou') {
             source = createPouInSource(
               source,
               {
                 pouName: String(op.pou_name ?? ''),
-                language: (op.language as 'LD' | 'ST' | 'IL') ?? 'LD',
+                language: (op.language as PouLanguage) ?? 'LD',
                 pouType: (op.pou_type as 'PRG' | 'FB' | 'FC') ?? 'PRG',
+                returnType: typeof op.return_type === 'string' ? op.return_type : undefined,
                 code: typeof op.code === 'string' ? op.code : undefined,
+                sfcChart: op.sfc_chart as SfcChart | undefined,
+                fbdDiagram: op.fbd_diagram as FbdDiagram | undefined,
                 localVariables: typeof op.local_variables === 'string' ? op.local_variables : undefined,
                 assignToTask: op.assign_to_task !== false,
               },
@@ -775,6 +1086,12 @@ export const MCP_TOOLS: McpToolDef[] = [
             const repCode = normalized(String(op.code ?? '')).replace(/\n/g, c.newline);
             const newInner = pouMatch.inner.slice(0, stSec.innerStart) + repCode + pouMatch.inner.slice(stSec.innerEnd);
             source = source.slice(0, pouMatch.innerStart) + newInner + source.slice(pouMatch.innerEnd);
+          } else if (t === 'write_il') {
+            source = patchIlPouInSource(source, String(op.pou_name ?? ''), String(op.code ?? ''), c.newline);
+          } else if (t === 'write_sfc') {
+            source = patchSfcPouInSource(source, String(op.pou_name ?? ''), op.sfc_chart as SfcChart, c.newline);
+          } else if (t === 'write_fbd') {
+            source = patchFbdPouInSource(source, String(op.pou_name ?? ''), op.fbd_diagram as FbdDiagram, c.newline);
           } else if (t === 'write_ld') {
             const pouName = String(op.pou_name ?? '');
             const built = buildNetworksFromIl(String(op.program ?? ''), c.newline);
@@ -886,7 +1203,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         model: { type: 'string', description: 'Target PLC model, e.g. ES2, DVP32ES2T, EH3, AS228T' },
         output_path: { type: 'string', description: 'New .isp workspace path, e.g. /workspace/conveyor.isp' },
         initial_pou_name: { type: 'string', default: 'Prog0' },
-        language: { type: 'string', enum: ['LD', 'ST'], default: 'LD' },
+        language: { type: 'string', enum: ['LD', 'ST', 'IL', 'SFC', 'FBD'], default: 'LD' },
         dry_run: { type: 'boolean', default: false },
       },
     },
@@ -900,7 +1217,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         const { ispBytes, iniBytes, canonicalModel } = createBlankProjectBytes({
           model,
           initialPouName: typeof args.initial_pou_name === 'string' ? args.initial_pou_name : 'Prog0',
-          language: args.language === 'ST' ? 'ST' : 'LD',
+          language: (typeof args.language === 'string' ? args.language : 'LD') as PouLanguage,
         });
         const decoded = decodeContainer(ispBytes);
         if (args.dry_run) {
@@ -1113,7 +1430,7 @@ export const MCP_TOOLS: McpToolDef[] = [
             const { canonical, error } = resolveModel(String(v));
             if (error || !canonical) throw new FileTransformError(error ?? 'Invalid model');
           }
-          const lineRe = new RegExp(`^${k}=[^\\r\\n]*`, 'm');
+          const lineRe = new RegExp(`^${escapeRegex(k)}=[^\\r\\n]*`, 'm');
           if (lineRe.test(projInner)) {
             projInner = projInner.replace(lineRe, `${k}=${v}`);
           } else {
@@ -1143,8 +1460,7 @@ export const MCP_TOOLS: McpToolDef[] = [
         if (args.ini_settings && written.candidateCompanion) {
           let iniText = readFileBuffer(written.candidateCompanion).toString('utf-8');
           for (const [k, v] of Object.entries(args.ini_settings as Record<string, string>)) {
-            const re = new RegExp(`^${k}=[^\\r\\n]*`, 'm');
-            iniText = re.test(iniText) ? iniText.replace(re, `${k}=${v}`) : iniText.trimEnd() + `\r\n${k}=${v}\r\n`;
+            iniText = setIniKeySafe(iniText, k, String(v), '\r\n');
           }
           writeFileBuffer(written.candidateCompanion, Buffer.from(iniText, 'utf-8'), true);
         }
@@ -1309,7 +1625,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   // =========================================================================
   {
     name: 'ispsoft_create_pou',
-    description: 'Create a new PRG, FB, or FC POU in LD, ST, or IL inside a project (in_place or backed-up candidate).',
+    description: 'Create a new PRG, FB, or FC POU in LD, ST, IL, SFC, or FBD inside a project (in_place or backed-up candidate).',
     category: 'POU & Symbol Authoring',
     inputSchema: {
       type: 'object',
@@ -1317,9 +1633,13 @@ export const MCP_TOOLS: McpToolDef[] = [
       properties: {
         project_path: { type: 'string' },
         pou_name: { type: 'string' },
-        language: { type: 'string', enum: ['LD', 'ST', 'IL'] },
+        language: { type: 'string', enum: ['LD', 'ST', 'IL', 'SFC', 'FBD'] },
         pou_type: { type: 'string', enum: ['PRG', 'FB', 'FC'], default: 'PRG' },
+        return_type: { type: 'string', description: 'Optional IEC return type for FC POUs (e.g. INT, REAL, BOOL)' },
+        en_eno: { type: 'boolean', description: 'Optional EN/ENO enable flag for FB/FC POUs' },
         code: { type: 'string', description: 'ST code or IL program (compiled to LD networks if language=LD)' },
+        sfc_chart: SFC_CHART_SCHEMA,
+        fbd_diagram: FBD_DIAGRAM_SCHEMA,
         local_variables: { type: 'string' },
         assign_to_task: { type: 'boolean', default: true },
         in_place: { type: 'boolean', default: false },
@@ -1342,9 +1662,13 @@ export const MCP_TOOLS: McpToolDef[] = [
           source,
           {
             pouName: String(args.pou_name ?? ''),
-            language: (args.language as 'LD' | 'ST' | 'IL') ?? 'LD',
+            language: (args.language as PouLanguage) ?? 'LD',
             pouType: (args.pou_type as 'PRG' | 'FB' | 'FC') ?? 'PRG',
+            returnType: typeof args.return_type === 'string' ? args.return_type : undefined,
+            enEno: typeof args.en_eno === 'boolean' ? args.en_eno : undefined,
             code: typeof args.code === 'string' ? args.code : undefined,
+            sfcChart: args.sfc_chart as SfcChart | undefined,
+            fbdDiagram: args.fbd_diagram as FbdDiagram | undefined,
             localVariables: typeof args.local_variables === 'string' ? args.local_variables : undefined,
             assignToTask: args.assign_to_task !== false,
           },
@@ -1425,7 +1749,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_read_pou',
-    description: 'Read one POU source sections (LOCAL_VAR, IL_ST_CODE, LD_NETWORKS) and parsed symbol view.',
+    description: 'Read one POU source sections (LOCAL_VAR, IL_ST_CODE, LD_NETWORKS, SFC_BODY, FBD_BODY) and parsed symbol/graph view.',
     category: 'POU & Symbol Authoring',
     inputSchema: {
       type: 'object',
@@ -1436,29 +1760,47 @@ export const MCP_TOOLS: McpToolDef[] = [
       try {
         const p = normalizeVirtualPath(String(args.project_path ?? ''));
         const pouName = String(args.pou_name ?? '');
-        const c = decodeContainer(readFileBuffer(p));
+        const raw = readFileBuffer(p);
+        const c = decodeContainer(raw);
         const source = decodeCodepage(c.source, c.encoding);
         const candidates = sections(source, 'POU').filter((m) => propertyValue(m.inner, 'P_Name') === pouName);
         if (candidates.length !== 1) throw new FileTransformError(`Expected one POU named ${JSON.stringify(pouName)}; found ${candidates.length}`);
         const body = candidates[0].inner;
+        const lang = propertyValue(body, 'P_Lang') ?? '1';
         const secMap: Record<string, string[]> = {};
-        for (const tag of ['LOCAL_VAR', 'IL_ST_CODE']) {
+        for (const tag of ['LOCAL_VAR', 'IL_ST_CODE', 'SFC_BODY', 'FBD_BODY']) {
           secMap[tag] = sections(body, tag).map((m) => m.inner);
         }
         const networks = ldNetworks(body);
         secMap.LD_NETWORKS = networks;
         const localVarText = secMap.LOCAL_VAR.length === 1 ? secMap.LOCAL_VAR[0] : '';
         const localSymbols = parseLocalVariables(localVarText);
+        const extra: Record<string, unknown> = {};
+        if (lang === '3') {
+          extra.il_code = secMap.IL_ST_CODE[0] ?? '';
+        } else if (lang === '4') {
+          const parsedSfc = parseSfcFromPouBody(body);
+          extra.sfc_chart = parsedSfc.chart;
+          if (parsedSfc.error) extra.sfc_error = parsedSfc.error;
+          extra.sfc_ascii = parsedSfc.chart ? renderSfcAscii(parsedSfc.chart) : '';
+        } else if (lang === '5') {
+          const parsedFbd = parseFbdFromPouBody(body);
+          extra.fbd_diagram = parsedFbd.diagram;
+          if (parsedFbd.error) extra.fbd_error = parsedFbd.error;
+          extra.fbd_ascii = parsedFbd.diagram ? renderFbdAscii(parsedFbd.diagram) : '';
+        }
         return {
           success: true,
           name: pouName,
-          language: propertyValue(body, 'P_Lang'),
+          language: lang,
+          language_name: langCodeToName(lang),
           type: propertyValue(body, 'P_type'),
           network_count: networks.length,
           sections: secMap,
+          ...extra,
           local_variable_symbols: { status: localSymbols.status, entries: localSymbols.entries, errors: localSymbols.errors },
           content_hash: computeContentHash('pou', body),
-          project_content_hash: computeContentHash('isp', c.source),
+          project_content_hash: computeContentHash('isp', raw),
         };
       } catch (e) {
         return { success: false, failure_category: 'validation_error', error: errMsg(e) };
@@ -2570,29 +2912,26 @@ export const MCP_TOOLS: McpToolDef[] = [
   },
   {
     name: 'ispsoft_map_dvp_modbus_addresses',
-    description: 'Translate documented DVP ES2 device addresses (X, Y, M, S, T, C, D) to zero-based Modbus PDU addresses.',
+    description: 'Translate Delta DVP, AS, and AH device addresses (X, Y, M, SM, S, T, C, HC, D, SR) to zero-based Modbus PDU addresses.',
     category: 'Analysis & Compilation',
     inputSchema: {
       type: 'object',
       required: ['model', 'addresses'],
       properties: {
-        model: { type: 'string' },
+        model: { type: 'string', description: 'Delta PLC model (e.g. ES2, ES3, EH3, SV2, SE, AS228T, AS300, AH500)' },
         addresses: { type: 'array', items: { type: 'string' } },
       },
     },
     handler: (args) => {
       const { canonical, error } = resolveModel(String(args.model ?? ''));
       if (error || !canonical) return { status: 'UNSUPPORTED_MODEL', model: args.model, device_contacted: false, serial_port_opened: false, error };
-      if (canonical !== 'ES2') {
-        return { status: 'MODEL_NOT_QUALIFIED', model: canonical, device_contacted: false, serial_port_opened: false, error: 'Qualified only for DVP ES2.' };
-      }
       const addresses = Array.isArray(args.addresses) ? args.addresses : [];
       if (!addresses.length || addresses.length > 200) {
         return { status: 'REJECTED_BEFORE_IO', model: canonical, device_contacted: false, serial_port_opened: false, error: 'addresses must contain 1-200 strings' };
       }
       const mappings = addresses.map((addr) => {
         try {
-          return { success: true, ...mapDevice(String(addr)) };
+          return { success: true, ...mapDevice(String(addr), canonical) };
         } catch (e) {
           const msg = errMsg(e);
           const detail = classifyToolError(
@@ -3014,6 +3353,1079 @@ export const MCP_TOOLS: McpToolDef[] = [
           slow_threshold_ms: typeof args.slow_threshold_ms === 'number' ? args.slow_threshold_ms : undefined,
           reset_metrics: Boolean(args.reset_metrics),
           include_recent_scans: Boolean(args.include_recent_scans),
+        });
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+
+  // =========================================================================
+  // 7. Full ISPSoft Feature Suite: IL/SFC/FBD, HWCONFIG, Retain, Init, Exchange,
+  //    Packages, CSV, Converter, Allocator, Migration, Reference & Advanced Sim
+  // =========================================================================
+  {
+    name: 'ispsoft_write_il_pou',
+    description: 'Patch an Instruction List (IL, P_Lang=3) POU body with syntax validation, OCC expected_content_hash, and dry_run.',
+    category: 'POU & Symbol Authoring',
+    inputSchema: {
+      type: 'object',
+      required: ['project_path', 'pou_name', 'il_code'],
+      properties: {
+        project_path: { type: 'string' },
+        pou_name: { type: 'string' },
+        il_code: { type: 'string' },
+        in_place: { type: 'boolean', default: false },
+        output_path: { type: 'string' },
+        expected_content_hash: { type: 'string' },
+        dry_run: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        const srcPath = normalizeVirtualPath(String(args.project_path ?? ''));
+        const pouName = String(args.pou_name ?? '');
+        const original = readFileBuffer(srcPath);
+        const currentHash = computeContentHash('isp', original);
+        if (args.expected_content_hash && args.expected_content_hash !== currentHash) {
+          return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'state_changed', current_content_hash: currentHash };
+        }
+        const c = decodeContainer(original);
+        const source = decodeCodepage(c.source, c.encoding);
+        const updated = patchIlPouInSource(source, pouName, String(args.il_code ?? ''), c.newline);
+        const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
+        if (args.dry_run) {
+          return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, pou_name: pouName, current_content_hash: currentHash };
+        }
+        const target =
+          typeof args.output_path === 'string' && args.output_path.trim()
+            ? normalizeVirtualPath(args.output_path)
+            : artifactPath(`${path.posix.parse(srcPath).name}-${pouName}-il`, '.isp');
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
+        return {
+          success: true,
+          status: 'GENERATED_UNCOMPILED',
+          candidate: written.target,
+          backup: written.backup,
+          pou_name: pouName,
+          content_hash: computeContentHash('isp', candidateBytes),
+        };
+      } catch (e) {
+        return { success: false, status: 'CANDIDATE_FAILED', failure_category: 'validation_error', error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_write_sfc_pou',
+    description: 'Patch an IEC 61131-3 Sequential Function Chart (SFC, P_Lang=4) POU with steps, action qualifiers (N/S/R/P/P1/P0/L/D), and transitions.',
+    category: 'POU & Symbol Authoring',
+    inputSchema: {
+      type: 'object',
+      required: ['project_path', 'pou_name', 'sfc_chart'],
+      properties: {
+        project_path: { type: 'string' },
+        pou_name: { type: 'string' },
+        sfc_chart: SFC_CHART_SCHEMA,
+        in_place: { type: 'boolean', default: false },
+        output_path: { type: 'string' },
+        expected_content_hash: { type: 'string' },
+        dry_run: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        const srcPath = normalizeVirtualPath(String(args.project_path ?? ''));
+        const pouName = String(args.pou_name ?? '');
+        const original = readFileBuffer(srcPath);
+        const currentHash = computeContentHash('isp', original);
+        if (args.expected_content_hash && args.expected_content_hash !== currentHash) {
+          return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'state_changed', current_content_hash: currentHash };
+        }
+        const chart = args.sfc_chart as SfcChart;
+        const validation = validateSfcChart(chart);
+        if (!validation.valid) {
+          return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'validation_error', error: validation.errors.join('; '), validation };
+        }
+        const c = decodeContainer(original);
+        const source = decodeCodepage(c.source, c.encoding);
+        const updated = patchSfcPouInSource(source, pouName, chart, c.newline);
+        const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
+        const ascii = renderSfcAscii(chart);
+        if (args.dry_run) {
+          return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, pou_name: pouName, sfc_ascii: ascii, warnings: validation.warnings, current_content_hash: currentHash };
+        }
+        const target =
+          typeof args.output_path === 'string' && args.output_path.trim()
+            ? normalizeVirtualPath(args.output_path)
+            : artifactPath(`${path.posix.parse(srcPath).name}-${pouName}-sfc`, '.isp');
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
+        return {
+          success: true,
+          status: 'GENERATED_UNCOMPILED',
+          candidate: written.target,
+          backup: written.backup,
+          pou_name: pouName,
+          sfc_ascii: ascii,
+          warnings: validation.warnings,
+          content_hash: computeContentHash('isp', candidateBytes),
+        };
+      } catch (e) {
+        return { success: false, status: 'CANDIDATE_FAILED', failure_category: 'validation_error', error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_write_fbd_pou',
+    description: 'Patch an IEC 61131-3 Function Block Diagram / CFC (FBD, P_Lang=5) POU with interconnected logic, math, standard IEC FBs, and user FBs.',
+    category: 'POU & Symbol Authoring',
+    inputSchema: {
+      type: 'object',
+      required: ['project_path', 'pou_name', 'fbd_diagram'],
+      properties: {
+        project_path: { type: 'string' },
+        pou_name: { type: 'string' },
+        fbd_diagram: FBD_DIAGRAM_SCHEMA,
+        in_place: { type: 'boolean', default: false },
+        output_path: { type: 'string' },
+        expected_content_hash: { type: 'string' },
+        dry_run: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        const srcPath = normalizeVirtualPath(String(args.project_path ?? ''));
+        const pouName = String(args.pou_name ?? '');
+        const original = readFileBuffer(srcPath);
+        const currentHash = computeContentHash('isp', original);
+        if (args.expected_content_hash && args.expected_content_hash !== currentHash) {
+          return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'state_changed', current_content_hash: currentHash };
+        }
+        const diagram = args.fbd_diagram as FbdDiagram;
+        const validation = validateFbdDiagram(diagram);
+        if (!validation.valid) {
+          return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'validation_error', error: validation.errors.join('; '), validation };
+        }
+        const c = decodeContainer(original);
+        const source = decodeCodepage(c.source, c.encoding);
+        const updated = patchFbdPouInSource(source, pouName, diagram, c.newline);
+        const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
+        const ascii = renderFbdAscii(diagram);
+        if (args.dry_run) {
+          return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, pou_name: pouName, fbd_ascii: ascii, warnings: validation.warnings, current_content_hash: currentHash };
+        }
+        const target =
+          typeof args.output_path === 'string' && args.output_path.trim()
+            ? normalizeVirtualPath(args.output_path)
+            : artifactPath(`${path.posix.parse(srcPath).name}-${pouName}-fbd`, '.isp');
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
+        return {
+          success: true,
+          status: 'GENERATED_UNCOMPILED',
+          candidate: written.target,
+          backup: written.backup,
+          pou_name: pouName,
+          fbd_ascii: ascii,
+          warnings: validation.warnings,
+          content_hash: computeContentHash('isp', candidateBytes),
+        };
+      } catch (e) {
+        return { success: false, status: 'CANDIDATE_FAILED', failure_category: 'validation_error', error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_configure_hwconfig',
+    description: 'Read or update ISPSoft HWCONFIG: CPU parameters (watchdog/scan/filter), COM1-3 serial ports, Ethernet/Modbus TCP, and right-side extension modules with automatic I/O & CR allocation.',
+    category: 'Hardware & System Configuration',
+    inputSchema: {
+      type: 'object',
+      required: ['project_path'],
+      properties: {
+        project_path: { type: 'string' },
+        hw_config: HW_CONFIG_SCHEMA,
+        in_place: { type: 'boolean', default: false },
+        output_path: { type: 'string' },
+        expected_content_hash: { type: 'string' },
+        dry_run: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        const srcPath = normalizeVirtualPath(String(args.project_path ?? ''));
+        const original = readFileBuffer(srcPath);
+        const currentHash = computeContentHash('isp', original);
+        if (args.expected_content_hash && args.expected_content_hash !== currentHash) {
+          return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'state_changed', current_content_hash: currentHash };
+        }
+        const c = decodeContainer(original);
+        const source = decodeCodepage(c.source, c.encoding);
+        const currentCfg = readHwConfigFromSource(source);
+        if (!args.hw_config || typeof args.hw_config !== 'object') {
+          return {
+            success: true,
+            status: 'READ_HWCONFIG',
+            model: inspectContainer(c).project_model,
+            hw_config: currentCfg,
+            validation_errors: validateHwConfig(currentCfg),
+            content_hash: currentHash,
+          };
+        }
+        const patch = args.hw_config as Partial<HwConfigDocument>;
+        const merged: HwConfigDocument = {
+          cpu: { ...currentCfg.cpu, ...(patch.cpu ?? {}) },
+          serial_ports: Array.isArray(patch.serial_ports) ? patch.serial_ports : currentCfg.serial_ports,
+          ethernet: { ...currentCfg.ethernet, ...(patch.ethernet ?? {}) },
+          modules: Array.isArray(patch.modules) ? patch.modules : currentCfg.modules,
+        };
+        const errs = validateHwConfig(merged);
+        if (errs.length) {
+          return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'validation_error', error: errs.join('; '), validation_errors: errs };
+        }
+        const updated = writeHwConfigToSource(source, merged, c.newline);
+        const normalizedSaved = readHwConfigFromSource(updated);
+        const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
+        if (args.dry_run) {
+          return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, hw_config: normalizedSaved, current_content_hash: currentHash };
+        }
+        const target =
+          typeof args.output_path === 'string' && args.output_path.trim()
+            ? normalizeVirtualPath(args.output_path)
+            : artifactPath(`${path.posix.parse(srcPath).name}-hwconfig`, '.isp');
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
+        return {
+          success: true,
+          status: 'GENERATED_UNCOMPILED',
+          candidate: written.target,
+          backup: written.backup,
+          hw_config: normalizedSaved,
+          content_hash: computeContentHash('isp', candidateBytes),
+        };
+      } catch (e) {
+        return { success: false, status: 'CANDIDATE_FAILED', failure_category: 'validation_error', error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_configure_retain_ranges',
+    description: 'Read or configure ISPSoft Retentive / Latched Memory ranges (M/S/T/C/D) preserved across WARM_RESET and power cycles.',
+    category: 'Hardware & System Configuration',
+    inputSchema: {
+      type: 'object',
+      required: ['project_path'],
+      properties: {
+        project_path: { type: 'string' },
+        zones: RETAIN_ZONES_SCHEMA,
+        in_place: { type: 'boolean', default: false },
+        output_path: { type: 'string' },
+        expected_content_hash: { type: 'string' },
+        dry_run: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        const srcPath = normalizeVirtualPath(String(args.project_path ?? ''));
+        const original = readFileBuffer(srcPath);
+        const currentHash = computeContentHash('isp', original);
+        if (args.expected_content_hash && args.expected_content_hash !== currentHash) {
+          return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'state_changed', current_content_hash: currentHash };
+        }
+        const c = decodeContainer(original);
+        const source = decodeCodepage(c.source, c.encoding);
+        if (!Array.isArray(args.zones)) {
+          return { success: true, status: 'READ_RETAIN_RANGES', retain_config: readRetainConfigFromSource(source), content_hash: currentHash };
+        }
+        const zones = args.zones as RetainZone[];
+        for (const z of zones) {
+          if (z.end < z.start) throw new FileTransformError(`Retain zone ${z.area}${z.start}-${z.end} has end < start`);
+        }
+        const updated = writeRetainConfigToSource(source, { zones }, c.newline);
+        const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
+        if (args.dry_run) {
+          return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, retain_config: { zones }, current_content_hash: currentHash };
+        }
+        const target =
+          typeof args.output_path === 'string' && args.output_path.trim()
+            ? normalizeVirtualPath(args.output_path)
+            : artifactPath(`${path.posix.parse(srcPath).name}-retain`, '.isp');
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
+        return {
+          success: true,
+          status: 'GENERATED_UNCOMPILED',
+          candidate: written.target,
+          backup: written.backup,
+          retain_config: { zones },
+          content_hash: computeContentHash('isp', candidateBytes),
+        };
+      } catch (e) {
+        return { success: false, status: 'CANDIDATE_FAILED', failure_category: 'validation_error', error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_configure_device_init',
+    description: 'Read or configure the ISPSoft Device Initial Value Table (BOOL/INT/WORD/DINT/DWORD/REAL values seeded on PLC startup and COLD_RESET).',
+    category: 'Hardware & System Configuration',
+    inputSchema: {
+      type: 'object',
+      required: ['project_path'],
+      properties: {
+        project_path: { type: 'string' },
+        entries: DEVICE_INIT_ENTRIES_SCHEMA,
+        in_place: { type: 'boolean', default: false },
+        output_path: { type: 'string' },
+        expected_content_hash: { type: 'string' },
+        dry_run: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        const srcPath = normalizeVirtualPath(String(args.project_path ?? ''));
+        const original = readFileBuffer(srcPath);
+        const currentHash = computeContentHash('isp', original);
+        if (args.expected_content_hash && args.expected_content_hash !== currentHash) {
+          return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'state_changed', current_content_hash: currentHash };
+        }
+        const c = decodeContainer(original);
+        const source = decodeCodepage(c.source, c.encoding);
+        if (!Array.isArray(args.entries)) {
+          return { success: true, status: 'READ_DEVICE_INIT', entries: readDeviceInitFromSource(source), content_hash: currentHash };
+        }
+        const entries = args.entries as DeviceInitEntry[];
+        const updated = writeDeviceInitToSource(source, entries, c.newline);
+        const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
+        if (args.dry_run) {
+          return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, entries, current_content_hash: currentHash };
+        }
+        const target =
+          typeof args.output_path === 'string' && args.output_path.trim()
+            ? normalizeVirtualPath(args.output_path)
+            : artifactPath(`${path.posix.parse(srcPath).name}-devinit`, '.isp');
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
+        return {
+          success: true,
+          status: 'GENERATED_UNCOMPILED',
+          candidate: written.target,
+          backup: written.backup,
+          entries,
+          content_hash: computeContentHash('isp', candidateBytes),
+        };
+      } catch (e) {
+        return { success: false, status: 'CANDIDATE_FAILED', failure_category: 'validation_error', error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_configure_data_exchange',
+    description: 'Read or configure ISPSoft PLC Link / Modbus Data Exchange polling tables (COM2/COM3/Ethernet master-slave register sync).',
+    category: 'Hardware & System Configuration',
+    inputSchema: {
+      type: 'object',
+      required: ['project_path'],
+      properties: {
+        project_path: { type: 'string' },
+        rows: DATA_EXCHANGE_ROWS_SCHEMA,
+        in_place: { type: 'boolean', default: false },
+        output_path: { type: 'string' },
+        expected_content_hash: { type: 'string' },
+        dry_run: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        const srcPath = normalizeVirtualPath(String(args.project_path ?? ''));
+        const original = readFileBuffer(srcPath);
+        const currentHash = computeContentHash('isp', original);
+        if (args.expected_content_hash && args.expected_content_hash !== currentHash) {
+          return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'state_changed', current_content_hash: currentHash };
+        }
+        const c = decodeContainer(original);
+        const source = decodeCodepage(c.source, c.encoding);
+        if (!Array.isArray(args.rows)) {
+          return { success: true, status: 'READ_DATA_EXCHANGE', rows: readDataExchangeFromSource(source), content_hash: currentHash };
+        }
+        const rows = args.rows as DataExchangeRow[];
+        const updated = writeDataExchangeToSource(source, rows, c.newline);
+        const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
+        if (args.dry_run) {
+          return { success: true, status: 'DRY_RUN_PASSED', dry_run: true, rows, current_content_hash: currentHash };
+        }
+        const target =
+          typeof args.output_path === 'string' && args.output_path.trim()
+            ? normalizeVirtualPath(args.output_path)
+            : artifactPath(`${path.posix.parse(srcPath).name}-exchange`, '.isp');
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
+        return {
+          success: true,
+          status: 'GENERATED_UNCOMPILED',
+          candidate: written.target,
+          backup: written.backup,
+          rows,
+          content_hash: computeContentHash('isp', candidateBytes),
+        };
+      } catch (e) {
+        return { success: false, status: 'CANDIDATE_FAILED', failure_category: 'validation_error', error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_import_export_pou_package',
+    description: 'Import an .mpu POU package into an .isp project, export an LD POU to .mpu, or export the entire project to PLCopen XML (TC6 2.01) or IEC 61131-3 Structured Text.',
+    category: 'Project Management',
+    inputSchema: {
+      type: 'object',
+      required: ['action', 'project_path'],
+      properties: {
+        action: { type: 'string', enum: ['import_mpu', 'export_mpu', 'export_plcopen_xml', 'export_iec_st'] },
+        project_path: { type: 'string' },
+        mpu_path: { type: 'string', description: 'Source .mpu path for import_mpu or output .mpu path for export_mpu' },
+        pou_name: { type: 'string', description: 'Target POU name (required for export_mpu, optional override for import_mpu)' },
+        overwrite: { type: 'boolean', default: false },
+        assign_to_task: { type: 'boolean', default: false },
+        in_place: { type: 'boolean', default: false },
+        output_path: { type: 'string', description: 'Optional workspace path to save exported .isp / .xml / .st / .mpu file' },
+      },
+    },
+    handler: (args) => {
+      try {
+        const action = String(args.action ?? '');
+        const projPath = normalizeVirtualPath(String(args.project_path ?? ''));
+        const original = readFileBuffer(projPath);
+        const c = decodeContainer(original);
+        const source = decodeCodepage(c.source, c.encoding);
+
+        if (action === 'import_mpu') {
+          const mpuPath = normalizeVirtualPath(String(args.mpu_path ?? ''));
+          const mpuBytes = readFileBuffer(mpuPath);
+          const imported = importMpuIntoProjectSource(source, mpuBytes, {
+            pouName: typeof args.pou_name === 'string' && args.pou_name.trim() ? args.pou_name.trim() : undefined,
+            overwrite: Boolean(args.overwrite),
+            assignToTask: Boolean(args.assign_to_task),
+            newline: c.newline,
+          });
+          const candidateBytes = c.rebuild(encodeCodepage(imported.updatedSource, c.encoding));
+          const target =
+            typeof args.output_path === 'string' && args.output_path.trim()
+              ? normalizeVirtualPath(args.output_path)
+              : artifactPath(`${path.posix.parse(projPath).name}-imp-${imported.pouName}`, '.isp');
+          const written = writeProjectCandidateAndBackup(projPath, target, original, candidateBytes, Boolean(args.in_place));
+          return {
+            success: true,
+            status: 'MPU_IMPORTED',
+            candidate: written.target,
+            backup: written.backup,
+            pou_name: imported.pouName,
+            network_count: imported.networkCount,
+            content_hash: computeContentHash('isp', candidateBytes),
+          };
+        }
+
+        if (action === 'export_mpu') {
+          const pouName = String(args.pou_name ?? '').trim();
+          if (!pouName) throw new FileTransformError('pou_name is required for export_mpu');
+          const exported = exportLdPouToMpuBytes(source, pouName);
+          const target =
+            typeof args.output_path === 'string' && args.output_path.trim()
+              ? normalizeVirtualPath(args.output_path)
+              : typeof args.mpu_path === 'string' && args.mpu_path.trim()
+                ? normalizeVirtualPath(args.mpu_path)
+                : artifactPath(`${pouName}`, '.mpu');
+          const saved = writeFileBuffer(target, exported.mpuBytes, Boolean(args.overwrite));
+          return {
+            success: true,
+            status: 'MPU_EXPORTED',
+            mpu_path: saved,
+            pou_name: pouName,
+            network_count: exported.networkCount,
+            il: exported.il,
+            sha256: sha256(exported.mpuBytes),
+          };
+        }
+
+        const bundle = exportProjectBundle(source, inspectContainer(c));
+        const pouInputs = bundle.pous.map((p) => {
+          let bodyText = '';
+          if (p.language === 'ST' || p.language === 'IL') {
+            bodyText = p.code ?? '';
+          } else if (p.language === 'LD') {
+            const ilLines = (p.networks ?? []).flatMap((n) => (Array.isArray(n.il) ? n.il : []));
+            const parsed = parseIl(ilLines.join('\n'));
+            bodyText = convertIlInstructionsToSt(parsed).st;
+          } else if (p.language === 'SFC' && p.sfc) {
+            bodyText = renderSfcAscii(p.sfc);
+          } else if (p.language === 'FBD' && p.fbd) {
+            bodyText = renderFbdAscii(p.fbd);
+          }
+          return {
+            name: p.name,
+            pouType: (p.pou_type === 'FB' ? 'FUNCTION_BLOCK' : p.pou_type === 'FC' ? 'FUNCTION' : 'PROGRAM') as
+              | 'PROGRAM'
+              | 'FUNCTION_BLOCK'
+              | 'FUNCTION',
+            language: p.language,
+            variables: p.local_vars,
+            bodyText,
+          };
+        });
+
+        const projectName = path.posix.parse(projPath).name;
+        if (action === 'export_plcopen_xml') {
+          const xml = exportProjectToPlcopenXml({
+            projectName,
+            model: bundle.model ?? 'ES2',
+            pous: pouInputs,
+          });
+          let savedPath: string | null = null;
+          if (typeof args.output_path === 'string' && args.output_path.trim()) {
+            savedPath = writeFileBuffer(normalizeVirtualPath(args.output_path), Buffer.from(xml, 'utf-8'), Boolean(args.overwrite));
+          }
+          return {
+            success: true,
+            status: 'PLCOPEN_XML_EXPORTED',
+            format: 'PLCopen_TC6_0201',
+            saved_path: savedPath,
+            pou_count: pouInputs.length,
+            xml: enforceValueBudget(xml, 'xml'),
+          };
+        }
+
+        const stText = exportProjectToIecStText({
+          projectName,
+          model: bundle.model ?? 'ES2',
+          pous: pouInputs,
+        });
+        let savedPath: string | null = null;
+        if (typeof args.output_path === 'string' && args.output_path.trim()) {
+          savedPath = writeFileBuffer(normalizeVirtualPath(args.output_path), Buffer.from(stText, 'utf-8'), Boolean(args.overwrite));
+        }
+        return {
+          success: true,
+          status: 'IEC_ST_EXPORTED',
+          format: 'IEC_61131_3_ST',
+          saved_path: savedPath,
+          pou_count: pouInputs.length,
+          st_text: enforceValueBudget(stText, 'st_text'),
+        };
+      } catch (e) {
+        return { success: false, failure_category: 'validation_error', error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_csv_symbols_comments',
+    description: 'Export or import ISPSoft Global/Local Symbol Tables and Device Comment Tables in standard CSV format.',
+    category: 'POU & Symbol Authoring',
+    inputSchema: {
+      type: 'object',
+      required: ['action', 'project_path'],
+      properties: {
+        action: { type: 'string', enum: ['export_symbols', 'import_symbols', 'export_comments', 'import_comments'] },
+        project_path: { type: 'string' },
+        csv_text: { type: 'string', description: 'CSV payload required for import_symbols / import_comments' },
+        replace_all: { type: 'boolean', default: false, description: 'Replace all existing device comments when importing comments' },
+        in_place: { type: 'boolean', default: false },
+        output_path: { type: 'string' },
+        expected_content_hash: { type: 'string' },
+      },
+    },
+    handler: (args) => {
+      try {
+        const action = String(args.action ?? '');
+        const srcPath = normalizeVirtualPath(String(args.project_path ?? ''));
+        const original = readFileBuffer(srcPath);
+        const currentHash = computeContentHash('isp', original);
+        const c = decodeContainer(original);
+        const source = decodeCodepage(c.source, c.encoding);
+
+        if (action === 'export_symbols') {
+          const rows: Array<{
+            scope: string;
+            identifier: string;
+            data_type: string;
+            address: string;
+            class_name: string;
+            initial_value: string;
+            comment: string;
+          }> = [];
+          const gSec = sections(source, 'GLOBAL_VAR')[0];
+          if (gSec) {
+            for (const e of parseLocalVariables(gSec.inner).entries) {
+              rows.push({
+                scope: 'GLOBAL',
+                identifier: e.identifier,
+                data_type: e.type,
+                address: e.address ?? '',
+                class_name: e.class,
+                initial_value: e.initial_value,
+                comment: e.comment ?? '',
+              });
+            }
+          }
+          for (const pou of sections(source, 'POU')) {
+            const pName = propertyValue(pou.inner, 'P_Name') ?? 'POU';
+            const lSec = sections(pou.inner, 'LOCAL_VAR')[0];
+            if (lSec) {
+              for (const e of parseLocalVariables(lSec.inner).entries) {
+                rows.push({
+                  scope: pName,
+                  identifier: e.identifier,
+                  data_type: e.type,
+                  address: e.address ?? '',
+                  class_name: e.class,
+                  initial_value: e.initial_value,
+                  comment: e.comment ?? '',
+                });
+              }
+            }
+          }
+          return { success: true, action, row_count: rows.length, csv: formatSymbolsCsv(rows) };
+        }
+
+        if (action === 'export_comments') {
+          const comments = readDeviceComments(source);
+          const rows = Object.entries(comments)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([device, comment]) => ({ device, comment }));
+          return { success: true, action, row_count: rows.length, csv: formatCommentsCsv(rows) };
+        }
+
+        if (args.expected_content_hash && args.expected_content_hash !== currentHash) {
+          return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'state_changed', current_content_hash: currentHash };
+        }
+        const csvText = String(args.csv_text ?? '');
+        if (!csvText.trim()) throw new FileTransformError('csv_text is required for CSV import');
+
+        let updated = source;
+        let importedCount = 0;
+
+        if (action === 'import_symbols') {
+          const parsedRows = parseSymbolsCsv(csvText);
+          const globalUpserts: Array<Record<string, unknown>> = [];
+          const byPou = new Map<string, Array<Record<string, unknown>>>();
+          for (const r of parsedRows) {
+            const entry = {
+              name: r.identifier,
+              type: r.data_type,
+              address: r.address || undefined,
+              class: r.class_name,
+              initial_value: r.initial_value || undefined,
+              comment: r.comment || undefined,
+            };
+            if (r.scope.toUpperCase() === 'GLOBAL') {
+              globalUpserts.push(entry);
+            } else {
+              if (!byPou.has(r.scope)) byPou.set(r.scope, []);
+              byPou.get(r.scope)!.push(entry);
+            }
+            importedCount++;
+          }
+          if (globalUpserts.length) {
+            updated = editGlobalVarsInSource(updated, { upsertVars: globalUpserts }, c.newline).updatedSource;
+          }
+          for (const [pName, vars] of byPou.entries()) {
+            updated = editLocalVarsInSource(updated, pName, { upsertVars: vars }, c.newline).updatedSource;
+          }
+        } else {
+          const commentRows = parseCommentsCsv(csvText);
+          const map: Record<string, string> = {};
+          for (const r of commentRows) {
+            map[r.device] = r.comment;
+            importedCount++;
+          }
+          updated = writeDeviceCommentsInSource(updated, map, c.newline, Boolean(args.replace_all)).updatedSource;
+        }
+
+        const candidateBytes = c.rebuild(encodeCodepage(updated, c.encoding));
+        const target =
+          typeof args.output_path === 'string' && args.output_path.trim()
+            ? normalizeVirtualPath(args.output_path)
+            : artifactPath(`${path.posix.parse(srcPath).name}-csv`, '.isp');
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, candidateBytes, Boolean(args.in_place));
+        return {
+          success: true,
+          status: 'CSV_IMPORTED',
+          candidate: written.target,
+          backup: written.backup,
+          imported_count: importedCount,
+          content_hash: computeContentHash('isp', candidateBytes),
+        };
+      } catch (e) {
+        return { success: false, failure_category: 'validation_error', error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_device_usage_and_allocate',
+    description: 'Scan the entire project (POUs, variables, comments, HWCONFIG, device_init) to build an ISPSoft Used-Device Map and automatically allocate free contiguous or individual X/Y/M/S/T/C/D addresses.',
+    category: 'Analysis & Compilation',
+    inputSchema: {
+      type: 'object',
+      required: ['project_path', 'action'],
+      properties: {
+        project_path: { type: 'string' },
+        action: { type: 'string', enum: ['usage_map', 'allocate'] },
+        area: { type: 'string', enum: ['X', 'Y', 'M', 'S', 'T', 'C', 'D'], description: 'Device area to allocate (required for action=allocate)' },
+        count: { type: 'integer', minimum: 1, maximum: 256, default: 1 },
+        start_from: { type: 'integer', minimum: 0, default: 0 },
+        contiguous: { type: 'boolean', default: true },
+      },
+    },
+    handler: (args) => {
+      try {
+        const p = normalizeVirtualPath(String(args.project_path ?? ''));
+        const c = decodeContainer(readFileBuffer(p));
+        const source = decodeCodepage(c.source, c.encoding);
+        const model = propertyValue(source, 'Prj_DT') ?? 'ES2';
+        const isOctal = !(model.toUpperCase().startsWith('AS') || model.toUpperCase().startsWith('AH'));
+        const sysVars = readSystemVars(source);
+        const limits: Record<string, number> = { X: 255, Y: 255, M: 4095, S: 1023, T: 255, C: 255, D: 9999 };
+        for (const r of sysVars) {
+          limits[r.area.toUpperCase()] = r.end;
+        }
+        const texts: string[] = [source];
+        for (const pou of sections(source, 'POU')) {
+          if (propertyValue(pou.inner, 'P_Lang') === '1') {
+            const rendered = renderLdAsciiForPou(pou.inner);
+            for (const rung of rendered.rungs) {
+              texts.push(rung.il.join(' '));
+            }
+          }
+        }
+        const usage = analyzeDeviceUsageFromTexts(texts, limits, isOctal);
+        if (args.action === 'allocate') {
+          const area = String(args.area ?? 'D').toUpperCase() as 'X' | 'Y' | 'M' | 'S' | 'T' | 'C' | 'D';
+          const count = typeof args.count === 'number' ? args.count : 1;
+          const allocated = allocateFreeDevices(usage, area, count, {
+            start_from: typeof args.start_from === 'number' ? args.start_from : 0,
+            contiguous: args.contiguous !== false,
+            is_octal_xy: isOctal,
+          });
+          return {
+            success: allocated.length === count,
+            model,
+            area,
+            requested_count: count,
+            allocated_count: allocated.length,
+            allocated,
+            area_summary: usage[area],
+          };
+        }
+        return {
+          success: true,
+          model,
+          octal_xy: isOctal,
+          usage,
+        };
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_convert_program',
+    description: 'Deterministically convert PLC logic between DVP IL / Ladder POU and IEC 61131-3 Structured Text (il_to_st, ld_pou_to_st, st_to_il).',
+    category: 'Analysis & Compilation',
+    inputSchema: {
+      type: 'object',
+      required: ['direction'],
+      properties: {
+        direction: { type: 'string', enum: ['il_to_st', 'ld_pou_to_st', 'st_to_il'] },
+        code: { type: 'string', description: 'Source IL or ST text (required for il_to_st and st_to_il)' },
+        project_path: { type: 'string', description: 'Required for ld_pou_to_st' },
+        pou_name: { type: 'string', description: 'Required for ld_pou_to_st' },
+      },
+    },
+    handler: (args) => {
+      try {
+        const dir = String(args.direction ?? '');
+        if (dir === 'il_to_st') {
+          const instructions = parseIl(String(args.code ?? ''));
+          const conv = convertIlInstructionsToSt(instructions);
+          return { success: true, direction: dir, st_code: conv.st, warnings: conv.warnings };
+        }
+        if (dir === 'ld_pou_to_st') {
+          const p = normalizeVirtualPath(String(args.project_path ?? ''));
+          const pouName = String(args.pou_name ?? '');
+          const c = decodeContainer(readFileBuffer(p));
+          const source = decodeCodepage(c.source, c.encoding);
+          const pou = sections(source, 'POU').find((m) => propertyValue(m.inner, 'P_Name') === pouName);
+          if (!pou) throw new FileTransformError(`POU ${JSON.stringify(pouName)} not found`);
+          const rendered = renderLdAsciiForPou(pou.inner);
+          const ilText = rendered.rungs.flatMap((r) => (r.label ? [`${r.label}:`, ...r.il] : r.il)).join('\n');
+          const instructions = parseIl(ilText);
+          const conv = convertIlInstructionsToSt(instructions);
+          return { success: true, direction: dir, pou_name: pouName, il_code: ilText, st_code: conv.st, warnings: conv.warnings };
+        }
+        const conv = convertSimpleStToIl(String(args.code ?? ''));
+        return { success: true, direction: 'st_to_il', il_code: conv.il, warnings: conv.warnings };
+      } catch (e) {
+        return { success: false, failure_category: 'validation_error', error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_migrate_project_model',
+    description: 'Migrate an ISPSoft .isp project to a different Delta PLC CPU model (e.g. ES2->EH3, ES2->AS228T, AS228T->AS300, AS300->AH500), resizing SYSTEM_VAR and reporting cross-family special-device warnings.',
+    category: 'Project Management',
+    inputSchema: {
+      type: 'object',
+      required: ['project_path', 'target_model'],
+      properties: {
+        project_path: { type: 'string' },
+        target_model: { type: 'string', description: 'Target Delta PLC model (e.g. EH3, ES3, SV2, AS228T, AS300, AH500)' },
+        output_path: { type: 'string' },
+        in_place: { type: 'boolean', default: false },
+        expected_content_hash: { type: 'string' },
+        dry_run: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        const srcPath = normalizeVirtualPath(String(args.project_path ?? ''));
+        const original = readFileBuffer(srcPath);
+        const currentHash = computeContentHash('isp', original);
+        if (args.expected_content_hash && args.expected_content_hash !== currentHash) {
+          return { success: false, status: 'REJECTED_BEFORE_WRITE', failure_category: 'state_changed', current_content_hash: currentHash };
+        }
+        const c = decodeContainer(original);
+        const source = decodeCodepage(c.source, c.encoding);
+        const migrated = migrateProjectModel(source, String(args.target_model ?? ''));
+        if (args.dry_run) {
+          return {
+            success: true,
+            status: 'DRY_RUN_PASSED',
+            dry_run: true,
+            source_model: migrated.sourceModel,
+            target_model: migrated.targetModel,
+            source_family: migrated.sourceFamily,
+            target_family: migrated.targetFamily,
+            migration_notes: migrated.migrationNotes,
+            warnings: migrated.warnings,
+            current_content_hash: currentHash,
+          };
+        }
+        const target =
+          typeof args.output_path === 'string' && args.output_path.trim()
+            ? normalizeVirtualPath(args.output_path)
+            : artifactPath(`${path.posix.parse(srcPath).name}-${migrated.targetModel}`, '.isp');
+        const written = writeProjectCandidateAndBackup(srcPath, target, original, migrated.ispBytes, Boolean(args.in_place));
+        const iniPath = written.target.replace(/\.isp$/i, '.ini');
+        writeFileBuffer(iniPath, migrated.iniBytes, true);
+        return {
+          success: true,
+          status: 'PROJECT_MIGRATED',
+          candidate: written.target,
+          companion_path: iniPath,
+          backup: written.backup,
+          source_model: migrated.sourceModel,
+          target_model: migrated.targetModel,
+          source_family: migrated.sourceFamily,
+          target_family: migrated.targetFamily,
+          migration_notes: migrated.migrationNotes,
+          warnings: migrated.warnings,
+          content_hash: computeContentHash('isp', migrated.ispBytes),
+        };
+      } catch (e) {
+        return { success: false, status: 'CANDIDATE_FAILED', failure_category: 'validation_error', error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_lookup_reference',
+    description: 'Search the built-in Delta PLC engineering reference catalog: DVP/AS/AH instructions & API numbers, special relays/registers (M1000+/D1000+/SM/SR), and extension modules with CR/BFM register maps.',
+    category: 'Diagnostics',
+    inputSchema: {
+      type: 'object',
+      required: ['topic'],
+      properties: {
+        topic: { type: 'string', enum: ['instructions', 'special_devices', 'extension_modules', 'all'] },
+        query: { type: 'string', description: 'Optional keyword/mnemonic/device/module search string' },
+        series: { type: 'string', enum: ['DVP', 'AS', 'AH'] },
+        category: { type: 'string' },
+        limit: { type: 'integer', minimum: 1, maximum: 200, default: 50 },
+      },
+    },
+    handler: (args) => {
+      try {
+        const res = lookupDeltaReference({
+          topic: (String(args.topic ?? 'all') as 'instructions' | 'special_devices' | 'extension_modules' | 'all'),
+          query: typeof args.query === 'string' ? args.query : undefined,
+          series: typeof args.series === 'string' ? (args.series as 'DVP' | 'AS' | 'AH') : undefined,
+          category: typeof args.category === 'string' ? args.category : undefined,
+          limit: typeof args.limit === 'number' ? args.limit : 50,
+        });
+        return { success: true, ...res };
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_modbus_planner',
+    description: 'Multi-series Delta Modbus toolkit: forward map devices (DVP/AS/AH), reverse map PDU address + function code back to PLC device, or generate exact Modbus RTU (CRC16) and Modbus TCP (MBAP) hex frames.',
+    category: 'Analysis & Compilation',
+    inputSchema: {
+      type: 'object',
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['forward', 'reverse', 'plan_frame'] },
+        model: { type: 'string', default: 'ES2', description: 'Delta PLC model (e.g. ES2, EH3, AS228T, AS300, AH500)' },
+        addresses: { type: 'array', items: { type: 'string' }, description: 'Device addresses for action=forward' },
+        pdu_address: { type: 'integer', minimum: 0, maximum: 65535, description: 'Zero-based Modbus PDU address for action=reverse' },
+        function_code: { type: 'integer', enum: [1, 2, 3, 4, 5, 6, 15, 16], default: 3, description: 'Modbus function code for action=reverse' },
+        device: { type: 'string', description: 'Target PLC device for action=plan_frame (e.g. D100, M0, Y0.1)' },
+        operation: { type: 'string', enum: ['read', 'write'], default: 'read' },
+        slave_id: { type: 'integer', minimum: 1, maximum: 247, default: 1 },
+        count: { type: 'integer', minimum: 1, maximum: 125, default: 1 },
+        value: { type: 'integer', description: 'Register or coil value (0/1 or 16-bit int) for write frames' },
+        transaction_id: { type: 'integer', minimum: 0, maximum: 65535, default: 1 },
+      },
+    },
+    handler: (args) => {
+      try {
+        const { canonical, error } = resolveModel(String(args.model ?? 'ES2'));
+        if (error || !canonical) return { success: false, status: 'UNSUPPORTED_MODEL', error };
+        const action = String(args.action ?? 'forward');
+        if (action === 'forward') {
+          const addrs = Array.isArray(args.addresses) ? args.addresses.map(String) : [];
+          if (!addrs.length) throw new FileTransformError('addresses must be a non-empty array for action=forward');
+          return {
+            success: true,
+            action,
+            model: canonical,
+            mappings: addrs.map((a) => mapDevice(a, canonical)),
+          };
+        }
+        if (action === 'reverse') {
+          if (typeof args.pdu_address !== 'number') throw new FileTransformError('pdu_address is required for action=reverse');
+          const fc = typeof args.function_code === 'number' ? args.function_code : 3;
+          const match = reverseMapModbus(args.pdu_address, fc, canonical);
+          return {
+            success: match !== null,
+            action,
+            model: canonical,
+            match,
+            ...(match === null ? { error: `No ${canonical} PLC device maps to PDU ${args.pdu_address} with FC${fc}` } : {}),
+          };
+        }
+        const dev = String(args.device ?? '').trim();
+        if (!dev) throw new FileTransformError('device is required for action=plan_frame');
+        const plan = planModbusRequest({
+          device: dev,
+          model: canonical,
+          operation: args.operation === 'write' ? 'write' : 'read',
+          slave_id: typeof args.slave_id === 'number' ? args.slave_id : 1,
+          count: typeof args.count === 'number' ? args.count : 1,
+          value: typeof args.value === 'number' ? args.value : 0,
+          transaction_id: typeof args.transaction_id === 'number' ? args.transaction_id : 1,
+        });
+        return { success: true, action, ...plan };
+      } catch (e) {
+        return { success: false, error_code: 'MODBUS_ADDRESS_ERROR', error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_sim_online_edit',
+    description: 'ISPSoft Online Edit: hot-patch a POU (ST, IL/LD, SFC, or FBD) inside a running Soft-PLC simulator WITHOUT stopping the CPU or losing device/timer/counter memory, optionally persisting back to disk.',
+    category: 'Soft-PLC Simulator & Monitor',
+    inputSchema: {
+      type: 'object',
+      required: ['session_id', 'pou_name'],
+      properties: {
+        session_id: { type: 'string' },
+        pou_name: { type: 'string' },
+        st_code: { type: 'string' },
+        il_code: { type: 'string' },
+        sfc_chart: SFC_CHART_SCHEMA,
+        fbd_diagram: FBD_DIAGRAM_SCHEMA,
+        persist_to_disk: { type: 'boolean', default: false },
+      },
+    },
+    handler: (args) => {
+      try {
+        return onlineEditSimulatorPou(String(args.session_id ?? ''), {
+          pouName: String(args.pou_name ?? ''),
+          stCode: typeof args.st_code === 'string' ? args.st_code : undefined,
+          ilCode: typeof args.il_code === 'string' ? args.il_code : undefined,
+          sfcChart: args.sfc_chart as SfcChart | undefined,
+          fbdDiagram: args.fbd_diagram as FbdDiagram | undefined,
+          persistToDisk: Boolean(args.persist_to_disk),
+        });
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_sim_io_modules',
+    description: 'Inspect or inject right-side special extension module Buffer Memory (BFM / CR registers) in a live Soft-PLC simulator (e.g. simulate DVP04AD-E2 analog channel readings or inspect DVP04DA-E2 DAC outputs written by FROM/TO).',
+    category: 'Soft-PLC Simulator & Monitor',
+    inputSchema: {
+      type: 'object',
+      required: ['session_id', 'action'],
+      properties: {
+        session_id: { type: 'string' },
+        action: { type: 'string', enum: ['list', 'read', 'write'] },
+        slot: { type: 'integer', minimum: 0, maximum: 31 },
+        cr_values: { type: 'object', additionalProperties: { type: 'number' }, description: 'Map of CR index -> 16-bit integer value, e.g. {"6": 2000, "12": 2000}' },
+      },
+    },
+    handler: (args) => {
+      try {
+        return manageSimIoModules(String(args.session_id ?? ''), {
+          action: (String(args.action ?? 'list') as 'list' | 'read' | 'write'),
+          slot: typeof args.slot === 'number' ? args.slot : undefined,
+          cr_values: args.cr_values as Record<string, number> | undefined,
+        });
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_sim_trigger_interrupt',
+    description: 'Trigger an interrupt task, interrupt POU, or interrupt subroutine label (I001/I100/etc.) immediately in the Soft-PLC simulator (honors EI/DI interrupt enable state).',
+    category: 'Soft-PLC Simulator & Monitor',
+    inputSchema: {
+      type: 'object',
+      required: ['session_id'],
+      properties: {
+        session_id: { type: 'string' },
+        task_name: { type: 'string', description: 'Interrupt task name to trigger' },
+        pou_name: { type: 'string', description: 'Interrupt POU name to execute' },
+        label: { type: 'string', description: 'Interrupt label inside an LD/IL POU (e.g. I001)' },
+      },
+    },
+    handler: (args) => {
+      try {
+        return triggerSimulatorInterrupt(String(args.session_id ?? ''), {
+          taskName: typeof args.task_name === 'string' ? args.task_name : undefined,
+          pouName: typeof args.pou_name === 'string' ? args.pou_name : undefined,
+          label: typeof args.label === 'string' ? args.label : undefined,
+        });
+      } catch (e) {
+        return { success: false, error: errMsg(e) };
+      }
+    },
+  },
+  {
+    name: 'ispsoft_sim_trace_analytics',
+    description: 'Compute oscilloscope-style Data Tracer analytics (min/max/avg/last, rising & falling edge counts, duty cycle %) and optional CSV export from a Soft-PLC simulator trace buffer.',
+    category: 'Soft-PLC Simulator & Monitor',
+    inputSchema: {
+      type: 'object',
+      required: ['session_id'],
+      properties: {
+        session_id: { type: 'string' },
+        addresses: { type: 'array', items: { type: 'string' }, description: 'Optional subset of traced addresses to analyze' },
+        format: { type: 'string', enum: ['summary', 'csv'], default: 'summary' },
+      },
+    },
+    handler: (args) => {
+      try {
+        return analyzeSimulatorTrace(String(args.session_id ?? ''), {
+          addresses: Array.isArray(args.addresses) ? args.addresses.map(String) : undefined,
+          format: args.format === 'csv' ? 'csv' : 'summary',
         });
       } catch (e) {
         return { success: false, error: errMsg(e) };

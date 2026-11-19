@@ -179,8 +179,8 @@ test('all MCP_TOOLS have consistent schemas, annotations, and bounded validation
   assert.equal(delMissing.success, false);
   assert.equal(delMissing.error_code, 'NOT_FOUND');
 
-  // Strict schema compliance across all 60 AI-agent tools (Gemini / Google Antigravity / OpenAI / VS Code)
-  assert.equal(annotated.length, 60);
+  // Strict schema compliance across all 78 AI-agent tools (Gemini / Google Antigravity / OpenAI / VS Code)
+  assert.equal(annotated.length, 78);
   const walkSchema = (node: Record<string, unknown>, loc: string) => {
     assert.ok(!Array.isArray(node.type), `${loc}: type must not be an array`);
     if (node.type === 'array') {
@@ -343,7 +343,7 @@ test('stdio.ts handles NDJSON + multi-header Content-Length framing and clean si
     const batch1 = await waitForLines(4);
     assert.equal(batch1[0].id, 1);
     const listedTools = ((batch1[1].result as Record<string, unknown>).tools as Array<Record<string, unknown>>);
-    assert.equal(listedTools.length, 60);
+    assert.equal(listedTools.length, 78);
 
     const simStartOut = JSON.parse(
       String((((batch1[3].result as Record<string, unknown>).content as Array<Record<string, unknown>>)[0]).text),

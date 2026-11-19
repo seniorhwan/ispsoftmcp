@@ -582,16 +582,19 @@ export function classifyToolError(
   if (
     existingCode === 'MODBUS_ADDRESS_ERROR' ||
     toolName === 'ispsoft_map_dvp_modbus_addresses' ||
+    toolName === 'ispsoft_modbus_planner' ||
     msg.includes('octal digits') ||
     msg.includes('outside the documented') ||
-    msg.includes('supported devices are x, y, m, s, t, c and d')
+    msg.includes('supported devices are x, y, m, s, t, c and d') ||
+    msg.includes('supported as-series devices')
   ) {
     return finalize({
       error_code: 'MODBUS_ADDRESS_ERROR',
       domain: 'MODBUS_COMM',
       severity: 'ERROR',
       retryable: false,
-      remediation: 'Verify DVP ES2 device area and valid numbering (X/Y octal 000-377, S0-1023, M0-4095, T/C0-255, D0-9999).',
+      remediation:
+        'Verify PLC device area and numbering (DVP: X/Y octal 000-377, S0-1023, M0-4095, T/C0-255, D0-9999/11999; AS/AH: X/Y0.0-63.15, M0-8191, SM0-2047, D0-29999, SR0-2047).',
       recovery_actions: [
         {
           action: 'FIX_INPUT_PARAMETERS',
@@ -934,6 +937,11 @@ const READ_ONLY_PREFIXES = [
   'ispsoft_sim_monitor',
   'ispsoft_sim_memory_dump',
   'ispsoft_sim_diagnostics',
+  'ispsoft_sim_trace_analytics',
+  'ispsoft_lookup_',
+  'ispsoft_modbus_planner',
+  'ispsoft_convert_',
+  'ispsoft_device_usage_',
   'ispsoft_online_status',
   'ispsoft_server_telemetry',
 ];
@@ -941,9 +949,11 @@ const READ_ONLY_PREFIXES = [
 const DESTRUCTIVE_NAMES = new Set([
   'ispsoft_manage_workspace_files',
   'ispsoft_manage_pou',
-  'ispsoft_manage_dut',
+  'ispsoft_manage_duts',
+  'ispsoft_migrate_project_model',
   'ispsoft_sim_control',
   'ispsoft_sim_reload',
+  'ispsoft_sim_online_edit',
   'ispsoft_download',
   'ispsoft_runtime_write',
 ]);

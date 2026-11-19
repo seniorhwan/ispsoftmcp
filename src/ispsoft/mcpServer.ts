@@ -71,6 +71,21 @@ export const MCP_PROMPTS = [
       { name: 'session_id', description: 'Active simulator session ID (e.g. sim-1)', required: true },
     ],
   },
+  {
+    name: 'design_sfc_state_machine',
+    description: 'Design, author, validate, and Soft-PLC simulate an IEC 61131-3 SFC sequential state machine.',
+    arguments: [
+      { name: 'project_path', description: 'Workspace .isp path', required: true },
+      { name: 'pou_name', description: 'Target SFC POU name', required: true },
+    ],
+  },
+  {
+    name: 'configure_hw_and_analog_pid',
+    description: 'Configure HWCONFIG extension modules (AD/DA), BFM CR registers, PID closed-loop control, and verify in Soft-PLC simulation.',
+    arguments: [
+      { name: 'project_path', description: 'Workspace .isp path', required: true },
+    ],
+  },
 ];
 
 export function buildPromptMessages(name: string, args: Record<string, unknown>) {
@@ -156,6 +171,46 @@ export function buildPromptMessages(name: string, args: Record<string, unknown>)
       ],
     };
   }
+  if (name === 'design_sfc_state_machine') {
+    return {
+      description: 'End-to-end IEC 61131-3 SFC authoring and simulation workflow',
+      messages: [
+        {
+          role: 'user',
+          content: {
+            type: 'text',
+            text: [
+              `Design and verify SFC state machine ${pou} in ${proj}:`,
+              `1. Create the SFC POU via ispsoft_create_pou (language="SFC") or update it with ispsoft_write_sfc_pou.`,
+              `2. Define steps (initial=true on start step), actions (N/S/R/P/P1/P0/L/D qualifiers), and transitions (from/to/condition/priority).`,
+              `3. Validate with ispsoft_static_check_and_compile and read ASCII view via ispsoft_read_pou.`,
+              `4. Start Soft-PLC simulation (ispsoft_sim_start) and verify step transitions & elapsed step timers (Step.X / Step.T) using ispsoft_sim_run_sequence.`,
+            ].join('\n'),
+          },
+        },
+      ],
+    };
+  }
+  if (name === 'configure_hw_and_analog_pid') {
+    return {
+      description: 'HWCONFIG analog/temperature extension module + PID loop engineering workflow',
+      messages: [
+        {
+          role: 'user',
+          content: {
+            type: 'text',
+            text: [
+              `Configure extension modules and PID control in ${proj}:`,
+              `1. Look up module CR/BFM specs via ispsoft_lookup_reference (topic="extension_modules").`,
+              `2. Configure CPU, COM/Ethernet, and extension module slots via ispsoft_configure_hwconfig.`,
+              `3. Configure retentive ranges (ispsoft_configure_retain_ranges) and initial setpoints (ispsoft_configure_device_init).`,
+              `4. Author FROM/TO + SCL/PID logic, start Soft-PLC simulation, inject analog CR values with ispsoft_sim_io_modules, and analyze response via ispsoft_sim_trace_analytics.`,
+            ].join('\n'),
+          },
+        },
+      ],
+    };
+  }
   return null;
 }
 
@@ -186,6 +241,24 @@ export function listStaticAndDynamicResources() {
       description: 'Machine-readable JSON Schema defining error_code, domain, severity, context, and prioritized recovery_actions for AI agents.',
       mimeType: 'application/schema+json',
     },
+    {
+      uri: 'ispsoft://reference/instructions',
+      name: 'Delta PLC Instruction Set Reference Catalog',
+      description: 'Searchable reference of DVP/AS/AH instructions, API numbers, operand syntax, and examples.',
+      mimeType: 'application/json',
+    },
+    {
+      uri: 'ispsoft://reference/special-devices',
+      name: 'Delta PLC Special Relays & Registers Catalog',
+      description: 'Reference for DVP M1000+/D1000+ and AS SM*/SR* special relays and registers.',
+      mimeType: 'application/json',
+    },
+    {
+      uri: 'ispsoft://reference/extension-modules',
+      name: 'Delta Extension Modules & CR/BFM Register Map',
+      description: 'Catalog of DVP & AS digital, analog (AD/DA/XA), temperature (PT/TC), and Ethernet extension modules with CR maps.',
+      mimeType: 'application/json',
+    },
   ];
   for (const filePath of listAllFiles()) {
     if (/\.isp$/i.test(filePath)) {
@@ -199,7 +272,19 @@ export function listStaticAndDynamicResources() {
       baseResources.push({
         uri: `ispsoft://projects/${encodeURIComponent(name)}/bundle`,
         name: `Project JSON Bundle: ${name}`,
-        description: `Complete structured JSON bundle (IL/ST code, variables, tasks, DUTs, comments) for ${filePath}.`,
+        description: `Complete structured JSON bundle (LD/ST/IL/SFC/FBD code, variables, tasks, DUTs, HWCONFIG, comments) for ${filePath}.`,
+        mimeType: 'application/json',
+      });
+      baseResources.push({
+        uri: `ispsoft://projects/${encodeURIComponent(name)}/hwconfig`,
+        name: `Project HWCONFIG: ${name}`,
+        description: `CPU parameters, COM/Ethernet settings, and extension module I/O slots for ${filePath}.`,
+        mimeType: 'application/json',
+      });
+      baseResources.push({
+        uri: `ispsoft://projects/${encodeURIComponent(name)}/device-usage`,
+        name: `Project Device Usage Map: ${name}`,
+        description: `Allocated and next-free X/Y/M/S/T/C/D device map for ${filePath}.`,
         mimeType: 'application/json',
       });
     }
@@ -239,17 +324,36 @@ export function readMcpResource(uri: string): { contents: Array<{ uri: string; m
       ],
     };
   }
-  const projMatch = /^ispsoft:\/\/projects\/([^/]+)\/(overview|bundle|source)$/.exec(uri);
+  if (uri === 'ispsoft://reference/instructions') {
+    const data = executeMcpTool('ispsoft_lookup_reference', { topic: 'instructions', limit: 200 });
+    return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(data, null, 2) }] };
+  }
+  if (uri === 'ispsoft://reference/special-devices') {
+    const data = executeMcpTool('ispsoft_lookup_reference', { topic: 'special_devices', limit: 200 });
+    return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(data, null, 2) }] };
+  }
+  if (uri === 'ispsoft://reference/extension-modules') {
+    const data = executeMcpTool('ispsoft_lookup_reference', { topic: 'extension_modules', limit: 200 });
+    return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(data, null, 2) }] };
+  }
+  const projMatch = /^ispsoft:\/\/projects\/([^/]+)\/(overview|bundle|source|hwconfig|device-usage)$/.exec(uri);
   if (projMatch) {
     const fileName = decodeURIComponent(projMatch[1]);
     const kind = projMatch[2];
-    const toolName =
-      kind === 'bundle'
-        ? 'ispsoft_export_project_bundle'
-        : kind === 'source'
-          ? 'ispsoft_read_project_source'
-          : 'ispsoft_get_project_overview';
-    const data = executeMcpTool(toolName, { project_path: `/workspace/${fileName}` });
+    let data: Record<string, unknown>;
+    if (kind === 'hwconfig') {
+      data = executeMcpTool('ispsoft_configure_hwconfig', { project_path: `/workspace/${fileName}` });
+    } else if (kind === 'device-usage') {
+      data = executeMcpTool('ispsoft_device_usage_and_allocate', { project_path: `/workspace/${fileName}`, action: 'usage_map' });
+    } else {
+      const toolName =
+        kind === 'bundle'
+          ? 'ispsoft_export_project_bundle'
+          : kind === 'source'
+            ? 'ispsoft_read_project_source'
+            : 'ispsoft_get_project_overview';
+      data = executeMcpTool(toolName, { project_path: `/workspace/${fileName}` });
+    }
     if (data.success === false) return null;
     return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(data, null, 2) }] };
   }
@@ -468,6 +572,18 @@ export function handleSingleRpc(
               mimeType: 'application/json',
             },
             {
+              uriTemplate: 'ispsoft://projects/{name}/hwconfig',
+              name: 'Project HWCONFIG',
+              description: 'Read CPU parameters, COM/Ethernet settings, and extension module slots for a workspace .isp file',
+              mimeType: 'application/json',
+            },
+            {
+              uriTemplate: 'ispsoft://projects/{name}/device-usage',
+              name: 'Project Device Usage Map',
+              description: 'Read allocated and next-free X/Y/M/S/T/C/D device usage map for a workspace .isp file',
+              mimeType: 'application/json',
+            },
+            {
               uriTemplate: 'ispsoft://simulator/{session_id}/status',
               name: 'Simulator Status',
               description: 'Read compact live monitor snapshot for an active Soft-PLC simulator session',
@@ -634,7 +750,7 @@ export function handleSingleRpc(
               severity: 'ERROR',
               message: `Unknown MCP tool: ${toolName}`,
               retryable: false,
-              remediation: 'Call tools/list to inspect the 60 active headless ISPSoft MCP tools.',
+              remediation: `Call tools/list to inspect the ${getAnnotatedTools().length} active headless ISPSoft MCP tools.`,
               recovery_actions: [
                 {
                   action: 'FALLBACK_TO_TOOL',

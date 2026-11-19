@@ -1,191 +1,63 @@
-# ISPSoft MCP
+# Delta ISPSoft MCP Agent Server
 
-A Python MCP stdio server for Delta ISPSoft. It borrows the validation, backup,
-and explicit-result patterns from the local SIMATIC STEP 7 and GX Works2 MCP
-projects. The installed ISPSoft model catalog is discovered separately from
-operations qualified by this server; an installed or listed model is not proof
-that an MCP operation works on it.
+Pure headless AI-agent MCP server (**Streamable HTTP** on `/mcp` + **Stdio** via `stdio.ts`, zero UI) implementing the full Delta ISPSoft engineering workflow for **DVP** (`ES2`, `ES2-E`, `ES3`, `EX2`, `EX3`, `EH2`, `EH3`, `SS2`, `SA2`, `SX2`, `SE`, `SV`, `SV2`, `EC3`), **AS** (`AS218PX/RX/TX`, `AS228P/R/T`, `AS300`, `AS320`, `AS332`), and **AH** (`AH500`) PLCs.
 
-## Current support
+## Transports & Endpoints
 
-- Read-only inspection and source extraction for unprotected ISPSoft project
-  containers recognized by the codec (ISPSoft 3.24 v8 pointer/footer files for
-  qualified DVP series, legacy `0xAA`/`0xAC` streams, and the qualified
-  AS228T/P/R v3010 layout).
-- ST source patching to a **new candidate file** for AS228T/P/R and DVP ES2.
-  The POU must be identified as ST in its source metadata. The original project
-  is retained and a byte-identical backup is
-  written beside the candidate. A project `.ini` companion is copied to both
-  new filenames when present. The result is `GENERATED_UNCOMPILED`; this
-  candidate-generation tool does not compile or claim IDE readback. Use the
-  separate native compile/check tool for qualified ES2 projects.
-- Local-variable/symbol section replacement to a **new ES2 candidate file**.
-  The caller supplies the complete inner `LOCAL_VAR` text returned by
-  `ispsoft_read_pou`; the original project and its companion file are preserved,
-  and the candidate section is verified by decoding it again. This is a raw
-  native-section edit, so the candidate remains uncompiled until native Check.
-- Project overview, POU-section reads, device-comment reads, and comment
-  candidate generation for DVP ES2. LD network blocks are returned as raw
-  native project text and can be read one at a time or summarized as ordered
-  node records. A structurally validated raw-network candidate editor writes
-  a new project and byte-identical backup. Node type semantics and rung
-  topology are not inferred, and candidates remain uncompiled.
-- DVP IL-to-MPU POU generation and MPU-to-IL inspection for the qualified ES2,
-  DVP12SE11R, and DVP12SE11T profiles. Supported mnemonics and network shapes
-  are deliberately limited by the serializer; unsupported or lossy logic is
-  rejected.
-- End-to-end LD authoring for existing ISPSoft 3.24 ES2 Ladder Diagram POUs from
-  the supported IL subset. `ispsoft_write_ld_program` replaces all networks in
-  a new project candidate while retaining POU metadata and symbols, makes a
-  byte-identical backup, runs native Compile on an isolated copy, and compares
-  semantic IL plus exact network readback before it reports success. Agents can
-  iterate by using the returned candidate as the next input; every iteration
-  creates another candidate and backup. Unsupported instructions, project
-  types, POUs, or layouts fail closed. This is not PLC download qualification.
-- Textual cross-reference analysis and DVP-style comment-map validation.
-- Offline DVP ES2 device-to-Modbus PDU address translation. It reports standard
-  function codes and zero-based PDU addresses for documented X/Y/M/S/T/C/D
-  regions. It is address planning only; it neither opens a port nor qualifies
-  a live connection. The mapping follows Delta's [DVP-PLC Application Manual,
-  section 2.12](https://filecenter.deltaww.com/Products/download/06/060301/Manual/DELTA_IA-PLC_DVP-PLC_PM_EN_20220407.pdf). In particular, the later manual lists D4096 at communication address `0x9000`; an older application note has an inconsistent decimal reference for this range.
-- Native ISPSoft 3.24 Check/Compile for ES2 projects uses a private desktop,
-  disposable project copy, and Windows OCR of the Compile Message pane. Other
-  project models remain unqualified. PLC connection, upload, download, monitor
-  mode, and live device I/O remain disabled until a vendor adapter is implemented
-  and qualified.
-- ISPSoft process/window diagnostics and verified application startup are
-  available through `ispsoft_get_ide_session` and `ispsoft_start_ide`. These
-  report visible windows and startup failures; they do not inspect the active
-  project. Compile/check runs through the isolated worker tool described below.
-- Silent background sessions start a separate ISPSoft process on a uniquely
-  named Windows desktop, with a private settings profile and a disposable
-  project copy. This keeps the user's visible ISPSoft session open and prevents
-  the worker from taking its keyboard focus. The server verifies the copied
-  project's title on that desktop and confirms the worker created no windows
-  on the user's desktop. Use these session tools for agent work; the GUI
-  start/open tools are interactive-only. If Windows denies private desktop
-  creation, ISPSoft cannot initialize its settings, or the project title is
-  not confirmed, the server reports failure and stops the worker. The MCP
-  process must have normal access to ISPSoft's AppData files. A local
-  ISPSoft 3.24 project-copy launch has been qualified with the user's desktop
-  left unchanged.
-- Installed PLC family/model catalog and installed simulator executables are
-  discovered from ISPSoft 3.24's own device configuration. This catalog is
-  informational; MCP capability status remains per operation.
-- Windows serial-port enumeration is read-only and reports COM names and
-  adapter descriptions. It does not identify a connected PLC or verify serial
-  settings; transport remains disabled until the exact target and protocol are
-  qualified.
-- Project discovery under an explicit folder and readback-verified offline
-  project cloning from a user-selected template are supported. Native blank
-  project creation and active-project readback are not automated.
+- **Streamable HTTP MCP**: `POST /mcp`, `GET /mcp` (SSE), `DELETE /mcp` (protocol versions `2025-03-26` & `2024-11-05`)
+- **Stdio MCP**: `npx tsx stdio.ts` (NDJSON & `Content-Length` framing)
+- **Discovery & Health**: `GET /.well-known/mcp.json`, `GET /api/health`, `GET /metrics` (Prometheus)
+- **Auth**: Optional bearer token via `ISPSOFT_MCP_AUTH_TOKEN`
 
-The included operation profiles are narrow interoperability profiles, not a
-claim of support for every controller accepted by ISPSoft. Unknown models and
-unsupported container variants fail closed. The DVP32ES2 transistor model maps
-to the ES2 project-source profile, but PLC communication is not qualified. The
-local ISPSoft 3.24 sample is a DVP ES2
-v8 pointer/footer project; its read/patch container path is covered by a
-portable synthetic regression and a conditional read-only smoke test. The
-sample itself is never modified by the test suite.
+## Full ISPSoft Feature Coverage (78 Active Tools)
 
-## Install
+### 1. All 5 IEC 61131-3 Programming Languages
+- **LD (Ladder Diagram, `P_Lang=1`)**: Rung authoring (`ispsoft_write_ld_program`, `ispsoft_edit_ld_rungs`), raw network inspection/patching, ASCII rendering (`ispsoft_render_ld_ascii`), IL round-trip validation (`ispsoft_validate_il`).
+- **ST (Structured Text, `P_Lang=2`)**: Patching (`ispsoft_write_st_candidate`), `IF`/`CASE`/`FOR`/`WHILE`/`REPEAT`, arrays, structs/DUTs, `REAL` floating-point, standard IEC FBs (`TON`, `TOF`, `TP`, `CTU`, `CTD`, `CTUD`, `R_TRIG`, `F_TRIG`, `SR`, `RS`, `PID_FB`, `SCALE`), and multi-instance user FBs/FCs.
+- **IL (Instruction List, `P_Lang=3`)**: Native IL POU authoring (`ispsoft_write_il_pou`) and full DVP/IEC instruction set execution.
+- **SFC (Sequential Function Chart, `P_Lang=4`)**: Steps, `Step.X`/`Step.T` timers, action qualifiers (`N`, `S`, `R`, `P`, `P1`, `P0`, `L`, `D`), simultaneous divergence/convergence, priority transitions, ASCII rendering (`ispsoft_write_sfc_pou`).
+- **FBD / CFC (Function Block Diagram, `P_Lang=5`)**: Topological DAG + feedback execution of logic, math, comparison, selector, standard IEC FB, and user FB blocks (`ispsoft_write_fbd_pou`).
 
-Windows with Python 3.11 or newer:
+### 2. Hardware, Memory & Communication Configuration
+- **HWCONFIG (`ispsoft_configure_hwconfig`)**: CPU parameters (watchdog, constant scan, input filter, STOP behavior), COM1/COM2/COM3 serial settings, Ethernet & Modbus TCP/EtherNet/IP, and right-side extension modules (`DVP08XM`, `DVP16SP`, `DVP04AD-E2`, `DVP04DA-E2`, `DVP06XA-E2`, `DVP04PT-E2`, `DVP04TC-E2`, `AS04AD`, `AS04DA`, `AS04RTD`, etc.) with automatic I/O slot & CR/BFM defaults.
+- **Retentive / Latched Memory (`ispsoft_configure_retain_ranges`)**: Custom `M`/`S`/`T`/`C`/`D` retained ranges enforced on Soft-PLC `WARM_RESET`.
+- **Device Initial Value Table (`ispsoft_configure_device_init`)**: Startup/cold-reset initial values for `BOOL`/`INT`/`WORD`/`DINT`/`DWORD`/`REAL`/`STRING`.
+- **PLC Link / Data Exchange (`ispsoft_configure_data_exchange`)**: COM2/COM3/Ethernet Modbus master-slave polling tables.
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+### 3. Project Lifecycle, Exchange & Engineering Utilities
+- **Project Creation, Transactions & OCC**: `ispsoft_create_blank_project`, `ispsoft_export_project_bundle`, `ispsoft_import_project_bundle`, `ispsoft_apply_project_transaction` (20 atomic op types + `dry_run` + `expected_content_hash` + backup/rollback).
+- **Packages & Standards Export (`ispsoft_import_export_pou_package`)**: `.mpu` <-> `.isp` import/export, **PLCopen XML (TC6 2.01)** export, and **IEC 61131-3 ST** export.
+- **CSV Symbol & Comment Exchange (`ispsoft_csv_symbols_comments`)**: Global/Local symbol table and device comment table CSV import/export.
+- **Device Usage Map & Free-Address Allocator (`ispsoft_device_usage_and_allocate`)**: Full project device usage scan + contiguous/individual free-address allocation.
+- **Language Converter (`ispsoft_convert_program`)**: Deterministic `il_to_st`, `ld_pou_to_st`, and `st_to_il` conversion.
+- **Model Migration (`ispsoft_migrate_project_model`)**: Cross-model and cross-family migration (`DVP <-> AS <-> AH`) with automatic `SYSTEM_VAR` resizing and special-device migration warnings.
+- **Delta Reference Catalog (`ispsoft_lookup_reference`)**: Built-in searchable catalog of 85+ Delta instructions/API numbers, DVP/AS special relays & registers (`M1000+`/`D1000+`/`SM*`/`SR*`), and extension module CR/BFM maps.
+- **Multi-Series Modbus Planner (`ispsoft_map_dvp_modbus_addresses`, `ispsoft_modbus_planner`)**: Forward mapping, reverse mapping (PDU + FC -> device), and RTU (CRC16) + TCP (MBAP) hex frame generation for DVP, AS, and AH PLCs.
+- **Static Check, Audit & Refactor**: `ispsoft_static_check_and_compile`, `ispsoft_audit_project`, `ispsoft_diff_projects`, `ispsoft_search_project`, `ispsoft_refactor_symbol`.
+
+### 4. Headless Soft-PLC Simulator & Diagnostics
+- **Execution Engine**: `ispsoft_sim_start`, `ispsoft_sim_control` (`RUN`/`STOP`/`STEP`/`WARM_RESET`/`COLD_RESET`/`CLOSE`), `ispsoft_sim_step_until`, `ispsoft_sim_run_sequence`, `ispsoft_sim_force_and_write`, `ispsoft_sim_monitor`, `ispsoft_sim_memory_dump`, `ispsoft_sim_breakpoints`, `ispsoft_sim_watch_table`, `ispsoft_sim_reload`, `ispsoft_sim_compare_and_upload`, `ispsoft_sim_diagnostics`.
+- **Advanced ISPSoft Runtime Features**:
+  - **Online Edit (`ispsoft_sim_online_edit`)**: Hot-patch ST, IL/LD, SFC, or FBD POUs in a running simulator without stopping the CPU or losing device memory.
+  - **Special I/O Module BFM Simulation (`ispsoft_sim_io_modules`)**: Read/write extension module CR registers interacting live with `FROM`/`TO`/`DFROM`/`DTO` instructions.
+  - **Interrupt Trigger (`ispsoft_sim_trigger_interrupt`)**: Trigger interrupt tasks, POUs, or labels (`I001`, etc.) honoring `EI`/`DI`.
+  - **Data Tracer Analytics (`ispsoft_sim_trace_analytics`)**: Min/max/avg, rising/falling edge counts, duty cycle %, and CSV trace export.
+
+### 5. MCP Resources & Prompts
+- **Resources**: `ispsoft://models`, `ispsoft://workspace/files`, `ispsoft://telemetry`, `ispsoft://schemas/error`, `ispsoft://reference/instructions`, `ispsoft://reference/special-devices`, `ispsoft://reference/extension-modules`, `ispsoft://projects/{name}/overview|bundle|source|hwconfig|device-usage`, `ispsoft://simulator/{session_id}/status`.
+- **Prompts**: `audit_and_optimize_plc`, `author_ld_interlock_safe`, `commission_and_test_sequence`, `diagnose_sluggish_scan`, `design_sfc_state_machine`, `configure_hw_and_analog_pid`.
+
+## Development & Verification
+
+```bash
+npm install
+npm run build
+npm run lint
+npx tsx --test src/ispsoft/industrialMcp.test.ts src/ispsoft/simulatorDiagnostics.test.ts src/ispsoft/ispsoftFullFeatures.test.ts
 ```
 
-Run the MCP server with:
+Start the HTTP MCP server on port 3000:
 
-```powershell
-python ispsoft_mcp_server.py
+```bash
+npm run dev
 ```
-
-Configure an MCP client to launch that Python executable with the absolute path
-to `ispsoft_mcp_server.py`. Set `ISPSOFT_EXE` only if `NewISPSoft.exe` is not in
-the detected Delta installation path.
-
-## Tools
-
-| Tool | Purpose |
-|---|---|
-| `ispsoft_get_status` | Detect installed/running ISPSoft, COMMGR, and the DVP ES2 simulator. Presence is not a connection check. |
-| `ispsoft_list_commgr_drivers` | Read the active user-profile COMMGR driver/endpoint catalog (falling back to the install default) without starting COMMGR or contacting a device. It flags multiple driver names that share a serial port or network target. Returned targets describe configuration only; they are not proof of identity or reachability. |
-| `ispsoft_list_serial_ports` | List Windows Ports-class adapters and compare configured COMMGR serial ports without opening a port. Adapter presence does not identify a PLC. |
-| `ispsoft_get_ide_session` | Report ISPSoft process IDs and visible top-level window metadata. Does not identify the open project. |
-| `ispsoft_start_ide` | Interactive-only: open an explicit project or ISPSoft's configured previous project. Does not start blank. Background agents should not call this tool. |
-| `ispsoft_start_background_session` | Open the requested project, or ISPSoft's configured previous project when `project_path` is omitted, on a private Windows desktop using a disposable copy and private settings profile. It refuses to start blank and waits up to 60 seconds by default for ISPSoft's cold start. |
-| `ispsoft_get_background_sessions` | Report private-desktop workers created by this MCP process, including worker windows and project-copy paths. |
-| `ispsoft_stop_background_session` | Stop only a private-desktop worker created by this MCP process; retains its disposable project folder for inspection. |
-| `ispsoft_get_capabilities` | Separate detected ISPSoft models from MCP-qualified operation profiles. |
-| `ispsoft_map_dvp_modbus_addresses` | Translate documented ES2 device addresses to Modbus function codes and zero-based PDU addresses; offline only, with no serial I/O. |
-| `ispsoft_list_supported_plc_types` | Show the installed model catalog and exact MCP operation profiles. |
-| `ispsoft_list_projects` | Find and inspect ISPSoft project files in a requested folder. |
-| `ispsoft_create_project_from_template` | Create a new offline project copy with verified readback; does not compile. |
-| `ispsoft_inspect_project` | Inspect a recognized `.isp` or `.bak` file. |
-| `ispsoft_get_project_overview` | Summarize model, POUs, tasks, and device-comment count. |
-| `ispsoft_read_project_source` | Return project source and POU metadata. |
-| `ispsoft_read_pou` | Read a single POU's raw source sections plus a limited structured local-symbol view; unrecognized declarations remain in raw form and are marked. |
-| `ispsoft_read_ld_network` | Read one raw LD network by one-based POU order without modifying the project. |
-| `ispsoft_get_ld_program_structure` | Return all LD networks as ordered node fields and raw type-code counts, without guessing type semantics. |
-| `ispsoft_read_device_comments` | Read device comments from a project. |
-| `ispsoft_get_cross_references` | Build a best-effort reference list for one POU. |
-| `ispsoft_get_memory_usage_map` | Read declared ranges from `SYSTEM_VAR`. |
-| `ispsoft_open_project` | Interactive-only: open a project in the user's IDE; background agents should use an isolated background session. |
-| `ispsoft_write_st_candidate` | Patch an existing ST POU into a new `.isp` candidate with a backup. |
-| `ispsoft_write_local_variables_candidate` | Replace one ES2 POU's native `LOCAL_VAR` symbol section in a new backed-up candidate, with exact decoded readback verification. |
-| `ispsoft_write_ld_network_candidate` | Replace one raw ES2 LD network into a backed-up `.isp` candidate; structural checks only, never compile or download. |
-| `ispsoft_write_ld_program` | Convert supported IL into native LD networks, replace an existing ES2 LD POU in a new backed-up candidate, native-compile a disposable copy, and require semantic readback before reporting success. Pass the returned candidate into the next call for an agent edit/compile/readback loop. |
-| `ispsoft_write_device_comment_candidate` | Merge comments into a new ES2 project candidate. |
-| `ispsoft_validate_il` | Validate supported DVP IL and prove MPU serialization/readback. |
-| `ispsoft_generate_mpu` | Generate a `.mpu` POU artifact; it does not import it into a project. |
-| `ispsoft_read_mpu` | Inspect a supported MPU package as IL. |
-| `ispsoft_analyze_source` | Build a best-effort text cross-reference. |
-| `ispsoft_validate_device_comments` | Validate DVP-style addresses and optionally emit a JSON map. |
-| `ispsoft_compile_and_check` | Run ISPSoft 3.24 Compile or Check on an ES2 project copy in a private desktop; OCR the Compile Message pane and save compiler sidecars plus screenshot evidence. Set `action` to `"check"` to run Check, `timeout_seconds` to wait up to five minutes, or `idle_wait_seconds` to silently wait for the user's ISPSoft window to leave the foreground (default 15 seconds, maximum five minutes). |
-| `ispsoft_online_status`, `ispsoft_connect`, `ispsoft_upload_from_plc`, `ispsoft_start_monitor`, `ispsoft_runtime_read` | Explicitly report that no PLC transport is qualified; no device is contacted. Serial targets must match an exact saved COMMGR driver, have no shared endpoint, and be present in Windows' port inventory before any future adapter can proceed. `ispsoft_list_commgr_drivers` and `ispsoft_list_serial_ports` are configuration/device-enumeration only. |
-| `ispsoft_runtime_write` / `ispsoft_download` | Require a call-level confirmation and `ISPSOFT_WRITES_ENABLED=1`; even then they remain disabled until transport qualification is implemented. |
-| `ispsoft_stop_monitor` | Report that this server has no active monitor session. |
-
-## Safe write sequence
-
-1. Inspect the exact project and model.
-2. Validate the full candidate.
-3. Generate a new candidate and preserve the original.
-4. Run `ispsoft_compile_and_check` on the candidate. Native menu automation is
-   qualified only for ISPSoft 3.24 ES2 projects; it opens a disposable copy on a
-   private desktop, leaves the user's foreground session alone, and reports a
-   pass only when Windows OCR reads the Compile Message pane's error and warning
-   counts. Inspect the retained screenshot and compiler sidecars when OCR fails.
-   For supported ES2 LD authoring, `ispsoft_write_ld_program` performs candidate
-   creation, Compile, and semantic readback as one operation; use its returned
-   candidate as the next iteration's input to continue the agent review loop.
-5. Transfer to hardware only through ISPSoft after engineering approval. MCP
-   downloads and runtime writes are not yet available. Never treat the
-   installed model catalog or COMMGR process presence as proof of connectivity.
-
-## Tests
-
-Run offline regression tests with:
-
-```powershell
-python -m unittest discover -s tests -v
-```
-
-Tests use synthetic files and never open ISPSoft or contact a PLC. The installed
-ISPSoft sample smoke test is read-only. Real project and hardware qualification
-remains model- and version-specific. Native compile/check writes fixed-name
-compiler sidecars beneath the Windows roaming profile despite the worker's
-private `APPDATA`. The MCP snapshots those files and restores their previous
-  contents only when the visible user's ISPSoft process did not become foreground
-and each current file still matches this worker's captured output. A concurrent
-change is preserved and makes the result unverified. MCP instances serialize their
-builds within the current Windows logon session. A build waits briefly for the
-visible ISPSoft window to leave the foreground; if it remains active, the tool
-returns without starting a worker. It is marked unverified if the user
-interacts with ISPSoft during the build. In particular, DVP32ES2 COM1 transfer
-and monitor behavior still require a controlled physical PLC qualification.

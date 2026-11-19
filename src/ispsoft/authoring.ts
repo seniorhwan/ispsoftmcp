@@ -4,6 +4,7 @@ import {
   buildAsV3010Container,
   buildEs2V8Container,
   decodeContainer,
+  escapeRegex,
   inspectContainer,
   ldNetworkMatches,
   ldNetworks,
@@ -14,27 +15,91 @@ import {
   replaceLdPouNetworks,
   sections,
 } from './containers.js';
-import { ilToMpu } from './dvp.js';
+import { ilToMpu, mpuToIl, parseIl } from './dvp.js';
 import { API_NUM, CONTACT_AND, CONTACT_LD, CONTACT_OR, COIL, nv } from './il2mpu.js';
 import { parseNetworks, netToIl } from './mpu2il.js';
 import { FileTransformError, decodeCodepage, encodeCodepage } from './limits.js';
 import { unpackPackage } from './packages.js';
 import { ENTRY_NAME } from './mpuCodec.js';
+import {
+  readDataExchangeFromSource,
+  readDeviceInitFromSource,
+  readHwConfigFromSource,
+  readRetainConfigFromSource,
+  validateHwConfig,
+  writeDataExchangeToSource,
+  writeDeviceInitToSource,
+  writeHwConfigToSource,
+  writeRetainConfigToSource,
+  type DataExchangeRow,
+  type DeviceInitEntry,
+  type HwConfigDocument,
+  type RetainConfigDocument,
+} from './hwConfig.js';
+import {
+  parseFbdFromPouBody,
+  parseSfcFromPouBody,
+  renderFbdAscii,
+  renderSfcAscii,
+  serializeFbdBody,
+  serializeSfcBody,
+  validateFbdDiagram,
+  validateSfcChart,
+  type FbdDiagram,
+  type SfcChart,
+} from './sfcFbd.js';
+
+export type PouLanguage = 'LD' | 'ST' | 'IL' | 'SFC' | 'FBD';
 
 export const MODEL_PROFILES: Record<string, Record<string, unknown>> = {
-  AS228T: { family: 'AS', project_model: 'AS228T', source_container: 'qualified v3010', languages: ['ST', 'LD'] },
-  AS228P: { family: 'AS', project_model: 'AS228P', source_container: 'qualified v3010', languages: ['ST', 'LD'] },
-  AS228R: { family: 'AS', project_model: 'AS228R', source_container: 'qualified v3010', languages: ['ST', 'LD'] },
-  ES2: { family: 'DVP', project_model: 'ES2', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL'] },
-  'ES2-E': { family: 'DVP', project_model: 'ES2-E', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL'] },
-  EH3: { family: 'DVP', project_model: 'EH3', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL'] },
-  SA2: { family: 'DVP', project_model: 'SA2', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL'] },
-  SX2: { family: 'DVP', project_model: 'SX2', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL'] },
-  SS2: { family: 'DVP', project_model: 'SS2', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL'] },
-  EX2: { family: 'DVP', project_model: 'EX2', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL'] },
-  DVP12SE11R: { family: 'DVP', project_model: 'ES2', pou_exchange: 'MPU', languages: ['LD', 'IL'] },
-  DVP12SE11T: { family: 'DVP', project_model: 'ES2', pou_exchange: 'MPU', languages: ['LD', 'IL'] },
+  // AS Series
+  AS218PX: { family: 'AS', project_model: 'AS218PX', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 29999, max_m: 8191 },
+  AS218RX: { family: 'AS', project_model: 'AS218RX', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 29999, max_m: 8191 },
+  AS218TX: { family: 'AS', project_model: 'AS218TX', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 29999, max_m: 8191 },
+  AS228T: { family: 'AS', project_model: 'AS228T', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 29999, max_m: 8191 },
+  AS228P: { family: 'AS', project_model: 'AS228P', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 29999, max_m: 8191 },
+  AS228R: { family: 'AS', project_model: 'AS228R', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 29999, max_m: 8191 },
+  AS300: { family: 'AS', project_model: 'AS300', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 29999, max_m: 8191 },
+  AS320T: { family: 'AS', project_model: 'AS320T', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 29999, max_m: 8191 },
+  AS320P: { family: 'AS', project_model: 'AS320P', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 29999, max_m: 8191 },
+  AS332T: { family: 'AS', project_model: 'AS332T', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 29999, max_m: 8191 },
+  AS332P: { family: 'AS', project_model: 'AS332P', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 29999, max_m: 8191 },
+  // AH Series
+  AHCPU500: { family: 'AH', project_model: 'AHCPU500', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 65535, max_m: 16383 },
+  AHCPU510: { family: 'AH', project_model: 'AHCPU510', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 65535, max_m: 16383 },
+  AHCPU520: { family: 'AH', project_model: 'AHCPU520', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 65535, max_m: 16383 },
+  AHCPU530: { family: 'AH', project_model: 'AHCPU530', source_container: 'qualified v3010', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 65535, max_m: 16383 },
+  // DVP Series
+  ES2: { family: 'DVP', project_model: 'ES2', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 9999, max_m: 4095 },
+  'ES2-E': { family: 'DVP', project_model: 'ES2-E', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 9999, max_m: 4095 },
+  ES3: { family: 'DVP', project_model: 'ES3', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 11999, max_m: 4095 },
+  EX2: { family: 'DVP', project_model: 'EX2', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 9999, max_m: 4095 },
+  EX3: { family: 'DVP', project_model: 'EX3', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 11999, max_m: 4095 },
+  EH3: { family: 'DVP', project_model: 'EH3', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 11999, max_m: 4095 },
+  SA2: { family: 'DVP', project_model: 'SA2', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 9999, max_m: 4095 },
+  SX2: { family: 'DVP', project_model: 'SX2', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 9999, max_m: 4095 },
+  SS2: { family: 'DVP', project_model: 'SS2', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 4999, max_m: 4095 },
+  SE: { family: 'DVP', project_model: 'SE', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 11999, max_m: 4095 },
+  SV2: { family: 'DVP', project_model: 'SV2', source_container: 'ISPSoft 3.24 v8 pointer/footer', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 11999, max_m: 4095 },
+  DVP12SE11R: { family: 'DVP', project_model: 'ES2', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 9999, max_m: 4095 },
+  DVP12SE11T: { family: 'DVP', project_model: 'ES2', pou_exchange: 'MPU', languages: ['LD', 'ST', 'IL', 'SFC', 'FBD'], max_d: 9999, max_m: 4095 },
 };
+
+export function langCodeToName(code: string | null | undefined): PouLanguage {
+  if (code === '2') return 'ST';
+  if (code === '3') return 'IL';
+  if (code === '4') return 'SFC';
+  if (code === '5') return 'FBD';
+  return 'LD';
+}
+
+export function langNameToCode(lang: PouLanguage): string {
+  if (lang === 'ST') return '2';
+  if (lang === 'IL') return '3';
+  if (lang === 'SFC') return '4';
+  if (lang === 'FBD') return '5';
+  return '1';
+}
 
 export function resolveModel(model: string): { canonical: string | null; error: string | null } {
   if (typeof model !== 'string' || !model.trim()) {
@@ -47,6 +112,15 @@ export function resolveModel(model: string): { canonical: string | null; error: 
   }
   aliases.DVP32ES2 = 'ES2';
   aliases.DVP32ES2T = 'ES2';
+  aliases.DVP16ES2 = 'ES2';
+  aliases.DVP24ES2 = 'ES2';
+  aliases.DVP32ES3 = 'ES3';
+  aliases.DVP32EH3 = 'EH3';
+  aliases.DVP28SV2 = 'SV2';
+  aliases.DVP12SA2 = 'SA2';
+  aliases.DVP20SX2 = 'SX2';
+  aliases.DVP14SS2 = 'SS2';
+  aliases.DVP12SE = 'SE';
   const canonical = aliases[key] ?? null;
   if (!canonical) {
     return {
@@ -60,7 +134,7 @@ export function resolveModel(model: string): { canonical: string | null; error: 
 export function createBlankProjectBytes(options: {
   model: string;
   initialPouName?: string;
-  language?: 'LD' | 'ST';
+  language?: PouLanguage;
   codepage?: string;
 }): { ispBytes: Buffer; iniBytes: Buffer; canonicalModel: string } {
   const { canonical, error } = resolveModel(options.model);
@@ -73,67 +147,124 @@ export function createBlankProjectBytes(options: {
   if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(pouName)) {
     throw new FileTransformError('initial_pou_name must be an ASCII IEC identifier (1-64 chars)');
   }
-  const lang = options.language === 'ST' ? 'ST' : 'LD';
+  const lang: PouLanguage = options.language ?? 'LD';
   const cp = options.codepage?.trim() || '1252';
-  const isAs = profile.family === 'AS';
-  const nl = isAs ? '\r\n' : '\r\r\n';
-  const ispVer = isAs ? '3.19' : '3.24';
+  const isAsOrAh = profile.family === 'AS' || profile.family === 'AH';
+  const nl = isAsOrAh ? '\r\n' : '\r\r\n';
+  const ispVer = isAsOrAh ? '3.19' : '3.24';
+  const maxD = Number(profile.max_d ?? 9999);
+  const maxM = Number(profile.max_m ?? 4095);
 
-  const pouBlock =
-    lang === 'ST'
-      ? [
-          '<POU>',
-          `P_Name=${pouName}`,
-          'P_Lang=2',
-          'P_type=0',
-          'P_Active=TRUE',
-          '<LOCAL_VAR>',
-          '<VAR>',
-          '</VAR>',
-          '</LOCAL_VAR>',
-          '<IL_ST_CODE>',
-          '(* Initial ST program *)',
-          'M0 := X0;',
-          '</IL_ST_CODE>',
-          '</POU>',
-        ]
-      : [
-          '<POU>',
-          `P_Name=${pouName}`,
-          'P_Lang=1',
-          'P_type=0',
-          'P_Active=TRUE',
-          '<LOCAL_VAR>',
-          '<VAR>',
-          '</VAR>',
-          '</LOCAL_VAR>',
-          '<NETWORK_START>',
-          '<PROPERTIES_START>',
-          'NET_ID=1',
-          'NET_LABEL=',
-          'NET_ACTIVE=TRUE',
-          'NET_BOOKMARK=FALSE',
-          'NET_MODIFY=TRUE',
-          'NET_FOLD=FALSE',
-          '(',
-          '',
-          '*)',
-          '<PROPERTIES_END>',
-          '<ROOTLINK_START>',
-          '[LD_NODE]',
-          'TYPE=1',
-          'DEV_NAME=X0',
-          '[END_LD_NODE]',
-          '<ROOTLINK_END>',
-          '<OUTLINK_START>',
-          '[LD_NODE]',
-          'TYPE=13',
-          'DEV_NAME=Y0',
-          '[END_LD_NODE]',
-          '<OUTLINK_END>',
-          '<NETWORK_END>',
-          '</POU>',
-        ];
+  let pouBlock: string[];
+  if (lang === 'ST') {
+    pouBlock = [
+      '<POU>',
+      `P_Name=${pouName}`,
+      'P_Lang=2',
+      'P_type=0',
+      'P_Active=TRUE',
+      '<LOCAL_VAR>',
+      '<VAR>',
+      '</VAR>',
+      '</LOCAL_VAR>',
+      '<IL_ST_CODE>',
+      '(* Initial ST program *)',
+      'M0 := X0;',
+      '</IL_ST_CODE>',
+      '</POU>',
+    ];
+  } else if (lang === 'IL') {
+    pouBlock = [
+      '<POU>',
+      `P_Name=${pouName}`,
+      'P_Lang=3',
+      'P_type=0',
+      'P_Active=TRUE',
+      '<LOCAL_VAR>',
+      '<VAR>',
+      '</VAR>',
+      '</LOCAL_VAR>',
+      '<IL_ST_CODE>',
+      'LD X0',
+      'OUT Y0',
+      'END',
+      '</IL_ST_CODE>',
+      '</POU>',
+    ];
+  } else if (lang === 'SFC') {
+    const defaultChart: SfcChart = {
+      steps: [{ name: 'Step0', initial: true, actions: [{ qualifier: 'N', code: 'Y0 := X0;' }] }],
+      transitions: [],
+    };
+    pouBlock = [
+      '<POU>',
+      `P_Name=${pouName}`,
+      'P_Lang=4',
+      'P_type=0',
+      'P_Active=TRUE',
+      '<LOCAL_VAR>',
+      '<VAR>',
+      '</VAR>',
+      '</LOCAL_VAR>',
+      serializeSfcBody(defaultChart, nl),
+      '</POU>',
+    ];
+  } else if (lang === 'FBD') {
+    const defaultFbd: FbdDiagram = {
+      blocks: [{ id: 'B1', op: 'MOVE', inputs: { IN: 'X0' }, outputs: { OUT: 'Y0' } }],
+    };
+    pouBlock = [
+      '<POU>',
+      `P_Name=${pouName}`,
+      'P_Lang=5',
+      'P_type=0',
+      'P_Active=TRUE',
+      '<LOCAL_VAR>',
+      '<VAR>',
+      '</VAR>',
+      '</LOCAL_VAR>',
+      serializeFbdBody(defaultFbd, nl),
+      '</POU>',
+    ];
+  } else {
+    pouBlock = [
+      '<POU>',
+      `P_Name=${pouName}`,
+      'P_Lang=1',
+      'P_type=0',
+      'P_Active=TRUE',
+      '<LOCAL_VAR>',
+      '<VAR>',
+      '</VAR>',
+      '</LOCAL_VAR>',
+      '<NETWORK_START>',
+      '<PROPERTIES_START>',
+      'NET_ID=1',
+      'NET_LABEL=',
+      'NET_ACTIVE=TRUE',
+      'NET_BOOKMARK=FALSE',
+      'NET_MODIFY=TRUE',
+      'NET_FOLD=FALSE',
+      '(',
+      '',
+      '*)',
+      '<PROPERTIES_END>',
+      '<ROOTLINK_START>',
+      '[LD_NODE]',
+      'TYPE=1',
+      'DEV_NAME=X0',
+      '[END_LD_NODE]',
+      '<ROOTLINK_END>',
+      '<OUTLINK_START>',
+      '[LD_NODE]',
+      'TYPE=13',
+      'DEV_NAME=Y0',
+      '[END_LD_NODE]',
+      '<OUTLINK_END>',
+      '<NETWORK_END>',
+      '</POU>',
+    ];
+  }
 
   const lines = [
     '<PROJECT>',
@@ -159,20 +290,20 @@ export function createBlankProjectBytes(options: {
     '[DEVICE_CMT_END]',
     '<SYSTEM_VAR>',
     '[BIT_RANGE]',
-    '<M>0-4095',
+    `<M>0-${maxM}`,
     '[STEP_RANGE]',
-    '<S>0-1023',
+    `<S>0-${isAsOrAh ? 2047 : 1023}`,
     '[TIMER_RANGE]',
-    '<T>0-255',
+    `<T>0-${isAsOrAh ? 511 : 255}`,
     '[COUNTER_RANGE]',
-    '<C>0-255',
+    `<C>0-${isAsOrAh ? 511 : 255}`,
     '[DATA_RANGE]',
-    '<D>0-9999',
+    `<D>0-${maxD}`,
     '</SYSTEM_VAR>',
     ...pouBlock,
   ];
   const source = lines.join(nl) + nl;
-  const ispBytes = isAs ? buildAsV3010Container(source) : buildEs2V8Container(source);
+  const ispBytes = isAsOrAh ? buildAsV3010Container(source) : buildEs2V8Container(source);
   const iniBytes = Buffer.from(`[PRJ_DATA]\r\nDEVICE_TYPE=1\r\nMODEL=${projectModel}\r\n`, 'ascii');
   return { ispBytes, iniBytes, canonicalModel: projectModel };
 }
@@ -340,9 +471,13 @@ export function createPouInSource(
   source: string,
   options: {
     pouName: string;
-    language: 'LD' | 'ST' | 'IL';
+    language: PouLanguage;
     pouType?: 'PRG' | 'FB' | 'FC';
+    returnType?: string;
+    enEno?: boolean;
     code?: string;
+    sfcChart?: SfcChart;
+    fbdDiagram?: FbdDiagram;
     localVariables?: string;
     assignToTask?: boolean;
   },
@@ -357,10 +492,13 @@ export function createPouInSource(
     throw new FileTransformError(`POU ${JSON.stringify(pouName)} already exists`);
   }
   const pType = options.pouType === 'FB' ? '1' : options.pouType === 'FC' ? '2' : '0';
-  const pLang = language === 'ST' ? '2' : language === 'IL' ? '3' : '1';
+  const pLang = langNameToCode(language);
   const localVarBody = options.localVariables?.trim()
     ? normalized(options.localVariables).replace(/\n/g, newline)
     : `<VAR>${newline}</VAR>`;
+  const headerExtras: string[] = [];
+  if (options.returnType) headerExtras.push(`P_Rtn_Type=${options.returnType.trim()}`);
+  if (options.enEno !== undefined) headerExtras.push(`P_En_Eno=${options.enEno ? 'TRUE' : 'FALSE'}`);
 
   let pouInnerLines: string[];
   if (language === 'LD') {
@@ -371,6 +509,7 @@ export function createPouInSource(
       `P_Name=${pouName}`,
       `P_Lang=${pLang}`,
       `P_type=${pType}`,
+      ...headerExtras,
       'P_Active=TRUE',
       '<LOCAL_VAR>',
       localVarBody,
@@ -378,8 +517,51 @@ export function createPouInSource(
       ...networks,
       '</POU>',
     ];
+  } else if (language === 'SFC') {
+    const chart: SfcChart = options.sfcChart ?? {
+      steps: [{ name: 'Step0', initial: true, actions: [{ qualifier: 'N', code: 'Y0 := X0;' }] }],
+      transitions: [],
+    };
+    const check = validateSfcChart(chart);
+    if (!check.valid) {
+      throw new FileTransformError(`Invalid SFC chart: ${check.errors.join('; ')}`);
+    }
+    pouInnerLines = [
+      '<POU>',
+      `P_Name=${pouName}`,
+      `P_Lang=${pLang}`,
+      `P_type=${pType}`,
+      ...headerExtras,
+      'P_Active=TRUE',
+      '<LOCAL_VAR>',
+      localVarBody,
+      '</LOCAL_VAR>',
+      serializeSfcBody(chart, newline),
+      '</POU>',
+    ];
+  } else if (language === 'FBD') {
+    const diagram: FbdDiagram = options.fbdDiagram ?? {
+      blocks: [{ id: 'B1', op: 'MOVE', inputs: { IN: 'X0' }, outputs: { OUT: 'Y0' } }],
+    };
+    const check = validateFbdDiagram(diagram);
+    if (!check.valid) {
+      throw new FileTransformError(`Invalid FBD diagram: ${check.errors.join('; ')}`);
+    }
+    pouInnerLines = [
+      '<POU>',
+      `P_Name=${pouName}`,
+      `P_Lang=${pLang}`,
+      `P_type=${pType}`,
+      ...headerExtras,
+      'P_Active=TRUE',
+      '<LOCAL_VAR>',
+      localVarBody,
+      '</LOCAL_VAR>',
+      serializeFbdBody(diagram, newline),
+      '</POU>',
+    ];
   } else {
-    const codeBody = normalized(options.code ?? (language === 'ST' ? '(* ST POU *)\n' : 'LD X0\nOUT Y0\n')).replace(
+    const codeBody = normalized(options.code ?? (language === 'ST' ? '(* ST POU *)\n' : 'LD X0\nOUT Y0\nEND\n')).replace(
       /\n/g,
       newline,
     );
@@ -388,6 +570,7 @@ export function createPouInSource(
       `P_Name=${pouName}`,
       `P_Lang=${pLang}`,
       `P_type=${pType}`,
+      ...headerExtras,
       'P_Active=TRUE',
       '<LOCAL_VAR>',
       localVarBody,
@@ -924,13 +1107,18 @@ export function exportProjectBundle(source: string, containerInfo: ReturnType<ty
   const duts = readDuts(source);
   const globalSec = sections(source, 'GLOBAL_VAR')[0];
   const globalVars = globalSec ? parseLocalVariables(globalSec.inner).entries : [];
+  const hwConfig = readHwConfigFromSource(source);
+  const retainConfig = readRetainConfigFromSource(source);
+  const deviceInit = readDeviceInitFromSource(source);
+  const dataExchange = readDataExchangeFromSource(source);
 
   const pous = sections(source, 'POU').map((m) => {
     const name = propertyValue(m.inner, 'P_Name') ?? 'Unknown';
     const langCode = propertyValue(m.inner, 'P_Lang') ?? '1';
     const pTypeCode = propertyValue(m.inner, 'P_type') ?? '0';
+    const returnType = propertyValue(m.inner, 'P_Rtn_Type') ?? undefined;
     const active = (propertyValue(m.inner, 'P_Active') ?? 'TRUE').trim().toUpperCase() !== 'FALSE';
-    const language = langCode === '2' ? 'ST' : langCode === '3' ? 'IL' : 'LD';
+    const language = langCodeToName(langCode);
     const pouType = pTypeCode === '1' ? 'FB' : pTypeCode === '2' ? 'FC' : 'PRG';
     const lvSec = sections(m.inner, 'LOCAL_VAR')[0];
     const localVars = lvSec ? parseLocalVariables(lvSec.inner).entries : [];
@@ -941,6 +1129,7 @@ export function exportProjectBundle(source: string, containerInfo: ReturnType<ty
         name,
         language,
         pou_type: pouType,
+        ...(returnType ? { return_type: returnType } : {}),
         active,
         local_vars: localVars,
         networks: rendered.rungs.map((r) => ({
@@ -954,11 +1143,37 @@ export function exportProjectBundle(source: string, containerInfo: ReturnType<ty
         })),
       };
     }
+    if (language === 'SFC') {
+      const { chart } = parseSfcFromPouBody(m.inner);
+      return {
+        name,
+        language,
+        pou_type: pouType,
+        active,
+        local_vars: localVars,
+        sfc: chart,
+        ...(includeAscii && chart ? { ascii: renderSfcAscii(chart) } : {}),
+      };
+    }
+    if (language === 'FBD') {
+      const { diagram } = parseFbdFromPouBody(m.inner);
+      return {
+        name,
+        language,
+        pou_type: pouType,
+        ...(returnType ? { return_type: returnType } : {}),
+        active,
+        local_vars: localVars,
+        fbd: diagram,
+        ...(includeAscii && diagram ? { ascii: renderFbdAscii(diagram) } : {}),
+      };
+    }
     const code = sections(m.inner, 'IL_ST_CODE')[0]?.inner ?? '';
     return {
       name,
       language,
       pou_type: pouType,
+      ...(returnType ? { return_type: returnType } : {}),
       active,
       local_vars: localVars,
       code,
@@ -975,6 +1190,10 @@ export function exportProjectBundle(source: string, containerInfo: ReturnType<ty
     device_comments: deviceComments,
     global_vars: globalVars,
     duts,
+    hw_config: hwConfig,
+    retain_config: retainConfig,
+    device_init: deviceInit,
+    data_exchange: dataExchange,
     pous,
   };
 }
@@ -987,13 +1206,20 @@ export interface ProjectBundleInput {
   device_comments?: Record<string, string>;
   global_vars?: Array<Record<string, unknown>>;
   duts?: Array<{ name: string; content: string }>;
+  hw_config?: HwConfigDocument;
+  retain_config?: RetainConfigDocument;
+  device_init?: DeviceInitEntry[];
+  data_exchange?: DataExchangeRow[];
   pous: Array<{
     name: string;
-    language: 'LD' | 'ST' | 'IL';
+    language: PouLanguage;
     pou_type?: 'PRG' | 'FB' | 'FC';
+    return_type?: string;
     active?: boolean;
     local_vars?: Array<Record<string, unknown>>;
     code?: string;
+    sfc?: SfcChart;
+    fbd?: FbdDiagram;
     networks?: Array<{ il: string | string[]; active?: boolean; bookmark?: boolean; label?: string }>;
   }>;
 }
@@ -1010,11 +1236,26 @@ export function buildProjectFromBundle(bundle: ProjectBundleInput): {
   const { ispBytes: baseBytes, iniBytes, canonicalModel } = createBlankProjectBytes({
     model: bundle.model,
     initialPouName: firstPou.name,
-    language: firstPou.language === 'ST' ? 'ST' : 'LD',
+    language: firstPou.language,
   });
   const container = decodeContainer(baseBytes);
   const nl = container.newline;
   let source = decodeCodepage(container.source, container.encoding);
+
+  // Apply pou_type / return_type on the first POU (createBlankProjectBytes defaults to P_type=0)
+  if (firstPou.pou_type && firstPou.pou_type !== 'PRG') {
+    const firstPouSec = sections(source, 'POU')[0];
+    if (firstPouSec) {
+      const pTypeCode = firstPou.pou_type === 'FB' ? '1' : '2';
+      let nextInner = firstPouSec.inner.replace(/^P_type=[^\r\n]*/m, `P_type=${pTypeCode}`);
+      if (firstPou.return_type) {
+        nextInner = /^P_Rtn_Type=/m.test(nextInner)
+          ? nextInner.replace(/^P_Rtn_Type=[^\r\n]*/m, `P_Rtn_Type=${firstPou.return_type.trim()}`)
+          : nextInner.replace(/^P_type=[^\r\n]*/m, `P_type=${pTypeCode}${nl}P_Rtn_Type=${firstPou.return_type.trim()}`);
+      }
+      source = source.slice(0, firstPouSec.innerStart) + nextInner + source.slice(firstPouSec.innerEnd);
+    }
+  }
 
   // Properties
   if (bundle.properties) {
@@ -1022,7 +1263,7 @@ export function buildProjectFromBundle(bundle: ProjectBundleInput): {
     if (projSec) {
       let projInner = projSec.inner;
       for (const [k, v] of Object.entries(bundle.properties)) {
-        const re = new RegExp(`^${k}=[^\\r\\n]*`, 'm');
+        const re = new RegExp(`^${escapeRegex(k)}=[^\\r\\n]*`, 'm');
         projInner = re.test(projInner) ? projInner.replace(re, `${k}=${v}`) : projInner.trimEnd() + nl + `${k}=${v}` + nl;
       }
       source = source.slice(0, projSec.innerStart) + projInner + source.slice(projSec.innerEnd);
@@ -1038,7 +1279,10 @@ export function buildProjectFromBundle(bundle: ProjectBundleInput): {
         pouName: p.name,
         language: p.language,
         pouType: p.pou_type ?? 'PRG',
+        returnType: p.return_type,
         code: p.code,
+        sfcChart: p.sfc,
+        fbdDiagram: p.fbd,
         assignToTask: false,
       },
       nl,
@@ -1071,7 +1315,11 @@ export function buildProjectFromBundle(bundle: ProjectBundleInput): {
     } else if (p.language === 'LD' && p.code) {
       const built = buildNetworksFromIl(p.code, nl);
       source = replaceLdPouNetworks(source, p.name, built, nl);
-    } else if (p.language !== 'LD' && typeof p.code === 'string') {
+    } else if (p.language === 'SFC' && p.sfc) {
+      source = patchSfcPouInSource(source, p.name, p.sfc, nl);
+    } else if (p.language === 'FBD' && p.fbd) {
+      source = patchFbdPouInSource(source, p.name, p.fbd, nl);
+    } else if ((p.language === 'ST' || p.language === 'IL') && typeof p.code === 'string') {
       const pouMatch = sections(source, 'POU').find((m) => propertyValue(m.inner, 'P_Name') === p.name);
       if (pouMatch) {
         const stSec = sections(pouMatch.inner, 'IL_ST_CODE')[0];
@@ -1123,6 +1371,20 @@ export function buildProjectFromBundle(bundle: ProjectBundleInput): {
       Object.assign(map, bundle.system_vars);
     }
     source = writeSystemVarsInSource(source, map, nl);
+  }
+
+  // HWCONFIG / Retain / DeviceInit / DataExchange
+  if (bundle.hw_config) {
+    source = writeHwConfigToSource(source, bundle.hw_config, nl);
+  }
+  if (bundle.retain_config) {
+    source = writeRetainConfigToSource(source, bundle.retain_config, nl);
+  }
+  if (bundle.device_init) {
+    source = writeDeviceInitToSource(source, bundle.device_init, nl);
+  }
+  if (bundle.data_exchange) {
+    source = writeDataExchangeToSource(source, bundle.data_exchange, nl);
   }
 
   // Tasks
@@ -1209,12 +1471,33 @@ export function searchProjectSource(
             });
           }
         }
+      } else if (lang === '4') {
+        const sfcRaw = sections(pou.inner, 'SFC_BODY')[0]?.inner ?? '';
+        sfcRaw.split(/\r?\n/).forEach((line, idx) => {
+          if (pattern.test(line)) {
+            pattern.lastIndex = 0;
+            matches.push({ scope: 'SFC_LINE', pou: pouName, location: `Line ${idx + 1}`, text: line.trim() });
+          }
+        });
+      } else if (lang === '5') {
+        const fbdRaw = sections(pou.inner, 'FBD_BODY')[0]?.inner ?? '';
+        fbdRaw.split(/\r?\n/).forEach((line, idx) => {
+          if (pattern.test(line)) {
+            pattern.lastIndex = 0;
+            matches.push({ scope: 'FBD_LINE', pou: pouName, location: `Line ${idx + 1}`, text: line.trim() });
+          }
+        });
       } else {
         const stCode = sections(pou.inner, 'IL_ST_CODE')[0]?.inner ?? '';
         stCode.split(/\r?\n/).forEach((line, idx) => {
           if (pattern.test(line)) {
             pattern.lastIndex = 0;
-            matches.push({ scope: 'ST_LINE', pou: pouName, location: `Line ${idx + 1}`, text: line.trim() });
+            matches.push({
+              scope: lang === '3' ? 'IL_LINE' : 'ST_LINE',
+              pou: pouName,
+              location: `Line ${idx + 1}`,
+              text: line.trim(),
+            });
           }
         });
       }
@@ -1358,6 +1641,11 @@ export function staticCheckAndCompileProject(container: IspContainer) {
       });
     } else if (lang === '2') {
       const code = sections(body, 'IL_ST_CODE')[0]?.inner ?? '';
+      const openComments = (code.match(/\(\*/g) ?? []).length;
+      const closeComments = (code.match(/\*\)/g) ?? []).length;
+      if (openComments !== closeComments) {
+        errors.push({ scope: `POU:${name}`, message: `Unclosed ST block comment (* ... *) (${openComments} vs ${closeComments})` });
+      }
       const cleanCode = code.replace(/\(\*[\s\S]*?\*\)/g, '').replace(/\/\/[^\r\n]*/g, '');
       const lines = cleanCode.split(/\r?\n/).filter((l) => l.trim());
       totalInstructions += lines.length;
@@ -1371,6 +1659,53 @@ export function staticCheckAndCompileProject(container: IspContainer) {
       checkPair(/\bWHILE\b/gi, /\bEND_WHILE\b/gi, 'WHILE/END_WHILE');
       checkPair(/\bCASE\b/gi, /\bEND_CASE\b/gi, 'CASE/END_CASE');
       checkPair(/\bREPEAT\b/gi, /\bEND_REPEAT\b/gi, 'REPEAT/END_REPEAT');
+    } else if (lang === '3') {
+      const code = sections(body, 'IL_ST_CODE')[0]?.inner ?? '';
+      try {
+        const ins = parseIl(code);
+        totalInstructions += ins.length;
+        for (const [opCode, ops] of ins) {
+          if (opCode === 'OUT' && ops[0]) {
+            const dev = ops[0].toUpperCase();
+            if (!coilWrites.has(dev)) coilWrites.set(dev, []);
+            coilWrites.get(dev)!.push(`${name}:IL`);
+          } else if ((opCode === 'SET' || opCode === 'RST') && ops[0]) {
+            const dev = ops[0].toUpperCase();
+            if (!setRstWrites.has(dev)) setRstWrites.set(dev, []);
+            setRstWrites.get(dev)!.push(`${name}:IL`);
+          }
+        }
+      } catch (e) {
+        errors.push({ scope: `POU:${name}`, message: e instanceof Error ? e.message : String(e) });
+      }
+    } else if (lang === '4') {
+      const { chart, error } = parseSfcFromPouBody(body);
+      if (error || !chart) {
+        errors.push({ scope: `POU:${name}`, message: error ?? 'Missing SFC_BODY section' });
+      } else {
+        totalInstructions += chart.steps.length + chart.transitions.length;
+        const res = validateSfcChart(chart);
+        for (const err of res.errors) errors.push({ scope: `POU:${name}:SFC`, message: err });
+        for (const warn of res.warnings) warnings.push({ scope: `POU:${name}:SFC`, message: warn });
+      }
+    } else if (lang === '5') {
+      const { diagram, error } = parseFbdFromPouBody(body);
+      if (error || !diagram) {
+        errors.push({ scope: `POU:${name}`, message: error ?? 'Missing FBD_BODY section' });
+      } else {
+        totalInstructions += diagram.blocks.length;
+        const res = validateFbdDiagram(diagram);
+        for (const err of res.errors) errors.push({ scope: `POU:${name}:FBD`, message: err });
+        for (const warn of res.warnings) warnings.push({ scope: `POU:${name}:FBD`, message: warn });
+      }
+    }
+  }
+
+  // Validate HWCONFIG if present
+  if (sections(text, 'HWCONFIG').length > 0) {
+    const hw = readHwConfigFromSource(text);
+    for (const err of validateHwConfig(hw)) {
+      errors.push({ scope: 'HWCONFIG', message: err });
     }
   }
 
@@ -1448,6 +1783,10 @@ export function auditProjectDeep(container: IspContainer) {
         }
         codeParts.push(raw);
       });
+    } else if (lang === '4') {
+      codeParts.push(sections(pou.inner, 'SFC_BODY')[0]?.inner ?? '');
+    } else if (lang === '5') {
+      codeParts.push(sections(pou.inner, 'FBD_BODY')[0]?.inner ?? '');
     } else {
       codeParts.push(sections(pou.inner, 'IL_ST_CODE')[0]?.inner ?? '');
     }
@@ -1536,6 +1875,223 @@ export function diffProjectsSource(sourceA: string, sourceB: string) {
     removed_pous: removedPous,
     modified_pous: modifiedPous,
     identical: normalized(sourceA) === normalized(sourceB),
+  };
+}
+
+export function patchIlPouInSource(source: string, pouName: string, ilCode: string, newline = '\r\n'): string {
+  // Validate IL syntax first
+  parseIl(ilCode);
+  const matches = sections(source, 'POU').filter((m) => propertyValue(m.inner, 'P_Name') === pouName);
+  if (matches.length !== 1) {
+    throw new FileTransformError(`Expected one POU named ${JSON.stringify(pouName)}; found ${matches.length}`);
+  }
+  const match = matches[0];
+  if (propertyValue(match.inner, 'P_Lang') !== '3') {
+    throw new FileTransformError(`POU ${JSON.stringify(pouName)} is not an IL POU (P_Lang=3)`);
+  }
+  const codeSecs = sections(match.inner, 'IL_ST_CODE');
+  const rep = normalized(ilCode).replace(/\n/g, newline);
+  let newBody: string;
+  if (codeSecs.length === 1) {
+    newBody = match.inner.slice(0, codeSecs[0].innerStart) + rep + match.inner.slice(codeSecs[0].innerEnd);
+  } else {
+    newBody = match.inner.trimEnd() + newline + `<IL_ST_CODE>${newline}${rep}${newline}</IL_ST_CODE>${newline}`;
+  }
+  return source.slice(0, match.innerStart) + newBody + source.slice(match.innerEnd);
+}
+
+export function patchSfcPouInSource(source: string, pouName: string, chart: SfcChart, newline = '\r\n'): string {
+  const check = validateSfcChart(chart);
+  if (!check.valid) {
+    throw new FileTransformError(`Invalid SFC chart: ${check.errors.join('; ')}`);
+  }
+  const matches = sections(source, 'POU').filter((m) => propertyValue(m.inner, 'P_Name') === pouName);
+  if (matches.length !== 1) {
+    throw new FileTransformError(`Expected one POU named ${JSON.stringify(pouName)}; found ${matches.length}`);
+  }
+  const match = matches[0];
+  if (propertyValue(match.inner, 'P_Lang') !== '4') {
+    throw new FileTransformError(`POU ${JSON.stringify(pouName)} is not an SFC POU (P_Lang=4)`);
+  }
+  const block = serializeSfcBody(chart, newline);
+  const sfcSecs = sections(match.inner, 'SFC_BODY');
+  const newBody =
+    sfcSecs.length >= 1
+      ? match.inner.slice(0, sfcSecs[0].start) + block + match.inner.slice(sfcSecs[0].end)
+      : match.inner.trimEnd() + newline + block + newline;
+  return source.slice(0, match.innerStart) + newBody + source.slice(match.innerEnd);
+}
+
+export function patchFbdPouInSource(source: string, pouName: string, diagram: FbdDiagram, newline = '\r\n'): string {
+  const check = validateFbdDiagram(diagram);
+  if (!check.valid) {
+    throw new FileTransformError(`Invalid FBD diagram: ${check.errors.join('; ')}`);
+  }
+  const matches = sections(source, 'POU').filter((m) => propertyValue(m.inner, 'P_Name') === pouName);
+  if (matches.length !== 1) {
+    throw new FileTransformError(`Expected one POU named ${JSON.stringify(pouName)}; found ${matches.length}`);
+  }
+  const match = matches[0];
+  if (propertyValue(match.inner, 'P_Lang') !== '5') {
+    throw new FileTransformError(`POU ${JSON.stringify(pouName)} is not an FBD POU (P_Lang=5)`);
+  }
+  const block = serializeFbdBody(diagram, newline);
+  const fbdSecs = sections(match.inner, 'FBD_BODY');
+  const newBody =
+    fbdSecs.length >= 1
+      ? match.inner.slice(0, fbdSecs[0].start) + block + match.inner.slice(fbdSecs[0].end)
+      : match.inner.trimEnd() + newline + block + newline;
+  return source.slice(0, match.innerStart) + newBody + source.slice(match.innerEnd);
+}
+
+export function importMpuIntoProjectSource(
+  source: string,
+  mpuBytes: Buffer,
+  options: { pouName?: string; overwrite?: boolean; assignToTask?: boolean; newline?: string } = {},
+): { updatedSource: string; pouName: string; networkCount: number } {
+  const nl = options.newline ?? '\r\n';
+  const { members } = unpackPackage(mpuBytes);
+  if (!members[ENTRY_NAME]) {
+    throw new FileTransformError('MPU archive does not contain Unzipped.src');
+  }
+  const mpuSrc = decodeCodepage(members[ENTRY_NAME], 'cp1252');
+  const pouMatch = sections(mpuSrc, 'POU')[0];
+  if (!pouMatch) {
+    throw new FileTransformError('MPU archive does not contain a <POU> section');
+  }
+  const originalName = propertyValue(pouMatch.inner, 'P_Name') ?? 'ImportedPou';
+  const targetName = (options.pouName ?? originalName).trim();
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(targetName)) {
+    throw new FileTransformError('Target POU name must be an ASCII IEC identifier');
+  }
+  const nets = ldNetworkMatches(pouMatch.inner).map((m) => m.full);
+  if (!nets.length) {
+    throw new FileTransformError('MPU POU contains zero LD networks');
+  }
+  const existing = sections(source, 'POU').find((m) => propertyValue(m.inner, 'P_Name') === targetName);
+  let updatedSource = source;
+  if (existing) {
+    if (!options.overwrite) {
+      throw new FileTransformError(`POU ${JSON.stringify(targetName)} already exists; set overwrite=true to replace.`);
+    }
+    updatedSource = replaceLdPouNetworks(updatedSource, targetName, nets, nl);
+  } else {
+    const ilRes = mpuToIl(mpuBytes);
+    updatedSource = createPouInSource(
+      updatedSource,
+      {
+        pouName: targetName,
+        language: 'LD',
+        pouType: 'PRG',
+        code: ilRes.il,
+        assignToTask: options.assignToTask ?? false,
+      },
+      nl,
+    );
+  }
+  return { updatedSource, pouName: targetName, networkCount: nets.length };
+}
+
+export function exportLdPouToMpuBytes(source: string, pouName: string): { mpuBytes: Buffer; il: string; networkCount: number } {
+  const pouMatch = sections(source, 'POU').find((m) => propertyValue(m.inner, 'P_Name') === pouName);
+  if (!pouMatch) {
+    throw new FileTransformError(`POU ${JSON.stringify(pouName)} not found`);
+  }
+  if (propertyValue(pouMatch.inner, 'P_Lang') !== '1') {
+    throw new FileTransformError(`POU ${JSON.stringify(pouName)} is not a Ladder Diagram POU (P_Lang=1)`);
+  }
+  const rendered = renderLdAsciiForPou(pouMatch.inner);
+  const ilLines: string[] = [];
+  for (const r of rendered.rungs) {
+    if (r.label) ilLines.push(`${r.label}:`);
+    ilLines.push(...r.il);
+  }
+  const il = `${ilLines.join('\n')}\nEND\n`;
+  const { data, detail } = ilToMpu(il, pouName, 'cp1252');
+  return { mpuBytes: data, il, networkCount: detail.network_count };
+}
+
+export function migrateProjectModel(
+  source: string,
+  targetModel: string,
+): {
+  ispBytes: Buffer;
+  iniBytes: Buffer;
+  sourceModel: string;
+  targetModel: string;
+  sourceFamily: string;
+  targetFamily: string;
+  migrationNotes: string[];
+  warnings: string[];
+} {
+  const { canonical, error } = resolveModel(targetModel);
+  if (error || !canonical) {
+    throw new FileTransformError(error ?? 'Unsupported target model');
+  }
+  const targetProfile = MODEL_PROFILES[canonical];
+  const targetProjectModel = String(targetProfile.project_model || canonical);
+  const targetFamily = String(targetProfile.family);
+  const sourceModel = propertyValue(source, 'Prj_DT') ?? 'ES2';
+  const sourceRes = resolveModel(sourceModel);
+  const sourceFamily = sourceRes.canonical ? String(MODEL_PROFILES[sourceRes.canonical].family) : 'DVP';
+
+  const isTargetAsOrAh = targetFamily === 'AS' || targetFamily === 'AH';
+  const nl = isTargetAsOrAh ? '\r\n' : '\r\r\n';
+  const migrationNotes: string[] = [];
+  const warnings: string[] = [];
+
+  let updated = normalized(source).replace(/\n/g, nl);
+  updated = updated.replace(/^Prj_DT=[^\r\n]*/m, `Prj_DT=${targetProjectModel}`);
+  updated = updated.replace(/^Prj_ISPVer=[^\r\n]*/m, `Prj_ISPVer=${isTargetAsOrAh ? '3.19' : '3.24'}`);
+
+  const maxD = Number(targetProfile.max_d ?? 9999);
+  const maxM = Number(targetProfile.max_m ?? 4095);
+  updated = writeSystemVarsInSource(
+    updated,
+    {
+      M: `0-${maxM}`,
+      S: `0-${isTargetAsOrAh ? 2047 : 1023}`,
+      T: `0-${isTargetAsOrAh ? 511 : 255}`,
+      C: `0-${isTargetAsOrAh ? 511 : 255}`,
+      D: `0-${maxD}`,
+    },
+    nl,
+  );
+  migrationNotes.push(`Updated Prj_DT from ${sourceModel} to ${targetProjectModel} and resized SYSTEM_VAR ranges (D0-D${maxD}, M0-M${maxM}).`);
+
+  if (sourceFamily === 'DVP' && isTargetAsOrAh) {
+    // Report DVP special relays that map to AS SM*/SR* equivalents
+    const dvpSpecials: Array<[RegExp, string]> = [
+      [/\bM1000\b/g, 'SM400 (Always ON)'],
+      [/\bM1001\b/g, 'SM401 (Always OFF)'],
+      [/\bM1002\b/g, 'SM402 (First scan pulse)'],
+      [/\bM1012\b/g, 'SM410 (100ms clock)'],
+      [/\bM1013\b/g, 'SM412 (1s clock)'],
+      [/\bD1010\b/g, 'SR410 (Scan time)'],
+    ];
+    for (const [re, replacement] of dvpSpecials) {
+      if (re.test(source)) {
+        warnings.push(`Cross-family DVP->${targetFamily}: project uses ${re.source.replace(/\\b/g, '')}; review mapping to ${replacement}.`);
+      }
+    }
+    warnings.push('DVP octal X/Y addresses (e.g. X10/Y20) use slot.bit notation (X0.0/Y0.0) on AS/AH CPUs; verify I/O assignments in HWCONFIG.');
+  } else if ((sourceFamily === 'AS' || sourceFamily === 'AH') && targetFamily === 'DVP') {
+    if (/\bSM\d+\b|\bSR\d+\b/i.test(source)) {
+      warnings.push('Cross-family AS/AH->DVP: SM/SR special devices must be mapped back to DVP M1000+/D1000+ equivalents.');
+    }
+  }
+
+  const ispBytes = isTargetAsOrAh ? buildAsV3010Container(updated) : buildEs2V8Container(updated);
+  const iniBytes = Buffer.from(`[PRJ_DATA]\r\nDEVICE_TYPE=1\r\nMODEL=${targetProjectModel}\r\n`, 'ascii');
+  return {
+    ispBytes,
+    iniBytes,
+    sourceModel,
+    targetModel: targetProjectModel,
+    sourceFamily,
+    targetFamily,
+    migrationNotes,
+    warnings,
   };
 }
 

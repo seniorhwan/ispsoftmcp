@@ -2,7 +2,7 @@ export type HealthStatus = 'OPTIMAL' | 'ELEVATED' | 'SLUGGISH' | 'OVER_BUDGET';
 
 export interface PouTimingSummary {
   pou: string;
-  lang: 'LD' | 'ST';
+  lang: 'LD' | 'ST' | 'IL' | 'SFC' | 'FBD';
   executions: number;
   total_ms: number;
   avg_ms: number;
@@ -37,7 +37,7 @@ export interface ScanSample {
   heap_used_bytes: number;
   pou_timings: Array<{
     pou: string;
-    lang: 'LD' | 'ST';
+    lang: 'LD' | 'ST' | 'IL' | 'SFC' | 'FBD';
     duration_ms: number;
     work_units: number;
   }>;

@@ -1,9 +1,43 @@
-import { decodeContainer, inspectContainer, ldNetworks, parseLdNetwork, parseLocalVariables, propertyValue, sections } from './containers.js';
-import { readDuts, readTasks } from './authoring.js';
+import {
+  decodeContainer,
+  inspectContainer,
+  ldNetworks,
+  parseLdNetwork,
+  parseLocalVariables,
+  patchSt,
+  propertyValue,
+  replaceLdPouNetworks,
+  sections,
+} from './containers.js';
+import {
+  buildNetworksFromIl,
+  patchFbdPouInSource,
+  patchIlPouInSource,
+  patchSfcPouInSource,
+  readDuts,
+  readTasks,
+} from './authoring.js';
+import { parseIl } from './dvp.js';
+import {
+  DeviceInitEntry,
+  HwConfigDocument,
+  RetainConfigDocument,
+  isDeviceRetained,
+  readDeviceInitFromSource,
+  readHwConfigFromSource,
+  readRetainConfigFromSource,
+} from './hwConfig.js';
 import { netToIl, parseNetworks } from './mpu2il.js';
-import { Instruction } from './il2mpu.js';
-import { FileTransformError, computeContentHash, decodeCodepage } from './limits.js';
+import { Instruction, splitNets } from './il2mpu.js';
+import { FileTransformError, computeContentHash, decodeCodepage, encodeCodepage } from './limits.js';
 import { evaluateSafeNumericExpr } from './safeExpr.js';
+import {
+  FbdDiagram,
+  SfcChart,
+  parseFbdFromPouBody,
+  parseSfcFromPouBody,
+  topologicalSortFbd,
+} from './sfcFbd.js';
 import {
   MemoryBreakdown,
   NetworkTimingSummary,
@@ -12,7 +46,7 @@ import {
   analyzeSimulationDiagnostics,
   computeMemoryBreakdown,
 } from './simDiagnostics.js';
-import { readFileBuffer } from './workspace.js';
+import { readFileBuffer, writeFileBuffer } from './workspace.js';
 
 export interface SimNetworkTrace {
   pou: string;
@@ -69,6 +103,44 @@ export interface SimLocalVarMeta {
   initial: number | boolean;
 }
 
+export interface SfcStepRuntimeState {
+  active: boolean;
+  elapsedMs: number;
+  enteredThisScan: boolean;
+}
+
+export interface SfcRuntimeState {
+  initialized: boolean;
+  steps: Map<string, SfcStepRuntimeState>;
+  storedActions: Map<string, { name: string; code: string }>;
+}
+
+export interface PidRuntimeState {
+  integral: number;
+  prevError: number;
+  prevPv: number;
+  initialized: boolean;
+}
+
+export interface FbInstanceState {
+  type: string;
+  fields: Record<string, number | boolean>;
+  internal: Record<string, number | boolean>;
+}
+
+export interface SimSfcTrace {
+  pou: string;
+  active_steps: string[];
+  transitions_fired: string[];
+  outputs_written: Record<string, boolean | number>;
+}
+
+export interface SimFbdTrace {
+  pou: string;
+  blocks_evaluated: number;
+  outputs_written: Record<string, boolean | number>;
+}
+
 export interface SimPouProgram {
   name: string;
   lang: string;
@@ -77,6 +149,8 @@ export interface SimPouProgram {
   localVars: SimLocalVarMeta[];
   networks: Array<{ index: number; net_id: string; label: string; active: boolean; il: Instruction[] }>;
   stCode: string;
+  sfcChart?: SfcChart | null;
+  fbdDiagram?: FbdDiagram | null;
 }
 
 export interface SimulatorDiagnosticsState {
@@ -115,10 +189,21 @@ export interface SimulatorSession {
   counters: Map<string, CounterState>;
   symbols: Map<string, { address: string | null; type: string; value: number | boolean; initial: number | boolean }>;
   dutFields: Map<string, string[]>;
+  hwConfig: HwConfigDocument;
+  retainConfig: RetainConfigDocument;
+  deviceInit: DeviceInitEntry[];
+  moduleBfm: Map<number, Map<number, number>>;
+  sfcStates: Map<string, SfcRuntimeState>;
+  pidStates: Map<string, PidRuntimeState>;
+  fbInstances: Map<string, FbInstanceState>;
+  taskLastRunMs: Map<string, number>;
+  interruptsEnabled: boolean;
   tasks: ReturnType<typeof readTasks>;
   pouPrograms: SimPouProgram[];
   lastRungTrace: SimNetworkTrace[];
   lastStTrace: SimStTrace[];
+  lastSfcTrace: SimSfcTrace[];
+  lastFbdTrace: SimFbdTrace[];
   watchLists: Map<string, string[]>;
   traceBuffer: WatchSample[];
   breakpoints: BreakpointRule[];
@@ -251,39 +336,79 @@ function resolveSymbol(sess: SimulatorSession, name: string) {
   return null;
 }
 
+const _f32Buf = new ArrayBuffer(4);
+const _f32View = new DataView(_f32Buf);
+
+function float32ToInt32(val: number): number {
+  _f32View.setFloat32(0, val, true);
+  return _f32View.getInt32(0, true);
+}
+
+function int32ToFloat32(bits: number): number {
+  _f32View.setInt32(0, bits | 0, true);
+  return _f32View.getFloat32(0, true);
+}
+
+function isFloatType(typeName?: string): boolean {
+  const u = (typeName ?? '').trim().toUpperCase();
+  return u === 'REAL' || u === 'LREAL';
+}
+
+const STANDARD_IEC_FBS = new Set([
+  'TON', 'TOF', 'TP', 'CTU', 'CTD', 'CTUD', 'R_TRIG', 'F_TRIG', 'SR', 'RS', 'PID_FB', 'SCALE',
+]);
+
+function resolveIndexRegisterAddr(sess: SimulatorSession, rawAddr: string): string {
+  const m = /^([XYMSTCDR])(\d+)([VZE])(\d+)$/i.exec(rawAddr.trim());
+  if (!m) return normAddr(rawAddr);
+  const area = m[1].toUpperCase();
+  const isOctal = area === 'X' || area === 'Y';
+  const base = parseInt(m[2], isOctal ? 8 : 10);
+  const idxReg = `${m[3].toUpperCase()}${m[4]}`;
+  const offset = Math.trunc(sess.words.get(idxReg) ?? 0);
+  const effective = Math.max(0, base + offset);
+  return isOctal ? `${area}${effective.toString(8).toUpperCase()}` : `${area}${effective}`;
+}
+
 function resolveHardwareOrWordKey(sess: SimulatorSession, rawName: string): string {
   const resolved = resolveSymbol(sess, rawName);
   if (resolved?.entry.address) {
-    return normAddr(resolved.entry.address);
+    return resolveIndexRegisterAddr(sess, resolved.entry.address);
   }
-  return normAddr(rawName);
+  return resolveIndexRegisterAddr(sess, rawName);
 }
 
 function isBitAddress(addr: string): boolean {
   const t = addr.trim();
-  return /^(X|Y|M|S)\d+$/i.test(t) || parseBitOfWord(t) !== null;
+  return /^(X|Y|M|S|SM)\d+$/i.test(t) || /^(X|Y)\d+\.\d+$/i.test(t) || /^(X|Y|M|S)\d+[VZE]\d+$/i.test(t) || parseBitOfWord(t) !== null;
 }
 
 function parseConst(token: string, sess: SimulatorSession): number {
   const t = token.trim();
   if (/^[Kk](-?\d+)$/.test(t)) return parseInt(t.slice(1), 10);
+  if (/^[Ff](-?\d+(?:\.\d+)?)$/.test(t)) return parseFloat(t.slice(1));
+  if (/^-?\d+\.\d+$/.test(t)) return parseFloat(t);
   if (/^-?\d+$/.test(t)) return parseInt(t, 10);
   if (/^[Hh]([0-9A-Fa-f]+)$/.test(t)) return parseInt(t.slice(1), 16);
   if (parseBitOfWord(t)) return readBit(sess, t) ? 1 : 0;
   const sym = resolveSymbol(sess, t);
   if (sym) {
     if (sym.entry.address) {
+      if (isFloatType(sym.entry.type)) {
+        return readFloat32(sess, sym.entry.address);
+      }
       return isBitAddress(sym.entry.address)
         ? readBit(sess, sym.entry.address) ? 1 : 0
         : readWord(sess, sym.entry.address);
     }
     return typeof sym.entry.value === 'boolean' ? (sym.entry.value ? 1 : 0) : Number(sym.entry.value);
   }
-  return readWord(sess, t);
+  const idxResolved = resolveIndexRegisterAddr(sess, t);
+  return readWord(sess, idxResolved);
 }
 
 function readBit(sess: SimulatorSession, rawAddr: string): boolean {
-  const addr = normAddr(rawAddr);
+  const addr = resolveIndexRegisterAddr(sess, rawAddr);
   if (sess.forcedBits.has(addr)) return sess.forcedBits.get(addr)!;
 
   const bow = parseBitOfWord(addr);
@@ -318,7 +443,7 @@ function readBit(sess: SimulatorSession, rawAddr: string): boolean {
 }
 
 function writeBit(sess: SimulatorSession, rawAddr: string, val: boolean): void {
-  const addr = normAddr(rawAddr);
+  const addr = resolveIndexRegisterAddr(sess, rawAddr);
   if (sess.forcedBits.has(addr)) return;
 
   const bow = parseBitOfWord(addr);
@@ -365,7 +490,7 @@ function writeBit(sess: SimulatorSession, rawAddr: string, val: boolean): void {
 }
 
 function readWord(sess: SimulatorSession, rawAddr: string): number {
-  const addr = normAddr(rawAddr);
+  const addr = resolveIndexRegisterAddr(sess, rawAddr);
   if (sess.forcedWords.has(addr)) return sess.forcedWords.get(addr)!;
 
   const dotT = /^(T\d+)\.PV$/i.exec(addr);
@@ -381,7 +506,10 @@ function readWord(sess: SimulatorSession, rawAddr: string): number {
 
   const sym = resolveSymbol(sess, rawAddr);
   if (sym) {
-    if (sym.entry.address) return readWord(sess, sym.entry.address);
+    if (sym.entry.address) {
+      if (isFloatType(sym.entry.type)) return readFloat32(sess, sym.entry.address);
+      return readWord(sess, sym.entry.address);
+    }
     return Number(sym.entry.value) || 0;
   }
   if (/^T\d+$/.test(addr)) {
@@ -394,11 +522,21 @@ function readWord(sess: SimulatorSession, rawAddr: string): number {
 }
 
 function writeWord(sess: SimulatorSession, rawAddr: string, val: number): void {
-  const addr = normAddr(rawAddr);
+  const addr = resolveIndexRegisterAddr(sess, rawAddr);
   if (sess.forcedWords.has(addr)) return;
-  const intVal = Math.trunc(val);
   const sym = resolveSymbol(sess, rawAddr);
   if (sym) {
+    if (isFloatType(sym.entry.type)) {
+      const fVal = Number.isFinite(val) ? val : 0;
+      if (sym.entry.address) {
+        writeFloat32(sess, sym.entry.address, fVal);
+        return;
+      }
+      sym.entry.value = fVal;
+      sess.words.set(normAddr(sym.key), fVal);
+      return;
+    }
+    const intVal = Math.trunc(val);
     if (sym.entry.address) {
       writeWord(sess, sym.entry.address, intVal);
       return;
@@ -407,6 +545,7 @@ function writeWord(sess: SimulatorSession, rawAddr: string, val: number): void {
     sess.words.set(normAddr(sym.key), intVal);
     return;
   }
+  const intVal = Math.trunc(val);
   if (/^T\d+$/.test(addr)) {
     const t = sess.timers.get(addr) ?? {
       pv: 0,
@@ -450,7 +589,7 @@ function readDWord(sess: SimulatorSession, token: string): number {
   if (is32BitCounter(key)) {
     return toInt32(readWord(sess, key));
   }
-  if (/^[DRVZ]\d+$/i.test(key)) {
+  if (/^[DRVZE]\d+$/i.test(key) || /^SR\d+$/i.test(key)) {
     const lo = readWord(sess, key) & 0xffff;
     const hi = readWord(sess, shiftIndexedDevice(key, 1)) & 0xffff;
     return toInt32((hi << 16) | lo);
@@ -465,12 +604,36 @@ function writeDWord(sess: SimulatorSession, rawAddr: string, val: number): void 
     writeWord(sess, key, v32);
     return;
   }
-  if (/^[DRVZ]\d+$/i.test(key)) {
+  if (/^[DRVZE]\d+$/i.test(key) || /^SR\d+$/i.test(key)) {
     writeWord(sess, key, toInt16(v32 & 0xffff));
     writeWord(sess, shiftIndexedDevice(key, 1), toInt16((v32 >>> 16) & 0xffff));
     return;
   }
   writeWord(sess, key, v32);
+}
+
+function readFloat32(sess: SimulatorSession, token: string): number {
+  const t = token.trim();
+  if (/^[Ff](-?\d+(?:\.\d+)?)$/.test(t)) return parseFloat(t.slice(1));
+  if (/^-?\d+\.\d+$/.test(t)) return parseFloat(t);
+  if (/^[Kk](-?\d+)$/.test(t)) return parseInt(t.slice(1), 10);
+  if (/^-?\d+$/.test(t)) return parseInt(t, 10);
+  const sym = resolveSymbol(sess, t);
+  if (sym && !sym.entry.address) {
+    return Number(sym.entry.value) || 0;
+  }
+  return int32ToFloat32(readDWord(sess, t));
+}
+
+function writeFloat32(sess: SimulatorSession, rawAddr: string, val: number): void {
+  const f = Number.isFinite(val) ? val : 0;
+  const sym = resolveSymbol(sess, rawAddr);
+  if (sym && !sym.entry.address) {
+    sym.entry.value = f;
+    sess.words.set(normAddr(sym.key), f);
+    return;
+  }
+  writeDWord(sess, rawAddr, float32ToInt32(f));
 }
 
 function getSession(sessionId: string): SimulatorSession {
@@ -482,11 +645,45 @@ function getSession(sessionId: string): SimulatorSession {
   return sess;
 }
 
+function parseInitTokenValue(typeName: string, rawInitial: string): number | boolean {
+  const initToken = rawInitial.replace(/\[@[^\]]+@\]/g, '').trim();
+  if (typeName.toUpperCase() === 'BOOL') {
+    if (/^TRUE$/i.test(initToken) || initToken === '1') return true;
+    return false;
+  }
+  if (isFloatType(typeName)) {
+    const n = Number.parseFloat(initToken);
+    return Number.isFinite(n) ? n : 0;
+  }
+  if (/^-?\d+$/.test(initToken)) return parseInt(initToken, 10);
+  if (/^TRUE$/i.test(initToken)) return 1;
+  return 0;
+}
+
+function parseIlCodeToNetworks(ilCode: string): SimPouProgram['networks'] {
+  try {
+    const parsed = parseIl(ilCode);
+    const nets = splitNets(parsed);
+    return nets.map((net, idx) => ({
+      index: idx + 1,
+      net_id: String(idx + 1),
+      label: net.label ?? '',
+      active: true,
+      il: net.seq && net.seq.length > 0 ? net.seq : [...net.in, ...net.out],
+    }));
+  } catch {
+    return [];
+  }
+}
+
 function parseProjectForSim(rawBytes: Buffer) {
   const container = decodeContainer(rawBytes);
   const info = inspectContainer(container);
   const text = decodeCodepage(container.source, container.encoding);
   const tasks = readTasks(text);
+  const hwConfig = readHwConfigFromSource(text);
+  const retainConfig = readRetainConfigFromSource(text);
+  const deviceInit = readDeviceInitFromSource(text);
 
   const dutFields = new Map<string, string[]>();
   const dutFieldMeta = new Map<string, Array<{ name: string; type: string }>>();
@@ -505,17 +702,50 @@ function parseProjectForSim(rawBytes: Buffer) {
   }
 
   const symbols: SimulatorSession['symbols'] = new Map();
+  const fbInstances = new Map<string, FbInstanceState>();
+
   const registerStructSubfields = (identifier: string, entryType: string) => {
     const metas = dutFieldMeta.get(entryType);
-    if (!metas) return;
-    for (const f of metas) {
-      const fBool = f.type === 'BOOL';
-      symbols.set(`${identifier}.${f.name}`, {
-        address: null,
-        type: f.type,
-        value: fBool ? false : 0,
-        initial: fBool ? false : 0,
-      });
+    if (metas) {
+      for (const f of metas) {
+        const fBool = f.type === 'BOOL';
+        symbols.set(`${identifier}.${f.name}`, {
+          address: null,
+          type: f.type,
+          value: fBool ? false : 0,
+          initial: fBool ? false : 0,
+        });
+      }
+    }
+    const upType = entryType.toUpperCase();
+    if (STANDARD_IEC_FBS.has(upType)) {
+      const fields: Record<string, number | boolean> = {};
+      if (upType === 'TON' || upType === 'TOF' || upType === 'TP') {
+        Object.assign(fields, { IN: false, PT: 0, Q: false, ET: 0 });
+      } else if (upType === 'CTU') {
+        Object.assign(fields, { CU: false, R: false, PV: 0, Q: false, CV: 0 });
+      } else if (upType === 'CTD') {
+        Object.assign(fields, { CD: false, LD: false, PV: 0, Q: false, CV: 0 });
+      } else if (upType === 'CTUD') {
+        Object.assign(fields, { CU: false, CD: false, R: false, LD: false, PV: 0, QU: false, QD: false, CV: 0 });
+      } else if (upType === 'R_TRIG' || upType === 'F_TRIG') {
+        Object.assign(fields, { CLK: false, Q: false });
+      } else if (upType === 'SR' || upType === 'RS') {
+        Object.assign(fields, { S1: false, S: false, R: false, R1: false, Q1: false, Q: false });
+      } else if (upType === 'PID_FB') {
+        Object.assign(fields, { SV: 0, PV: 0, KP: 100, TI: 0, TD: 0, EN: true, MV: 0 });
+      } else if (upType === 'SCALE') {
+        Object.assign(fields, { IN: 0, IN_MIN: 0, IN_MAX: 4000, OUT_MIN: 0, OUT_MAX: 100, OUT: 0 });
+      }
+      fbInstances.set(identifier.toUpperCase(), { type: upType, fields, internal: {} });
+      for (const [fn, fv] of Object.entries(fields)) {
+        symbols.set(`${identifier}.${fn}`, {
+          address: null,
+          type: typeof fv === 'boolean' ? 'BOOL' : isFloatType(upType) ? 'REAL' : 'INT',
+          value: fv,
+          initial: fv,
+        });
+      }
     }
   };
 
@@ -523,10 +753,7 @@ function parseProjectForSim(rawBytes: Buffer) {
   for (const gs of globalSecs) {
     const parsed = parseLocalVariables(gs.inner);
     for (const entry of parsed.entries) {
-      const initToken = entry.initial_value.replace(/\[@[^\]]+@\]/g, '').trim();
-      const isBool = entry.type.toUpperCase() === 'BOOL';
-      const initNum = /^-?\d+$/.test(initToken) ? parseInt(initToken, 10) : /^TRUE$/i.test(initToken) ? 1 : 0;
-      const initVal = isBool ? Boolean(initNum) : initNum;
+      const initVal = parseInitTokenValue(entry.type, entry.initial_value);
       symbols.set(entry.identifier, {
         address: entry.address,
         type: entry.type,
@@ -548,10 +775,7 @@ function parseProjectForSim(rawBytes: Buffer) {
     const localVars: SimLocalVarMeta[] = [];
 
     for (const entry of parsedLocal.entries) {
-      const initToken = entry.initial_value.replace(/\[@[^\]]+@\]/g, '').trim();
-      const isBool = entry.type.toUpperCase() === 'BOOL';
-      const initNum = /^-?\d+$/.test(initToken) ? parseInt(initToken, 10) : /^TRUE$/i.test(initToken) ? 1 : 0;
-      const initVal = isBool ? Boolean(initNum) : initNum;
+      const initVal = parseInitTokenValue(entry.type, entry.initial_value);
       localVars.push({
         identifier: entry.identifier,
         type: entry.type,
@@ -568,7 +792,11 @@ function parseProjectForSim(rawBytes: Buffer) {
       registerStructSubfields(entry.identifier, entry.type);
     }
 
-    const networks: SimPouProgram['networks'] = [];
+    const stCode = sections(pouMatch.inner, 'IL_ST_CODE')[0]?.inner ?? '';
+    let networks: SimPouProgram['networks'] = [];
+    let sfcChart: SfcChart | null = null;
+    let fbdDiagram: FbdDiagram | null = null;
+
     if (lang === '1') {
       const rawNets = ldNetworks(pouMatch.inner);
       rawNets.forEach((raw, idx) => {
@@ -587,12 +815,54 @@ function parseProjectForSim(rawBytes: Buffer) {
         }
         networks.push({ index: idx + 1, net_id: netId, label, active: netActive, il });
       });
+    } else if (lang === '3') {
+      networks = parseIlCodeToNetworks(stCode);
+    } else if (lang === '4') {
+      sfcChart = parseSfcFromPouBody(pouMatch.inner).chart;
+    } else if (lang === '5') {
+      fbdDiagram = parseFbdFromPouBody(pouMatch.inner).diagram;
     }
-    const stCode = sections(pouMatch.inner, 'IL_ST_CODE')[0]?.inner ?? '';
-    pouPrograms.push({ name, lang, pouType, active, localVars, networks, stCode });
+
+    pouPrograms.push({ name, lang, pouType, active, localVars, networks, stCode, sfcChart, fbdDiagram });
   }
 
-  return { info, tasks, symbols, dutFields, pouPrograms };
+  // Register user-defined FB instances declared as symbols (e.g., Motor1 : MotorFB)
+  const userFbs = new Map<string, SimPouProgram>();
+  for (const p of pouPrograms) {
+    if (p.pouType === '1') userFbs.set(p.name.toUpperCase(), p);
+  }
+  for (const [symName, sym] of [...symbols.entries()]) {
+    const fbDef = userFbs.get(sym.type.toUpperCase());
+    if (fbDef && !fbInstances.has(symName.toUpperCase())) {
+      const fields: Record<string, number | boolean> = {};
+      for (const lv of fbDef.localVars) {
+        fields[lv.identifier] = lv.initial;
+        symbols.set(`${symName}.${lv.identifier}`, {
+          address: null,
+          type: lv.type,
+          value: lv.initial,
+          initial: lv.initial,
+        });
+      }
+      fbInstances.set(symName.toUpperCase(), { type: fbDef.name, fields, internal: {} });
+    }
+  }
+
+  return { info, tasks, symbols, dutFields, pouPrograms, hwConfig, retainConfig, deviceInit, fbInstances };
+}
+
+function seedModuleBfmFromHwConfig(sess: SimulatorSession): void {
+  sess.moduleBfm.clear();
+  for (const mod of sess.hwConfig.modules) {
+    const crMap = new Map<number, number>();
+    for (const [k, v] of Object.entries(mod.cr_init ?? {})) {
+      const crNum = Number(k);
+      if (Number.isInteger(crNum) && crNum >= 0) {
+        crMap.set(crNum, Math.trunc(Number(v) || 0));
+      }
+    }
+    sess.moduleBfm.set(mod.slot, crMap);
+  }
 }
 
 function seedInitialSymbolMemory(sess: SimulatorSession): void {
@@ -601,6 +871,8 @@ function seedInitialSymbolMemory(sess: SimulatorSession): void {
     if (sym.address) {
       if (isBitAddress(sym.address) || sym.type.toUpperCase() === 'BOOL') {
         sess.bits.set(normAddr(sym.address), Boolean(sym.initial));
+      } else if (isFloatType(sym.type)) {
+        writeFloat32(sess, sym.address, Number(sym.initial) || 0);
       } else {
         sess.words.set(normAddr(sym.address), Number(sym.initial) || 0);
       }
@@ -610,6 +882,27 @@ function seedInitialSymbolMemory(sess: SimulatorSession): void {
       sess.words.set(normAddr(name), Number(sym.initial) || 0);
     }
   }
+  for (const entry of sess.deviceInit) {
+    const dev = normAddr(entry.device);
+    const dt = entry.data_type.toUpperCase();
+    if (dt === 'BOOL' || isBitAddress(dev)) {
+      sess.bits.set(dev, Boolean(entry.value));
+    } else if (dt === 'REAL') {
+      writeFloat32(sess, dev, Number(entry.value) || 0);
+    } else if (dt === 'DINT' || dt === 'DWORD') {
+      writeDWord(sess, dev, Number(entry.value) || 0);
+    } else if (dt === 'STRING') {
+      const s = String(entry.value ?? '');
+      for (let i = 0; i < Math.ceil(s.length / 2); i++) {
+        const lo = s.charCodeAt(i * 2) || 0;
+        const hi = s.charCodeAt(i * 2 + 1) || 0;
+        sess.words.set(shiftIndexedDevice(dev, i), toInt16((hi << 8) | lo));
+      }
+    } else {
+      sess.words.set(dev, toInt16(Number(entry.value) || 0));
+    }
+  }
+  seedModuleBfmFromHwConfig(sess);
 }
 
 function computeSessionMemoryBreakdown(sess: SimulatorSession): MemoryBreakdown {
@@ -692,7 +985,8 @@ export function startSimulatorSession(projectPath: string, scanIntervalMs = 100)
     );
   }
   const rawBytes = readFileBuffer(projectPath);
-  const { info, tasks, symbols, dutFields, pouPrograms } = parseProjectForSim(rawBytes);
+  const { info, tasks, symbols, dutFields, pouPrograms, hwConfig, retainConfig, deviceInit, fbInstances } =
+    parseProjectForSim(rawBytes);
 
   const sessionId = `sim-${nextSimId++}`;
   const defaultWatch = ['X0', 'X1', 'Y0', 'M0', 'M10', 'T0', 'D10', 'D100'];
@@ -723,10 +1017,21 @@ export function startSimulatorSession(projectPath: string, scanIntervalMs = 100)
     counters: new Map(),
     symbols,
     dutFields,
+    hwConfig,
+    retainConfig,
+    deviceInit,
+    moduleBfm: new Map(),
+    sfcStates: new Map(),
+    pidStates: new Map(),
+    fbInstances,
+    taskLastRunMs: new Map(),
+    interruptsEnabled: true,
     tasks,
     pouPrograms,
     lastRungTrace: [],
     lastStTrace: [],
+    lastSfcTrace: [],
+    lastFbdTrace: [],
     watchLists: new Map([['default', defaultWatch]]),
     traceBuffer: [],
     breakpoints: [],
@@ -746,7 +1051,8 @@ export function reloadSimulatorSession(sessionId: string, projectPath?: string, 
   const sess = getSession(sessionId);
   const targetPath = projectPath?.trim() || sess.project_path;
   const rawBytes = readFileBuffer(targetPath);
-  const { info, tasks, symbols, dutFields, pouPrograms } = parseProjectForSim(rawBytes);
+  const { info, tasks, symbols, dutFields, pouPrograms, hwConfig, retainConfig, deviceInit, fbInstances } =
+    parseProjectForSim(rawBytes);
 
   sess.project_path = targetPath;
   sess.project_hash = computeContentHash('isp', rawBytes);
@@ -756,6 +1062,9 @@ export function reloadSimulatorSession(sessionId: string, projectPath?: string, 
   sess.pouPrograms = pouPrograms;
   sess.dutFields = dutFields;
   sess.symbols = symbols;
+  sess.hwConfig = hwConfig;
+  sess.retainConfig = retainConfig;
+  sess.deviceInit = deviceInit;
   sess.edgeStates.clear();
 
   if (resetState) {
@@ -770,14 +1079,22 @@ export function reloadSimulatorSession(sessionId: string, projectPath?: string, 
     sess.counters.clear();
     sess.forcedBits.clear();
     sess.forcedWords.clear();
+    sess.sfcStates.clear();
+    sess.pidStates.clear();
+    sess.fbInstances = fbInstances;
+    sess.taskLastRunMs.clear();
     sess.lastRungTrace = [];
     sess.lastStTrace = [];
+    sess.lastSfcTrace = [];
+    sess.lastFbdTrace = [];
     sess.traceBuffer = [];
     sess.lastBreakpointHit = null;
     seedInitialSymbolMemory(sess);
     resetDiagnosticsState(sess);
   } else {
-    // Clear stale POU/network timing buckets so reloaded code is measured cleanly
+    for (const [k, v] of fbInstances.entries()) {
+      if (!sess.fbInstances.has(k)) sess.fbInstances.set(k, v);
+    }
     resetDiagnosticsState(sess);
   }
   return monitorSimulator(sessionId);
@@ -797,8 +1114,11 @@ function evalContact(sess: SimulatorSession, op: string, ops: string[]): boolean
     const prev = sess.prevBits.get(resolveHardwareOrWordKey(sess, addr)) ?? false;
     return !cur && prev;
   }
-  const a = parseConst(ops[0] ?? '0', sess);
-  const b = parseConst(ops[1] ?? '0', sess);
+  const is32 = op.startsWith('D');
+  const a = is32 ? readDWord(sess, ops[0] ?? '0') : parseConst(ops[0] ?? '0', sess);
+  const b = is32 ? readDWord(sess, ops[1] ?? '0') : parseConst(ops[1] ?? '0', sess);
+  if (op.endsWith('<>')) return a !== b;
+  if (op.endsWith('>=')) return a >= b;
   if (op.endsWith('<=')) return a <= b;
   if (op.endsWith('=')) return a === b;
   if (op.endsWith('>')) return a > b;
@@ -806,16 +1126,70 @@ function evalContact(sess: SimulatorSession, op: string, ops: string[]): boolean
   return false;
 }
 
-const INPUT_OPS = new Set([
-  'LD', 'LDI', 'LDP', 'LDF', 'AND', 'ANI', 'ANDP', 'ANDF', 'OR', 'ORI', 'ORP', 'ORF',
-  'LD=', 'LD<=', 'LD>', 'LD<', 'AND=', 'AND<=', 'AND>', 'AND<', 'ANB', 'ORB',
+const LD_STARTER_OPS = new Set([
+  'LD', 'LDI', 'LDP', 'LDF',
+  'LD=', 'LD<>', 'LD>', 'LD>=', 'LD<', 'LD<=',
+  'DLD=', 'DLD<>', 'DLD>', 'DLD>=', 'DLD<', 'DLD<=',
 ]);
+const AND_CONTACT_OPS = new Set([
+  'AND', 'ANI', 'ANDP', 'ANDF',
+  'AND=', 'AND<>', 'AND>', 'AND>=', 'AND<', 'AND<=',
+  'DAND=', 'DAND<>', 'DAND>', 'DAND>=', 'DAND<', 'DAND<=',
+]);
+const OR_CONTACT_OPS = new Set([
+  'OR', 'ORI', 'ORP', 'ORF',
+  'OR=', 'OR<>', 'OR>', 'OR>=', 'OR<', 'OR<=',
+  'DOR=', 'DOR<>', 'DOR>', 'DOR>=', 'DOR<', 'DOR<=',
+]);
+
+const INPUT_OPS = new Set([
+  ...LD_STARTER_OPS,
+  ...AND_CONTACT_OPS,
+  ...OR_CONTACT_OPS,
+  'ANB', 'ORB', 'INV',
+]);
+
+const PULSEABLE_BASE_OPS = new Set([
+  'MOV', 'DMOV', 'BMOV', 'FMOV', 'ADD', 'DADD', 'SUB', 'DSUB', 'MUL', 'DMUL', 'DIV', 'DDIV',
+  'INC', 'DINC', 'DEC', 'DDEC', 'ANDW', 'ORW', 'XORW', 'DANDW', 'DORW', 'DXORW', 'NEG', 'DNEG',
+  'SWAP', 'XCH', 'CMP', 'DCMP', 'ZCP', 'DZCP', 'ALT', 'ZRST', 'ROL', 'ROR', 'DROL', 'DROR',
+  'SHL', 'SHR', 'SFTL', 'SFTR', 'DECO', 'ENCO', 'SUM', 'DSUM', 'BON', 'DBON', 'BCD', 'DBCD',
+  'BIN', 'DBIN', 'FLT', 'DFLT', 'INT', 'DINT', 'EADD', 'ESUB', 'EMUL', 'EDIV', 'ESQR',
+  'ECMP', 'EZCP', 'SQR', 'DSQR', 'SCL', 'MEAN', 'SORT', 'FROM', 'DFROM', 'TO', 'DTO',
+  'TRD', 'TWR', 'MODRD', 'MODWR', 'MODRW',
+]);
+
+function intToBcd16(n: number): number {
+  const clamped = Math.max(0, Math.min(9999, Math.trunc(Math.abs(n))));
+  const d3 = Math.floor(clamped / 1000) % 10;
+  const d2 = Math.floor(clamped / 100) % 10;
+  const d1 = Math.floor(clamped / 10) % 10;
+  const d0 = clamped % 10;
+  return (d3 << 12) | (d2 << 8) | (d1 << 4) | d0;
+}
+
+function bcd16ToInt(bcd: number): number {
+  const u = bcd & 0xffff;
+  const d3 = (u >>> 12) & 0xf;
+  const d2 = (u >>> 8) & 0xf;
+  const d1 = (u >>> 4) & 0xf;
+  const d0 = u & 0xf;
+  return d3 * 1000 + d2 * 100 + d1 * 10 + d0;
+}
+
+function updateAluFlags(sess: SimulatorSession, rawResult: number, is32 = false): void {
+  const min = is32 ? -2147483648 : -32768;
+  const max = is32 ? 2147483647 : 32767;
+  sess.bits.set('M1020', rawResult === 0);
+  sess.bits.set('M1021', rawResult < min);
+  sess.bits.set('M1022', rawResult > max);
+}
 
 function execOutputInstruction(
   sess: SimulatorSession,
   pouName: string,
   netIndex: number,
-  op: string,
+  rawOp: string,
   ops: string[],
   powerIn: boolean,
   outputsWritten: Record<string, boolean | number>,
@@ -826,7 +1200,8 @@ function execOutputInstruction(
     endMain?: boolean;
   },
 ): void {
-  if (op === 'SRET') {
+  let op = rawOp.toUpperCase();
+  if (op === 'SRET' || op === 'IRET') {
     if (flow) flow.subReturn = true;
     return;
   }
@@ -834,9 +1209,27 @@ function execOutputInstruction(
     if (flow) flow.endMain = true;
     return;
   }
-  if (op === 'WDT') {
+  if (op === 'WDT' || op === 'NOP') {
     return;
   }
+  if (op === 'EI') {
+    sess.interruptsEnabled = true;
+    return;
+  }
+  if (op === 'DI') {
+    sess.interruptsEnabled = false;
+    return;
+  }
+
+  // Handle pulse-triggered (P suffix) application instructions (e.g., MOVP, ADDP, INCP, SCLP, FROMP)
+  if (op.length > 2 && op.endsWith('P') && PULSEABLE_BASE_OPS.has(op.slice(0, -1))) {
+    const edgeKey = `${pouName}:${netIndex}:PULSE:${op}:${ops.join(',')}`;
+    const prev = sess.edgeStates.get(edgeKey) ?? false;
+    sess.edgeStates.set(edgeKey, powerIn);
+    if (!(powerIn && !prev)) return;
+    op = op.slice(0, -1);
+  }
+
   if (op === 'OUT') {
     writeBit(sess, ops[0], powerIn);
     outputsWritten[resolveHardwareOrWordKey(sess, ops[0])] = readBit(sess, ops[0]);
@@ -895,7 +1288,7 @@ function execOutputInstruction(
     return;
   }
   if (op === 'TMR') {
-    const tAddr = normAddr(ops[0]);
+    const tAddr = resolveHardwareOrWordKey(sess, ops[0]);
     const sv = Math.max(0, parseConst(ops[1] ?? '0', sess));
     const baseMs = timerTimebaseMs(tAddr);
     const t = sess.timers.get(tAddr) ?? { pv: 0, sv, done: false, prevIn: false, accMs: 0, baseMs };
@@ -921,12 +1314,11 @@ function execOutputInstruction(
     return;
   }
   if (op === 'CNT' || op === 'DCNT') {
-    const cAddr = normAddr(ops[0]);
+    const cAddr = resolveHardwareOrWordKey(sess, ops[0]);
     const sv = parseConst(ops[1] ?? '0', sess);
     const c = sess.counters.get(cAddr) ?? { pv: 0, sv, done: false, prevIn: false };
     c.sv = sv;
     if (powerIn && !c.prevIn) {
-      // Delta DCNT direction relay M(1000 + counter_num), e.g., M1200 for C200
       const cm = /^C(\d+)$/.exec(cAddr);
       const dirDown = op === 'DCNT' && cm ? readBit(sess, `M${1000 + parseInt(cm[1], 10)}`) : false;
       c.pv += dirDown ? -1 : 1;
@@ -945,9 +1337,9 @@ function execOutputInstruction(
     if (flow) flow.jumpToLabel = ops[0]?.trim();
   } else if (op === 'CALL') {
     if (flow) flow.callTarget = ops[0]?.trim();
-  } else if (op === 'CMP') {
-    const s1 = toInt16(parseConst(ops[0], sess));
-    const s2 = toInt16(parseConst(ops[1], sess));
+  } else if (op === 'CMP' || op === 'DCMP') {
+    const s1 = op === 'DCMP' ? readDWord(sess, ops[0]) : toInt16(parseConst(ops[0], sess));
+    const s2 = op === 'DCMP' ? readDWord(sess, ops[1]) : toInt16(parseConst(ops[1], sess));
     const d0 = resolveHardwareOrWordKey(sess, ops[2]);
     const d1 = shiftIndexedDevice(d0, 1);
     const d2 = shiftIndexedDevice(d0, 2);
@@ -957,10 +1349,10 @@ function execOutputInstruction(
     outputsWritten[d0] = s1 > s2;
     outputsWritten[d1] = s1 === s2;
     outputsWritten[d2] = s1 < s2;
-  } else if (op === 'ZCP') {
-    const s1 = toInt16(parseConst(ops[0], sess));
-    const s2 = toInt16(parseConst(ops[1], sess));
-    const s = toInt16(parseConst(ops[2], sess));
+  } else if (op === 'ZCP' || op === 'DZCP') {
+    const s1 = op === 'DZCP' ? readDWord(sess, ops[0]) : toInt16(parseConst(ops[0], sess));
+    const s2 = op === 'DZCP' ? readDWord(sess, ops[1]) : toInt16(parseConst(ops[1], sess));
+    const s = op === 'DZCP' ? readDWord(sess, ops[2]) : toInt16(parseConst(ops[2], sess));
     const d0 = resolveHardwareOrWordKey(sess, ops[3]);
     const d1 = shiftIndexedDevice(d0, 1);
     const d2 = shiftIndexedDevice(d0, 2);
@@ -976,9 +1368,19 @@ function execOutputInstruction(
     const res = toInt16(op === 'ANDW' ? a & b : op === 'ORW' ? a | b : a ^ b);
     writeWord(sess, ops[2], res);
     outputsWritten[resolveHardwareOrWordKey(sess, ops[2])] = res;
+  } else if (op === 'DANDW' || op === 'DORW' || op === 'DXORW') {
+    const a = readDWord(sess, ops[0]);
+    const b = readDWord(sess, ops[1]);
+    const res = toInt32(op === 'DANDW' ? a & b : op === 'DORW' ? a | b : a ^ b);
+    writeDWord(sess, ops[2], res);
+    outputsWritten[resolveHardwareOrWordKey(sess, ops[2])] = res;
   } else if (op === 'NEG') {
     const res = toInt16(-readWord(sess, ops[0]));
     writeWord(sess, ops[0], res);
+    outputsWritten[resolveHardwareOrWordKey(sess, ops[0])] = res;
+  } else if (op === 'DNEG') {
+    const res = toInt32(-readDWord(sess, ops[0]));
+    writeDWord(sess, ops[0], res);
     outputsWritten[resolveHardwareOrWordKey(sess, ops[0])] = res;
   } else if (op === 'SWAP') {
     const cur = readWord(sess, ops[0]) & 0xffff;
@@ -1002,55 +1404,79 @@ function execOutputInstruction(
     outputsWritten[resolveHardwareOrWordKey(sess, ops[1])] = val;
   } else if (op === 'BMOV') {
     const count = Math.max(0, Math.min(256, parseConst(ops[2] ?? '1', sess)));
+    const srcBase = resolveHardwareOrWordKey(sess, ops[0]);
+    const dstBase = resolveHardwareOrWordKey(sess, ops[1]);
     for (let i = 0; i < count; i++) {
-      const val = readWord(sess, shiftIndexedDevice(ops[0], i));
-      const dst = shiftIndexedDevice(ops[1], i);
+      const val = readWord(sess, shiftIndexedDevice(srcBase, i));
+      const dst = shiftIndexedDevice(dstBase, i);
       writeWord(sess, dst, val);
       outputsWritten[dst] = val;
     }
   } else if (op === 'FMOV') {
     const val = toInt16(parseConst(ops[0], sess));
     const count = Math.max(0, Math.min(256, parseConst(ops[2] ?? '1', sess)));
+    const dstBase = resolveHardwareOrWordKey(sess, ops[1]);
     for (let i = 0; i < count; i++) {
-      const dst = shiftIndexedDevice(ops[1], i);
+      const dst = shiftIndexedDevice(dstBase, i);
       writeWord(sess, dst, val);
       outputsWritten[dst] = val;
     }
   } else if (op === 'ADD') {
-    const val = toInt16(parseConst(ops[0], sess) + parseConst(ops[1], sess));
+    const raw = parseConst(ops[0], sess) + parseConst(ops[1], sess);
+    updateAluFlags(sess, raw, false);
+    const val = toInt16(raw);
     writeWord(sess, ops[2], val);
     outputsWritten[resolveHardwareOrWordKey(sess, ops[2])] = val;
   } else if (op === 'DADD') {
-    const val = toInt32(readDWord(sess, ops[0]) + readDWord(sess, ops[1]));
+    const raw = readDWord(sess, ops[0]) + readDWord(sess, ops[1]);
+    updateAluFlags(sess, raw, true);
+    const val = toInt32(raw);
     writeDWord(sess, ops[2], val);
     outputsWritten[resolveHardwareOrWordKey(sess, ops[2])] = val;
   } else if (op === 'SUB') {
-    const val = toInt16(parseConst(ops[0], sess) - parseConst(ops[1], sess));
+    const raw = parseConst(ops[0], sess) - parseConst(ops[1], sess);
+    updateAluFlags(sess, raw, false);
+    const val = toInt16(raw);
     writeWord(sess, ops[2], val);
     outputsWritten[resolveHardwareOrWordKey(sess, ops[2])] = val;
   } else if (op === 'DSUB') {
-    const val = toInt32(readDWord(sess, ops[0]) - readDWord(sess, ops[1]));
+    const raw = readDWord(sess, ops[0]) - readDWord(sess, ops[1]);
+    updateAluFlags(sess, raw, true);
+    const val = toInt32(raw);
     writeDWord(sess, ops[2], val);
     outputsWritten[resolveHardwareOrWordKey(sess, ops[2])] = val;
   } else if (op === 'MUL') {
-    const val = toInt16(parseConst(ops[0], sess) * parseConst(ops[1], sess));
+    const raw = parseConst(ops[0], sess) * parseConst(ops[1], sess);
+    updateAluFlags(sess, raw, false);
+    const val = toInt16(raw);
     writeWord(sess, ops[2], val);
     outputsWritten[resolveHardwareOrWordKey(sess, ops[2])] = val;
   } else if (op === 'DMUL') {
-    const val = toInt32(readDWord(sess, ops[0]) * readDWord(sess, ops[1]));
+    const raw = readDWord(sess, ops[0]) * readDWord(sess, ops[1]);
+    updateAluFlags(sess, raw, true);
+    const val = toInt32(raw);
     writeDWord(sess, ops[2], val);
     outputsWritten[resolveHardwareOrWordKey(sess, ops[2])] = val;
   } else if (op === 'DIV') {
     const denom = parseConst(ops[1], sess);
     if (denom !== 0) {
-      const val = toInt16(Math.trunc(parseConst(ops[0], sess) / denom));
-      writeWord(sess, ops[2], val);
-      outputsWritten[resolveHardwareOrWordKey(sess, ops[2])] = val;
+      const numer = parseConst(ops[0], sess);
+      const val = toInt16(Math.trunc(numer / denom));
+      const rem = toInt16(numer % denom);
+      updateAluFlags(sess, val, false);
+      const dst = resolveHardwareOrWordKey(sess, ops[2]);
+      writeWord(sess, dst, val);
+      if (/^[DRVZ]\d+$/i.test(dst)) {
+        writeWord(sess, shiftIndexedDevice(dst, 1), rem);
+      }
+      outputsWritten[dst] = val;
     }
   } else if (op === 'DDIV') {
     const denom = readDWord(sess, ops[1]);
     if (denom !== 0) {
-      const val = toInt32(Math.trunc(readDWord(sess, ops[0]) / denom));
+      const numer = readDWord(sess, ops[0]);
+      const val = toInt32(Math.trunc(numer / denom));
+      updateAluFlags(sess, val, true);
       writeDWord(sess, ops[2], val);
       outputsWritten[resolveHardwareOrWordKey(sess, ops[2])] = val;
     }
@@ -1070,13 +1496,285 @@ function execOutputInstruction(
     const val = toInt32(readDWord(sess, ops[0]) - 1);
     writeDWord(sess, ops[0], val);
     outputsWritten[resolveHardwareOrWordKey(sess, ops[0])] = val;
+  } else if (op === 'SQR' || op === 'DSQR') {
+    const src = Math.max(0, op === 'DSQR' ? readDWord(sess, ops[0]) : parseConst(ops[0], sess));
+    const res = Math.trunc(Math.sqrt(src));
+    if (op === 'DSQR') writeDWord(sess, ops[1], res);
+    else writeWord(sess, ops[1], toInt16(res));
+    outputsWritten[resolveHardwareOrWordKey(sess, ops[1])] = res;
+  } else if (op === 'ROL' || op === 'ROR' || op === 'SHL' || op === 'SHR') {
+    const target = resolveHardwareOrWordKey(sess, ops[0]);
+    const n = Math.max(0, Math.min(16, parseConst(ops[1] ?? '1', sess)));
+    const w = readWord(sess, target) & 0xffff;
+    let out = w;
+    if (op === 'ROL') out = ((w << (n % 16)) | (w >>> (16 - (n % 16)))) & 0xffff;
+    else if (op === 'ROR') out = ((w >>> (n % 16)) | (w << (16 - (n % 16)))) & 0xffff;
+    else if (op === 'SHL') out = (w << n) & 0xffff;
+    else if (op === 'SHR') out = (w >>> n) & 0xffff;
+    const res = toInt16(out);
+    writeWord(sess, target, res);
+    outputsWritten[target] = res;
+  } else if (op === 'DROL' || op === 'DROR') {
+    const target = resolveHardwareOrWordKey(sess, ops[0]);
+    const n = ((parseConst(ops[1] ?? '1', sess) % 32) + 32) % 32;
+    const v = readDWord(sess, target) >>> 0;
+    const out = op === 'DROL' ? ((v << n) | (v >>> (32 - n))) : ((v >>> n) | (v << (32 - n)));
+    const res = toInt32(out);
+    writeDWord(sess, target, res);
+    outputsWritten[target] = res;
+  } else if (op === 'SFTL' || op === 'SFTR') {
+    const srcBase = resolveHardwareOrWordKey(sess, ops[0]);
+    const dstBase = resolveHardwareOrWordKey(sess, ops[1]);
+    const totalBits = Math.max(1, Math.min(256, parseConst(ops[2] ?? '8', sess)));
+    const shiftBits = Math.max(1, Math.min(totalBits, parseConst(ops[3] ?? '1', sess)));
+    const cur: boolean[] = [];
+    for (let i = 0; i < totalBits; i++) cur.push(readBit(sess, shiftIndexedDevice(dstBase, i)));
+    const inBits: boolean[] = [];
+    for (let i = 0; i < shiftBits; i++) inBits.push(readBit(sess, shiftIndexedDevice(srcBase, i)));
+    const next = new Array<boolean>(totalBits).fill(false);
+    if (op === 'SFTL') {
+      for (let i = 0; i < totalBits; i++) {
+        next[i] = i < shiftBits ? inBits[i] : cur[i - shiftBits];
+      }
+    } else {
+      for (let i = 0; i < totalBits; i++) {
+        next[i] = i >= totalBits - shiftBits ? inBits[i - (totalBits - shiftBits)] : cur[i + shiftBits];
+      }
+    }
+    for (let i = 0; i < totalBits; i++) {
+      const addr = shiftIndexedDevice(dstBase, i);
+      writeBit(sess, addr, next[i]);
+      outputsWritten[addr] = next[i];
+    }
+  } else if (op === 'DECO') {
+    const n = Math.max(1, Math.min(8, parseConst(ops[2] ?? '4', sess)));
+    const val = parseConst(ops[0], sess) & ((1 << n) - 1);
+    const dstBase = resolveHardwareOrWordKey(sess, ops[1]);
+    if (isBitAddress(dstBase)) {
+      for (let i = 0; i < (1 << n); i++) {
+        const addr = shiftIndexedDevice(dstBase, i);
+        writeBit(sess, addr, i === val);
+        outputsWritten[addr] = i === val;
+      }
+    } else {
+      const out = toInt16(1 << (val & 0xf));
+      writeWord(sess, dstBase, out);
+      outputsWritten[dstBase] = out;
+    }
+  } else if (op === 'ENCO') {
+    const n = Math.max(1, Math.min(8, parseConst(ops[2] ?? '4', sess)));
+    const srcBase = resolveHardwareOrWordKey(sess, ops[0]);
+    let highest = 0;
+    if (isBitAddress(srcBase)) {
+      for (let i = 0; i < (1 << n); i++) {
+        if (readBit(sess, shiftIndexedDevice(srcBase, i))) highest = i;
+      }
+    } else {
+      const w = readWord(sess, srcBase) & 0xffff;
+      for (let i = 0; i < Math.min(16, 1 << n); i++) {
+        if ((w >>> i) & 1) highest = i;
+      }
+    }
+    const dst = resolveHardwareOrWordKey(sess, ops[1]);
+    writeWord(sess, dst, highest);
+    outputsWritten[dst] = highest;
+  } else if (op === 'SUM' || op === 'DSUM') {
+    let v = op === 'DSUM' ? readDWord(sess, ops[0]) >>> 0 : parseConst(ops[0], sess) & 0xffff;
+    let cnt = 0;
+    while (v !== 0) {
+      cnt += v & 1;
+      v >>>= 1;
+    }
+    const dst = resolveHardwareOrWordKey(sess, ops[1]);
+    writeWord(sess, dst, cnt);
+    sess.bits.set('M1020', cnt === 0);
+    outputsWritten[dst] = cnt;
+  } else if (op === 'BON' || op === 'DBON') {
+    const v = op === 'DBON' ? readDWord(sess, ops[0]) >>> 0 : parseConst(ops[0], sess) & 0xffff;
+    const bitIdx = Math.max(0, Math.min(op === 'DBON' ? 31 : 15, parseConst(ops[2] ?? '0', sess)));
+    const bitOn = ((v >>> bitIdx) & 1) === 1;
+    const dst = resolveHardwareOrWordKey(sess, ops[1]);
+    writeBit(sess, dst, bitOn);
+    outputsWritten[dst] = bitOn;
+  } else if (op === 'BCD' || op === 'DBCD') {
+    const src = op === 'DBCD' ? readDWord(sess, ops[0]) : parseConst(ops[0], sess);
+    const out = intToBcd16(src);
+    if (op === 'DBCD') writeDWord(sess, ops[1], out);
+    else writeWord(sess, ops[1], toInt16(out));
+    outputsWritten[resolveHardwareOrWordKey(sess, ops[1])] = out;
+  } else if (op === 'BIN' || op === 'DBIN') {
+    const src = op === 'DBIN' ? readDWord(sess, ops[0]) : parseConst(ops[0], sess);
+    const out = bcd16ToInt(src);
+    if (op === 'DBIN') writeDWord(sess, ops[1], out);
+    else writeWord(sess, ops[1], toInt16(out));
+    outputsWritten[resolveHardwareOrWordKey(sess, ops[1])] = out;
+  } else if (op === 'FLT' || op === 'DFLT') {
+    const src = op === 'DFLT' ? readDWord(sess, ops[0]) : parseConst(ops[0], sess);
+    writeFloat32(sess, ops[1], src);
+    outputsWritten[resolveHardwareOrWordKey(sess, ops[1])] = src;
+  } else if (op === 'INT' || op === 'DINT') {
+    const f = readFloat32(sess, ops[0]);
+    const iv = Math.trunc(f);
+    if (op === 'DINT') writeDWord(sess, ops[1], iv);
+    else writeWord(sess, ops[1], toInt16(iv));
+    outputsWritten[resolveHardwareOrWordKey(sess, ops[1])] = iv;
+  } else if (op === 'EADD' || op === 'ESUB' || op === 'EMUL' || op === 'EDIV') {
+    const a = readFloat32(sess, ops[0]);
+    const b = readFloat32(sess, ops[1]);
+    let res = 0;
+    if (op === 'EADD') res = a + b;
+    else if (op === 'ESUB') res = a - b;
+    else if (op === 'EMUL') res = a * b;
+    else if (op === 'EDIV') res = b !== 0 ? a / b : 0;
+    writeFloat32(sess, ops[2], res);
+    outputsWritten[resolveHardwareOrWordKey(sess, ops[2])] = Math.round(res * 10000) / 10000;
+  } else if (op === 'ESQR') {
+    const a = Math.max(0, readFloat32(sess, ops[0]));
+    const res = Math.sqrt(a);
+    writeFloat32(sess, ops[1], res);
+    outputsWritten[resolveHardwareOrWordKey(sess, ops[1])] = Math.round(res * 10000) / 10000;
+  } else if (op === 'ECMP') {
+    const a = readFloat32(sess, ops[0]);
+    const b = readFloat32(sess, ops[1]);
+    const d0 = resolveHardwareOrWordKey(sess, ops[2]);
+    const d1 = shiftIndexedDevice(d0, 1);
+    const d2 = shiftIndexedDevice(d0, 2);
+    writeBit(sess, d0, a > b);
+    writeBit(sess, d1, Math.abs(a - b) < 1e-6);
+    writeBit(sess, d2, a < b);
+    outputsWritten[d0] = a > b;
+    outputsWritten[d1] = Math.abs(a - b) < 1e-6;
+    outputsWritten[d2] = a < b;
+  } else if (op === 'EZCP') {
+    const s1 = readFloat32(sess, ops[0]);
+    const s2 = readFloat32(sess, ops[1]);
+    const s = readFloat32(sess, ops[2]);
+    const d0 = resolveHardwareOrWordKey(sess, ops[3]);
+    const d1 = shiftIndexedDevice(d0, 1);
+    const d2 = shiftIndexedDevice(d0, 2);
+    writeBit(sess, d0, s < s1);
+    writeBit(sess, d1, s >= s1 && s <= s2);
+    writeBit(sess, d2, s > s2);
+    outputsWritten[d0] = s < s1;
+    outputsWritten[d1] = s >= s1 && s <= s2;
+    outputsWritten[d2] = s > s2;
+  } else if (op === 'MEAN') {
+    const srcBase = resolveHardwareOrWordKey(sess, ops[0]);
+    const n = Math.max(1, Math.min(64, parseConst(ops[2] ?? '1', sess)));
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += readWord(sess, shiftIndexedDevice(srcBase, i));
+    const avg = toInt16(Math.trunc(sum / n));
+    writeWord(sess, ops[1], avg);
+    outputsWritten[resolveHardwareOrWordKey(sess, ops[1])] = avg;
+  } else if (op === 'SORT') {
+    const srcBase = resolveHardwareOrWordKey(sess, ops[0]);
+    const n = Math.max(1, Math.min(64, parseConst(ops[1] ?? '1', sess)));
+    const vals: number[] = [];
+    for (let i = 0; i < n; i++) vals.push(readWord(sess, shiftIndexedDevice(srcBase, i)));
+    vals.sort((a, b) => a - b);
+    const dstBase = ops[2] ? resolveHardwareOrWordKey(sess, ops[2]) : srcBase;
+    for (let i = 0; i < n; i++) {
+      const dst = shiftIndexedDevice(dstBase, i);
+      writeWord(sess, dst, vals[i]);
+      outputsWritten[dst] = vals[i];
+    }
+  } else if (op === 'SCL') {
+    // Delta SCL S1 S2 D: S2=srcMax, S2+1=srcMin, S2+2=dstMax, S2+3=dstMin
+    const x = parseConst(ops[0], sess);
+    const pBase = resolveHardwareOrWordKey(sess, ops[1]);
+    const srcMax = readWord(sess, pBase);
+    const srcMin = readWord(sess, shiftIndexedDevice(pBase, 1));
+    const dstMax = readWord(sess, shiftIndexedDevice(pBase, 2));
+    const dstMin = readWord(sess, shiftIndexedDevice(pBase, 3));
+    const span = srcMax - srcMin;
+    const scaled = span !== 0 ? Math.round(dstMin + ((x - srcMin) * (dstMax - dstMin)) / span) : dstMin;
+    const out = toInt16(scaled);
+    writeWord(sess, ops[2], out);
+    outputsWritten[resolveHardwareOrWordKey(sess, ops[2])] = out;
+  } else if (op === 'PID') {
+    // Delta PID S1(SV) S2(PV) S3(param block) D(MV)
+    // S3+0: Ts (sampling time in 10ms units, default 10 -> 100ms)
+    // S3+1: Kp (proportional gain %, e.g. 100 = 1.0x)
+    // S3+2: Ti (integral time in 0.1s units, 0 = disabled)
+    // S3+3: Td (derivative time in 0.01s units, 0 = disabled)
+    // S3+4: Direction/mode (bit0=1 -> reverse action)
+    const sv = parseConst(ops[0], sess);
+    const pv = parseConst(ops[1], sess);
+    const pBase = resolveHardwareOrWordKey(sess, ops[2]);
+    const dst = resolveHardwareOrWordKey(sess, ops[3]);
+    const tsMs = Math.max(10, (readWord(sess, pBase) || 10) * 10);
+    const kp = (readWord(sess, shiftIndexedDevice(pBase, 1)) || 100) / 100;
+    const tiSec = (readWord(sess, shiftIndexedDevice(pBase, 2)) || 0) * 0.1;
+    const tdSec = (readWord(sess, shiftIndexedDevice(pBase, 3)) || 0) * 0.01;
+    const mode = readWord(sess, shiftIndexedDevice(pBase, 4));
+    const reverse = (mode & 1) === 1;
+    const dtSec = Math.max(0.01, sess.scan_interval_ms / 1000);
+    const pidKey = `${pouName}:${pBase}:${dst}`;
+    const state = sess.pidStates.get(pidKey) ?? { integral: 0, prevError: 0, prevPv: pv, initialized: false };
+    const err = reverse ? pv - sv : sv - pv;
+    const pTerm = kp * err;
+    if (tiSec > 0) {
+      state.integral = Math.max(-4000, Math.min(4000, state.integral + (kp / tiSec) * err * dtSec));
+    }
+    const dTerm = state.initialized && tdSec > 0 ? kp * tdSec * ((err - state.prevError) / Math.max(dtSec, tsMs / 1000)) : 0;
+    state.prevError = err;
+    state.prevPv = pv;
+    state.initialized = true;
+    sess.pidStates.set(pidKey, state);
+    const mv = toInt16(Math.max(0, Math.min(4000, Math.round(pTerm + state.integral + dTerm))));
+    writeWord(sess, dst, mv);
+    outputsWritten[dst] = mv;
+  } else if (op === 'FROM' || op === 'DFROM') {
+    const slot = parseConst(ops[0], sess);
+    const crStart = parseConst(ops[1], sess);
+    const dstBase = resolveHardwareOrWordKey(sess, ops[2]);
+    const n = Math.max(1, Math.min(64, parseConst(ops[3] ?? '1', sess)));
+    const modMap = sess.moduleBfm.get(slot) ?? new Map<number, number>();
+    for (let i = 0; i < n; i++) {
+      if (op === 'DFROM') {
+        const lo = (modMap.get(crStart + i * 2) ?? 0) & 0xffff;
+        const hi = (modMap.get(crStart + i * 2 + 1) ?? 0) & 0xffff;
+        const v32 = toInt32((hi << 16) | lo);
+        const dst = shiftIndexedDevice(dstBase, i * 2);
+        writeDWord(sess, dst, v32);
+        outputsWritten[dst] = v32;
+      } else {
+        const val = toInt16(modMap.get(crStart + i) ?? 0);
+        const dst = shiftIndexedDevice(dstBase, i);
+        writeWord(sess, dst, val);
+        outputsWritten[dst] = val;
+      }
+    }
+  } else if (op === 'TO' || op === 'DTO') {
+    const slot = parseConst(ops[0], sess);
+    const crStart = parseConst(ops[1], sess);
+    const n = Math.max(1, Math.min(64, parseConst(ops[3] ?? '1', sess)));
+    let modMap = sess.moduleBfm.get(slot);
+    if (!modMap) {
+      modMap = new Map<number, number>();
+      sess.moduleBfm.set(slot, modMap);
+    }
+    const isConstSrc = /^[KkHh]-?\d+$/i.test(ops[2].trim()) || /^-?\d+$/.test(ops[2].trim());
+    const srcBase = isConstSrc ? '' : resolveHardwareOrWordKey(sess, ops[2]);
+    for (let i = 0; i < n; i++) {
+      if (op === 'DTO') {
+        const v32 = isConstSrc ? toInt32(parseConst(ops[2], sess)) : readDWord(sess, shiftIndexedDevice(srcBase, i * 2));
+        modMap.set(crStart + i * 2, toInt16(v32 & 0xffff));
+        modMap.set(crStart + i * 2 + 1, toInt16((v32 >>> 16) & 0xffff));
+        outputsWritten[`MOD${slot}.CR${crStart + i * 2}`] = v32;
+      } else {
+        const val = isConstSrc ? toInt16(parseConst(ops[2], sess)) : readWord(sess, shiftIndexedDevice(srcBase, i));
+        modMap.set(crStart + i, val);
+        outputsWritten[`MOD${slot}.CR${crStart + i}`] = val;
+      }
+    }
   } else if (op === 'ALT') {
     const next = !readBit(sess, ops[0]);
     writeBit(sess, ops[0], next);
     outputsWritten[resolveHardwareOrWordKey(sess, ops[0])] = next;
   } else if (op === 'ZRST') {
-    const m1 = /^([A-Z]+)(\d+)$/i.exec(ops[0]);
-    const m2 = /^([A-Z]+)(\d+)$/i.exec(ops[1]);
+    const m1 = /^([A-Z]+)(\d+)$/i.exec(resolveHardwareOrWordKey(sess, ops[0]));
+    const m2 = /^([A-Z]+)(\d+)$/i.exec(resolveHardwareOrWordKey(sess, ops[1]));
     if (m1 && m2 && m1[1].toUpperCase() === m2[1].toUpperCase()) {
       const area = m1[1].toUpperCase();
       const isOctal = area === 'X' || area === 'Y';
@@ -1095,12 +1793,67 @@ function execOutputInstruction(
         outputsWritten[addr] = 0;
       }
     }
-  } else if (op === 'DPLSY') {
+  } else if (op === 'PLSY' || op === 'DPLSY' || op === 'PLSR' || op === 'PWM') {
     const freq = parseConst(ops[0], sess);
-    const pulses = parseConst(ops[1], sess);
-    const target = resolveHardwareOrWordKey(sess, ops[2]);
-    writeBit(sess, target, freq > 0 && pulses >= 0);
+    const pulsesOrPeriod = parseConst(ops[1], sess);
+    const target = resolveHardwareOrWordKey(sess, ops[ops.length - 1]);
+    const active = freq > 0 && pulsesOrPeriod >= 0;
+    writeBit(sess, target, active);
+    if (active && op !== 'PWM') {
+      const posReg = target === 'Y1' ? 'D1032' : 'D1030';
+      const delta = pulsesOrPeriod > 0 ? pulsesOrPeriod : Math.round((freq * sess.scan_interval_ms) / 1000);
+      writeDWord(sess, posReg, readDWord(sess, posReg) + delta);
+      sess.bits.set('M1029', true);
+    }
     outputsWritten[target] = readBit(sess, target);
+  } else if (op === 'DDRVI' || op === 'DDRVA') {
+    const dist = readDWord(sess, ops[0]);
+    const freq = readDWord(sess, ops[1]);
+    const pulseOut = resolveHardwareOrWordKey(sess, ops[2]);
+    const dirOut = resolveHardwareOrWordKey(sess, ops[3]);
+    const posReg = pulseOut === 'Y1' ? 'D1032' : 'D1030';
+    const curPos = readDWord(sess, posReg);
+    const nextPos = op === 'DDRVI' ? curPos + dist : dist;
+    writeBit(sess, pulseOut, freq > 0);
+    writeBit(sess, dirOut, nextPos < curPos);
+    writeDWord(sess, posReg, nextPos);
+    sess.bits.set('M1029', true);
+    outputsWritten[posReg] = nextPos;
+  } else if (op === 'ZRN' || op === 'DZRN') {
+    const pulseOut = resolveHardwareOrWordKey(sess, ops[3] ?? 'Y0');
+    const posReg = pulseOut === 'Y1' ? 'D1032' : 'D1030';
+    writeDWord(sess, posReg, 0);
+    sess.bits.set('M1029', true);
+    outputsWritten[posReg] = 0;
+  } else if (op === 'TRD') {
+    const dstBase = resolveHardwareOrWordKey(sess, ops[0]);
+    const now = new Date();
+    const vals = [now.getFullYear(), now.getMonth() + 1, now.getDate(), now.getHours(), now.getMinutes(), now.getSeconds(), now.getDay()];
+    vals.forEach((v, idx) => {
+      const addr = shiftIndexedDevice(dstBase, idx);
+      writeWord(sess, addr, v);
+      outputsWritten[addr] = v;
+    });
+  } else if (op === 'TWR') {
+    const srcBase = resolveHardwareOrWordKey(sess, ops[0]);
+    for (let i = 0; i < 7; i++) {
+      sess.words.set(`D${1013 + i}`, readWord(sess, shiftIndexedDevice(srcBase, i)));
+    }
+    outputsWritten['D1013'] = readWord(sess, 'D1013');
+  } else if (op === 'TCMP' || op === 'TZCP') {
+    const nowSec = (sess.words.get('D1016') ?? 0) * 3600 + (sess.words.get('D1017') ?? 0) * 60 + (sess.words.get('D1018') ?? 0);
+    if (op === 'TCMP') {
+      const refSec = parseConst(ops[0], sess) * 3600 + parseConst(ops[1], sess) * 60 + parseConst(ops[2], sess);
+      const d0 = resolveHardwareOrWordKey(sess, ops[4] ?? ops[3]);
+      writeBit(sess, d0, nowSec < refSec);
+      writeBit(sess, shiftIndexedDevice(d0, 1), nowSec === refSec);
+      writeBit(sess, shiftIndexedDevice(d0, 2), nowSec > refSec);
+      outputsWritten[d0] = nowSec < refSec;
+    }
+  } else if (op === 'MODRD' || op === 'MODWR' || op === 'MODRW') {
+    sess.bits.set('M1127', true);
+    sess.bits.set('M1129', false);
+    outputsWritten['M1127'] = true;
   }
 }
 
@@ -1169,6 +1922,8 @@ function executeLdPou(
     if (n.label) labelIndexMap.set(n.label.toUpperCase(), i);
   });
 
+  const forStack: Array<{ startIdx: number; remaining: number }> = [];
+
   while (idx < pou.networks.length) {
     const net = pou.networks[idx];
     if (!net.active) {
@@ -1201,7 +1956,7 @@ function executeLdPou(
       });
       break;
     }
-    if (firstOut?.[0] === 'SRET') {
+    if (firstOut?.[0] === 'SRET' || firstOut?.[0] === 'IRET') {
       trace.push({
         pou: pou.name,
         network_index: net.index,
@@ -1209,10 +1964,31 @@ function executeLdPou(
         label: net.label || undefined,
         active: true,
         energized: true,
-        il: ['SRET'],
+        il: [firstOut[0]],
         outputs_written: {},
       });
       if (stopOnSret) break;
+      idx += 1;
+      continue;
+    }
+    if (firstOut?.[0] === 'FOR') {
+      const iterations = Math.max(0, Math.min(2000, parseConst(firstOut[1][0] ?? '1', sess)));
+      if (iterations > 0) {
+        forStack.push({ startIdx: idx + 1, remaining: iterations });
+      }
+      idx += 1;
+      continue;
+    }
+    if (firstOut?.[0] === 'NEXT') {
+      const top = forStack[forStack.length - 1];
+      if (top) {
+        top.remaining -= 1;
+        if (top.remaining > 0) {
+          idx = top.startIdx;
+          continue;
+        }
+        forStack.pop();
+      }
       idx += 1;
       continue;
     }
@@ -1257,19 +2033,23 @@ function executeLdPou(
 
     for (const [op, ops] of net.il) {
       if (execStats) execStats.instructions += 1;
-      if (['LD', 'LDI', 'LDP', 'LDF', 'LD=', 'LD<=', 'LD>', 'LD<'].includes(op)) {
+      if (LD_STARTER_OPS.has(op)) {
         if (acc !== null) stack.push(acc);
         acc = evalContact(sess, op, ops);
         continue;
       }
-      if (['AND', 'ANI', 'ANDP', 'ANDF', 'AND=', 'AND<=', 'AND>', 'AND<'].includes(op)) {
+      if (AND_CONTACT_OPS.has(op)) {
         const val: boolean = evalContact(sess, op, ops);
         acc = (acc ?? true) && val;
         continue;
       }
-      if (['OR', 'ORI', 'ORP', 'ORF'].includes(op)) {
+      if (OR_CONTACT_OPS.has(op)) {
         const val: boolean = evalContact(sess, op, ops);
         acc = (acc ?? false) || val;
+        continue;
+      }
+      if (op === 'INV') {
+        acc = !(acc ?? false);
         continue;
       }
       if (op === 'ANB') {
@@ -1330,10 +2110,14 @@ function executeLdPou(
       } else {
         const subPou = sess.pouPrograms.find((p) => p.name.toUpperCase() === flow.callTarget!.toUpperCase());
         if (subPou) {
-          if (subPou.lang === '1') {
+          if (subPou.lang === '1' || subPou.lang === '3') {
             executeLdPou(sess, subPou, trace, 0, true, callDepth + 1, execStats);
           } else if (subPou.lang === '2') {
             executeStBlock(subPou.stCode, sess, callDepth + 1);
+          } else if (subPou.lang === '4' && subPou.sfcChart) {
+            executeSfcPou(sess, subPou);
+          } else if (subPou.lang === '5' && subPou.fbdDiagram) {
+            executeFbdPou(sess, subPou);
           }
         }
       }
@@ -1369,6 +2153,312 @@ function executeLdPou(
 // Supports: CASE..OF..END_CASE, REPEAT..UNTIL, multi-line statements, arrays,
 // struct dot fields, built-in IEC functions, and user FC/FB POU calls.
 // ===========================================================================
+function executeStandardFb(
+  sess: SimulatorSession,
+  instKey: string,
+  fbType: string,
+  inputs: Record<string, number>,
+): Record<string, number | boolean> {
+  const upType = fbType.toUpperCase();
+  const key = instKey.toUpperCase();
+  let state = sess.fbInstances.get(key);
+  if (!state) {
+    state = { type: upType, fields: {}, internal: {} };
+    sess.fbInstances.set(key, state);
+  }
+  const f = state.fields;
+  const intl = state.internal;
+
+  if (upType === 'TON') {
+    const inVal = Boolean(inputs.IN ?? f.IN ?? false);
+    const pt = Math.max(0, Math.trunc(inputs.PT ?? Number(f.PT ?? 0)));
+    let et = Number(f.ET ?? 0);
+    let q = false;
+    if (!inVal) {
+      et = 0;
+      q = false;
+    } else {
+      et = Math.min(pt, et + sess.scan_interval_ms);
+      q = et >= pt;
+    }
+    Object.assign(f, { IN: inVal, PT: pt, ET: et, Q: q });
+    return { Q: q, ET: et };
+  }
+  if (upType === 'TOF') {
+    const inVal = Boolean(inputs.IN ?? f.IN ?? false);
+    const pt = Math.max(0, Math.trunc(inputs.PT ?? Number(f.PT ?? 0)));
+    let et = Number(f.ET ?? 0);
+    const prevIn = Boolean(intl.prevIn ?? false);
+    let running = Boolean(intl.running ?? false);
+    let q = false;
+    if (inVal) {
+      et = 0;
+      q = true;
+      running = false;
+    } else {
+      if (prevIn) running = true;
+      if (running) {
+        et = Math.min(pt, et + sess.scan_interval_ms);
+        q = et < pt;
+        if (et >= pt) running = false;
+      } else {
+        q = false;
+      }
+    }
+    intl.prevIn = inVal;
+    intl.running = running;
+    Object.assign(f, { IN: inVal, PT: pt, ET: et, Q: q });
+    return { Q: q, ET: et };
+  }
+  if (upType === 'TP') {
+    const inVal = Boolean(inputs.IN ?? f.IN ?? false);
+    const pt = Math.max(0, Math.trunc(inputs.PT ?? Number(f.PT ?? 0)));
+    const prevIn = Boolean(intl.prevIn ?? false);
+    let active = Boolean(intl.active ?? false);
+    let et = Number(f.ET ?? 0);
+    if (inVal && !prevIn && !active) {
+      active = true;
+      et = 0;
+    }
+    let q = false;
+    if (active) {
+      et += sess.scan_interval_ms;
+      if (et >= pt) {
+        et = pt;
+        active = false;
+        q = false;
+      } else {
+        q = true;
+      }
+    } else if (!inVal) {
+      et = 0;
+    }
+    intl.prevIn = inVal;
+    intl.active = active;
+    Object.assign(f, { IN: inVal, PT: pt, ET: et, Q: q });
+    return { Q: q, ET: et };
+  }
+  if (upType === 'CTU') {
+    const cu = Boolean(inputs.CU ?? f.CU ?? false);
+    const r = Boolean(inputs.R ?? f.R ?? false);
+    const pv = Math.trunc(inputs.PV ?? Number(f.PV ?? 0));
+    const prevCu = Boolean(intl.prevCu ?? false);
+    let cv = Number(f.CV ?? 0);
+    if (r) cv = 0;
+    else if (cu && !prevCu) cv += 1;
+    const q = cv >= pv;
+    intl.prevCu = cu;
+    Object.assign(f, { CU: cu, R: r, PV: pv, CV: cv, Q: q });
+    return { Q: q, CV: cv };
+  }
+  if (upType === 'CTD') {
+    const cd = Boolean(inputs.CD ?? f.CD ?? false);
+    const ld = Boolean(inputs.LD ?? f.LD ?? false);
+    const pv = Math.trunc(inputs.PV ?? Number(f.PV ?? 0));
+    const prevCd = Boolean(intl.prevCd ?? false);
+    let cv = Number(f.CV ?? 0);
+    if (ld) cv = pv;
+    else if (cd && !prevCd) cv -= 1;
+    const q = cv <= 0;
+    intl.prevCd = cd;
+    Object.assign(f, { CD: cd, LD: ld, PV: pv, CV: cv, Q: q });
+    return { Q: q, CV: cv };
+  }
+  if (upType === 'CTUD') {
+    const cu = Boolean(inputs.CU ?? f.CU ?? false);
+    const cd = Boolean(inputs.CD ?? f.CD ?? false);
+    const r = Boolean(inputs.R ?? f.R ?? false);
+    const ld = Boolean(inputs.LD ?? f.LD ?? false);
+    const pv = Math.trunc(inputs.PV ?? Number(f.PV ?? 0));
+    let cv = Number(f.CV ?? 0);
+    if (r) cv = 0;
+    else if (ld) cv = pv;
+    else {
+      if (cu && !Boolean(intl.prevCu ?? false)) cv += 1;
+      if (cd && !Boolean(intl.prevCd ?? false)) cv -= 1;
+    }
+    intl.prevCu = cu;
+    intl.prevCd = cd;
+    const qu = cv >= pv;
+    const qd = cv <= 0;
+    Object.assign(f, { CU: cu, CD: cd, R: r, LD: ld, PV: pv, CV: cv, QU: qu, QD: qd });
+    return { QU: qu, QD: qd, CV: cv };
+  }
+  if (upType === 'R_TRIG') {
+    const clk = Boolean(inputs.CLK ?? f.CLK ?? false);
+    const prev = Boolean(intl.prev ?? false);
+    const q = clk && !prev;
+    intl.prev = clk;
+    Object.assign(f, { CLK: clk, Q: q });
+    return { Q: q };
+  }
+  if (upType === 'F_TRIG') {
+    const clk = Boolean(inputs.CLK ?? f.CLK ?? false);
+    const prev = Boolean(intl.prev ?? false);
+    const q = !clk && prev;
+    intl.prev = clk;
+    Object.assign(f, { CLK: clk, Q: q });
+    return { Q: q };
+  }
+  if (upType === 'SR') {
+    const s1 = Boolean(inputs.S1 ?? inputs.S ?? false);
+    const r = Boolean(inputs.R ?? false);
+    let q1 = Boolean(f.Q1 ?? false);
+    q1 = s1 || (!r && q1);
+    Object.assign(f, { S1: s1, R: r, Q1: q1, Q: q1 });
+    return { Q1: q1, Q: q1 };
+  }
+  if (upType === 'RS') {
+    const s = Boolean(inputs.S ?? false);
+    const r1 = Boolean(inputs.R1 ?? inputs.R ?? false);
+    let q1 = Boolean(f.Q1 ?? false);
+    q1 = !r1 && (s || q1);
+    Object.assign(f, { S: s, R1: r1, Q1: q1, Q: q1 });
+    return { Q1: q1, Q: q1 };
+  }
+  if (upType === 'PID_FB') {
+    const en = inputs.EN === undefined ? true : Boolean(inputs.EN);
+    const sv = Number(inputs.SV ?? f.SV ?? 0);
+    const pv = Number(inputs.PV ?? f.PV ?? 0);
+    const kp = Number(inputs.KP ?? f.KP ?? 100) / 100;
+    const ti = Number(inputs.TI ?? f.TI ?? 0);
+    const td = Number(inputs.TD ?? f.TD ?? 0);
+    const dt = Math.max(0.01, sess.scan_interval_ms / 1000);
+    let mv = 0;
+    if (en) {
+      const err = sv - pv;
+      let integ = Number(intl.integral ?? 0);
+      if (ti > 0) integ = Math.max(-4000, Math.min(4000, integ + (kp / ti) * err * dt));
+      const prevErr = Number(intl.prevErr ?? err);
+      const deriv = td > 0 ? kp * td * ((err - prevErr) / dt) : 0;
+      intl.integral = integ;
+      intl.prevErr = err;
+      mv = Math.max(0, Math.min(4000, Math.round(kp * err + integ + deriv)));
+    }
+    Object.assign(f, { EN: en, SV: sv, PV: pv, KP: kp * 100, TI: ti, TD: td, MV: mv });
+    return { MV: mv };
+  }
+  if (upType === 'SCALE') {
+    const x = Number(inputs.IN ?? 0);
+    const inMin = Number(inputs.IN_MIN ?? 0);
+    const inMax = Number(inputs.IN_MAX ?? 4000);
+    const outMin = Number(inputs.OUT_MIN ?? 0);
+    const outMax = Number(inputs.OUT_MAX ?? 100);
+    const out = inMax !== inMin ? outMin + ((x - inMin) * (outMax - outMin)) / (inMax - inMin) : outMin;
+    Object.assign(f, { IN: x, IN_MIN: inMin, IN_MAX: inMax, OUT_MIN: outMin, OUT_MAX: outMax, OUT: out });
+    return { OUT: out };
+  }
+  return {};
+}
+
+function syncFbInstanceFieldsToSymbols(sess: SimulatorSession, instName: string, fields: Record<string, number | boolean>): void {
+  for (const [fn, fv] of Object.entries(fields)) {
+    const dotted = `${instName}.${fn}`;
+    const sym = resolveSymbol(sess, dotted);
+    if (sym) {
+      sym.entry.value = fv;
+    } else {
+      sess.symbols.set(dotted, {
+        address: null,
+        type: typeof fv === 'boolean' ? 'BOOL' : Number.isInteger(fv) ? 'INT' : 'REAL',
+        value: fv,
+        initial: fv,
+      });
+    }
+    const up = normAddr(dotted);
+    if (typeof fv === 'boolean') sess.bits.set(up, fv);
+    else sess.words.set(up, fv);
+  }
+}
+
+function invokeFbInstanceCall(
+  sess: SimulatorSession,
+  instName: string,
+  instState: FbInstanceState,
+  argTokens: string[],
+  callerLoopVars: Map<string, number>,
+  callDepth: number,
+  execStats?: StExecStats,
+): number {
+  const namedInputs: Record<string, number> = {};
+  const outBindings: Array<{ formal: string; actual: string }> = [];
+  const positional: number[] = [];
+
+  for (const tok of argTokens) {
+    const namedOut = /^([A-Za-z_][A-Za-z0-9_]*)\s*=>\s*([A-Za-z_][A-Za-z0-9_.]*)$/.exec(tok);
+    const namedIn = /^([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*(.+)$/.exec(tok);
+    if (namedOut) {
+      outBindings.push({ formal: namedOut[1], actual: namedOut[2] });
+    } else if (namedIn) {
+      namedInputs[namedIn[1].toUpperCase()] = evalStExpression(namedIn[2], sess, callerLoopVars, callDepth, execStats);
+    } else if (tok) {
+      positional.push(evalStExpression(tok, sess, callerLoopVars, callDepth, execStats));
+    }
+  }
+
+  if (STANDARD_IEC_FBS.has(instState.type.toUpperCase())) {
+    const outs = executeStandardFb(sess, instName, instState.type, namedInputs);
+    syncFbInstanceFieldsToSymbols(sess, instName, instState.fields);
+    for (const ob of outBindings) {
+      const val = instState.fields[ob.formal.toUpperCase()] ?? instState.fields[ob.formal] ?? 0;
+      assignStLhs(sess, ob.actual, typeof val === 'boolean' ? (val ? 1 : 0) : Number(val), {});
+    }
+    const primary = outs.Q ?? outs.Q1 ?? outs.QU ?? outs.MV ?? outs.OUT ?? 0;
+    return typeof primary === 'boolean' ? (primary ? 1 : 0) : Number(primary);
+  }
+
+  // User-defined FB instance: isolate instance fields around POU invocation
+  const targetPou = sess.pouPrograms.find((p) => p.name.toUpperCase() === instState.type.toUpperCase());
+  if (!targetPou || callDepth >= 8) return 0;
+
+  const savedLocals = new Map<string, number | boolean>();
+  for (const lv of targetPou.localVars) {
+    const sym = resolveSymbol(sess, lv.identifier);
+    if (sym) savedLocals.set(sym.key, sym.entry.value);
+    const instVal = instState.fields[lv.identifier] ?? lv.initial;
+    if (lv.type.toUpperCase() === 'BOOL') writeBit(sess, lv.identifier, Boolean(instVal));
+    else writeWord(sess, lv.identifier, Number(instVal) || 0);
+  }
+
+  const inputs = targetPou.localVars.filter((v) => v.varClass === 'VAR_INPUT' || v.varClass === 'VAR_IN_OUT');
+  positional.forEach((v, idx) => {
+    if (inputs[idx]) namedInputs[inputs[idx].identifier.toUpperCase()] = v;
+  });
+  for (const lv of targetPou.localVars) {
+    const nv = namedInputs[lv.identifier.toUpperCase()];
+    if (nv !== undefined) {
+      if (lv.type.toUpperCase() === 'BOOL') writeBit(sess, lv.identifier, Boolean(nv));
+      else writeWord(sess, lv.identifier, nv);
+    }
+  }
+
+  if (targetPou.lang === '2') {
+    executeStBlock(targetPou.stCode, sess, callDepth + 1, execStats);
+  } else if (targetPou.lang === '1' || targetPou.lang === '3') {
+    executeLdPou(sess, targetPou, [], 0, true, callDepth + 1);
+  } else if (targetPou.lang === '5' && targetPou.fbdDiagram) {
+    executeFbdPou(sess, targetPou);
+  }
+
+  for (const lv of targetPou.localVars) {
+    const val = lv.type.toUpperCase() === 'BOOL' ? readBit(sess, lv.identifier) : readWord(sess, lv.identifier);
+    instState.fields[lv.identifier] = val;
+  }
+  syncFbInstanceFieldsToSymbols(sess, instName, instState.fields);
+
+  for (const ob of outBindings) {
+    const foundKey = Object.keys(instState.fields).find((k) => k.toUpperCase() === ob.formal.toUpperCase());
+    const val = foundKey ? instState.fields[foundKey] : 0;
+    assignStLhs(sess, ob.actual, typeof val === 'boolean' ? (val ? 1 : 0) : Number(val), {});
+  }
+
+  for (const [k, oldVal] of savedLocals.entries()) {
+    const sym = sess.symbols.get(k);
+    if (sym) sym.value = oldVal;
+  }
+  return 0;
+}
+
 function evalStBuiltinOrCall(
   expr: string,
   sess: SimulatorSession,
@@ -1376,18 +2466,17 @@ function evalStBuiltinOrCall(
   callDepth: number,
   execStats?: StExecStats,
 ): string {
-  // Iteratively resolve innermost function calls Name(arg1, arg2, ...)
   let current = expr;
   const callRe = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\(([^()]*)\)/;
   let guard = 0;
   while (guard++ < 32) {
     const m = callRe.exec(current);
     if (!m) break;
-    const fnName = m[1].toUpperCase();
+    const rawName = m[1];
+    const fnName = rawName.toUpperCase();
     const rawArgs = m[2].trim();
     const argTokens = rawArgs ? rawArgs.split(',').map((a) => a.trim()) : [];
 
-    // Skip if fnName is ST logical operator like NOT(...) or precedence parentheses wouldn't match \bWord(
     if (fnName === 'NOT') {
       const v = evalStExpression(rawArgs, sess, loopVars, callDepth + 1, execStats);
       const repl = v ? '0' : '1';
@@ -1400,6 +2489,44 @@ function evalStBuiltinOrCall(
 
     if (fnName === 'ABS') {
       val = Math.abs(evalArgs()[0] ?? 0);
+    } else if (fnName === 'SQRT') {
+      val = Math.sqrt(Math.max(0, evalArgs()[0] ?? 0));
+    } else if (fnName === 'SIN') {
+      val = Math.sin(evalArgs()[0] ?? 0);
+    } else if (fnName === 'COS') {
+      val = Math.cos(evalArgs()[0] ?? 0);
+    } else if (fnName === 'TAN') {
+      val = Math.tan(evalArgs()[0] ?? 0);
+    } else if (fnName === 'ASIN') {
+      val = Math.asin(Math.max(-1, Math.min(1, evalArgs()[0] ?? 0)));
+    } else if (fnName === 'ACOS') {
+      val = Math.acos(Math.max(-1, Math.min(1, evalArgs()[0] ?? 0)));
+    } else if (fnName === 'ATAN') {
+      val = Math.atan(evalArgs()[0] ?? 0);
+    } else if (fnName === 'LN') {
+      val = Math.log(Math.max(1e-12, evalArgs()[0] ?? 1));
+    } else if (fnName === 'LOG') {
+      val = Math.log10(Math.max(1e-12, evalArgs()[0] ?? 1));
+    } else if (fnName === 'EXP') {
+      val = Math.exp(evalArgs()[0] ?? 0);
+    } else if (fnName === 'EXPT') {
+      const [b = 0, e = 0] = evalArgs();
+      val = Math.pow(b, e);
+    } else if (fnName === 'TRUNC' || fnName === 'REAL_TO_INT' || fnName === 'DINT_TO_INT' || fnName === 'WORD_TO_INT') {
+      val = Math.trunc(evalArgs()[0] ?? 0);
+    } else if (fnName === 'ROUND') {
+      val = Math.round(evalArgs()[0] ?? 0);
+    } else if (fnName === 'INT_TO_REAL' || fnName === 'INT_TO_DINT' || fnName === 'BOOL_TO_INT') {
+      val = Number(evalArgs()[0] ?? 0);
+    } else if (fnName === 'INT_TO_BOOL') {
+      val = (evalArgs()[0] ?? 0) !== 0 ? 1 : 0;
+    } else if (fnName === 'INT_TO_BCD') {
+      val = intToBcd16(evalArgs()[0] ?? 0);
+    } else if (fnName === 'BCD_TO_INT') {
+      val = bcd16ToInt(evalArgs()[0] ?? 0);
+    } else if (fnName === 'SCALE') {
+      const [x = 0, inMin = 0, inMax = 4000, outMin = 0, outMax = 100] = evalArgs();
+      val = inMax !== inMin ? outMin + ((x - inMin) * (outMax - outMin)) / (inMax - inMin) : outMin;
     } else if (fnName === 'MIN') {
       const vals = evalArgs();
       val = vals.length ? Math.min(...vals) : 0;
@@ -1432,8 +2559,10 @@ function evalStBuiltinOrCall(
       const s = ((Math.trunc(n) % 16) + 16) % 16;
       const w = Math.trunc(v) & 0xffff;
       val = toInt16(((w >>> s) | (w << (16 - s))) & 0xffff);
+    } else if (sess.fbInstances.has(fnName)) {
+      const instState = sess.fbInstances.get(fnName)!;
+      val = invokeFbInstanceCall(sess, rawName, instState, argTokens, loopVars, callDepth + 1, execStats);
     } else {
-      // User-defined FC / FB call!
       const targetPou = sess.pouPrograms.find((p) => p.name.toUpperCase() === fnName);
       if (targetPou && callDepth < 8) {
         val = invokeUserPouCall(sess, targetPou, argTokens, loopVars, callDepth + 1, execStats);
@@ -1480,8 +2609,12 @@ function invokeUserPouCall(
 
   if (pou.lang === '2') {
     executeStBlock(pou.stCode, sess, callDepth, execStats);
-  } else if (pou.lang === '1') {
+  } else if (pou.lang === '1' || pou.lang === '3') {
     executeLdPou(sess, pou, [], 0, true, callDepth);
+  } else if (pou.lang === '4' && pou.sfcChart) {
+    executeSfcPou(sess, pou);
+  } else if (pou.lang === '5' && pou.fbdDiagram) {
+    executeFbdPou(sess, pou);
   }
 
   for (const ob of outBindings) {
@@ -1490,7 +2623,6 @@ function invokeUserPouCall(
     assignStLhs(sess, ob.actual, v, {});
   }
 
-  // Convention: FC return value assigned to `<PouName> := ...;`
   const retSym = resolveSymbol(sess, pou.name);
   if (retSym) {
     return typeof retSym.entry.value === 'boolean' ? (retSym.entry.value ? 1 : 0) : Number(retSym.entry.value) || 0;
@@ -1698,6 +2830,9 @@ function assignStLhs(
     const bVal = Boolean(rhsVal);
     writeBit(sess, lhs, bVal);
     outputsWritten[sym ? sym.key : normAddr(lhs)] = bVal;
+  } else if (sym && isFloatType(sym.entry.type)) {
+    writeWord(sess, lhs, rhsVal);
+    outputsWritten[sym.key] = rhsVal;
   } else {
     const intVal = Math.trunc(rhsVal);
     writeWord(sess, lhs, intVal);
@@ -1989,6 +3124,289 @@ export function evaluateConditionExpr(sess: SimulatorSession, expr: string): boo
   return Boolean(evalStExpression(clean, sess));
 }
 
+// ===========================================================================
+// IEC 61131-3 SFC & FBD/CFC Execution Engines
+// ===========================================================================
+function executeSfcPou(sess: SimulatorSession, pou: SimPouProgram): SimSfcTrace {
+  const chart = pou.sfcChart;
+  if (!chart || !chart.steps.length) {
+    return { pou: pou.name, active_steps: [], transitions_fired: [], outputs_written: {} };
+  }
+
+  let state = sess.sfcStates.get(pou.name);
+  if (!state) {
+    state = { initialized: false, steps: new Map(), storedActions: new Map() };
+    sess.sfcStates.set(pou.name, state);
+  }
+  for (const s of chart.steps) {
+    if (!state.steps.has(s.name)) {
+      state.steps.set(s.name, { active: false, elapsedMs: 0, enteredThisScan: false });
+    }
+  }
+  if (!state.initialized) {
+    for (const s of chart.steps) {
+      if (s.initial) {
+        const st = state.steps.get(s.name)!;
+        st.active = true;
+        st.elapsedMs = 0;
+        st.enteredThisScan = true;
+      }
+    }
+    state.initialized = true;
+  }
+
+  const syncStepVars = () => {
+    for (const [stepName, st] of state!.steps.entries()) {
+      sess.bits.set(`${stepName.toUpperCase()}.X`, st.active);
+      sess.words.set(`${stepName.toUpperCase()}.T`, st.elapsedMs);
+    }
+  };
+
+  syncStepVars();
+  const outputsWritten: Record<string, boolean | number> = {};
+  const stepByName = new Map(chart.steps.map((s) => [s.name, s]));
+
+  // Execute active step actions
+  for (const [stepName, st] of state.steps.entries()) {
+    if (!st.active) continue;
+    const stepDef = stepByName.get(stepName);
+    if (!stepDef) continue;
+    for (const act of stepDef.actions ?? []) {
+      const q = act.qualifier;
+      if (q === 'N') {
+        const res = executeStBlock(act.code, sess);
+        Object.assign(outputsWritten, res.outputs);
+      } else if (q === 'P' || q === 'P1') {
+        if (st.enteredThisScan) {
+          const res = executeStBlock(act.code, sess);
+          Object.assign(outputsWritten, res.outputs);
+        }
+      } else if (q === 'S') {
+        const actKey = act.name?.trim() || `${stepName}:${act.code}`;
+        state.storedActions.set(actKey, { name: actKey, code: act.code });
+      } else if (q === 'R') {
+        const actKey = act.name?.trim() || act.code.trim();
+        state.storedActions.delete(actKey);
+        if (act.code.trim() && act.code.includes(':=')) {
+          const res = executeStBlock(act.code, sess);
+          Object.assign(outputsWritten, res.outputs);
+        }
+      } else if (q === 'L') {
+        if (st.elapsedMs < (act.time_ms ?? 0)) {
+          const res = executeStBlock(act.code, sess);
+          Object.assign(outputsWritten, res.outputs);
+        }
+      } else if (q === 'D') {
+        if (st.elapsedMs >= (act.time_ms ?? 0)) {
+          const res = executeStBlock(act.code, sess);
+          Object.assign(outputsWritten, res.outputs);
+        }
+      }
+    }
+  }
+
+  // Execute active stored ('S') actions
+  for (const sa of state.storedActions.values()) {
+    const res = executeStBlock(sa.code, sess);
+    Object.assign(outputsWritten, res.outputs);
+  }
+
+  // Evaluate transitions sorted by priority (lower number = higher priority)
+  const sortedTrans = [...chart.transitions].sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
+  const fired: string[] = [];
+  const consumedFrom = new Set<string>();
+  const toActivate = new Set<string>();
+  const toDeactivate = new Set<string>();
+
+  for (const tr of sortedTrans) {
+    if (!tr.from.length || !tr.to.length) continue;
+    const allFromActive = tr.from.every((fn) => state!.steps.get(fn)?.active && !consumedFrom.has(fn));
+    if (!allFromActive) continue;
+    if (Boolean(evalStExpression(tr.condition, sess))) {
+      fired.push(tr.name);
+      for (const fn of tr.from) {
+        consumedFrom.add(fn);
+        toDeactivate.add(fn);
+      }
+      for (const tn of tr.to) {
+        toActivate.add(tn);
+      }
+    }
+  }
+
+  // Apply transition deactivations (running P0 exit actions) & activations
+  for (const fn of toDeactivate) {
+    const st = state.steps.get(fn);
+    if (st) {
+      const def = stepByName.get(fn);
+      for (const act of def?.actions ?? []) {
+        if (act.qualifier === 'P0') {
+          const res = executeStBlock(act.code, sess);
+          Object.assign(outputsWritten, res.outputs);
+        }
+      }
+      st.active = false;
+      st.enteredThisScan = false;
+    }
+  }
+  for (const [stepName, st] of state.steps.entries()) {
+    if (st.active && !toActivate.has(stepName)) {
+      st.elapsedMs += sess.scan_interval_ms;
+      st.enteredThisScan = false;
+    }
+  }
+  for (const tn of toActivate) {
+    const st = state.steps.get(tn);
+    if (st) {
+      st.active = true;
+      st.elapsedMs = 0;
+      st.enteredThisScan = true;
+    }
+  }
+
+  syncStepVars();
+  const activeSteps = [...state.steps.entries()].filter(([, s]) => s.active).map(([name]) => name);
+  return {
+    pou: pou.name,
+    active_steps: activeSteps,
+    transitions_fired: fired,
+    outputs_written: outputsWritten,
+  };
+}
+
+function executeFbdPou(sess: SimulatorSession, pou: SimPouProgram): SimFbdTrace {
+  const diagram = pou.fbdDiagram;
+  if (!diagram || !diagram.blocks.length) {
+    return { pou: pou.name, blocks_evaluated: 0, outputs_written: {} };
+  }
+
+  const { order } = topologicalSortFbd(diagram);
+  const pinValues = new Map<string, number>();
+  const outputsWritten: Record<string, boolean | number> = {};
+
+  const evalPinInput = (expr: string): number => {
+    const trimmed = expr.trim();
+    if (pinValues.has(trimmed.toUpperCase())) {
+      return pinValues.get(trimmed.toUpperCase())!;
+    }
+    const prevKey = `${pou.name.toUpperCase()}:${trimmed.toUpperCase()}`;
+    if (/^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed) && sess.words.has(prevKey)) {
+      return sess.words.get(prevKey)!;
+    }
+    return evalStExpression(trimmed, sess);
+  };
+
+  for (const block of order) {
+    const op = block.op.trim().toUpperCase();
+    const inEntries = Object.entries(block.inputs ?? {});
+    const resolvedInputs: Record<string, number> = {};
+    const orderedVals: number[] = [];
+    for (const [pin, expr] of inEntries) {
+      const val = evalPinInput(expr);
+      resolvedInputs[pin.toUpperCase()] = val;
+      orderedVals.push(val);
+    }
+
+    const blockOuts: Record<string, number | boolean> = {};
+    if (op === 'AND') {
+      blockOuts.OUT = orderedVals.length > 0 && orderedVals.every((v) => Boolean(v));
+    } else if (op === 'OR') {
+      blockOuts.OUT = orderedVals.some((v) => Boolean(v));
+    } else if (op === 'XOR') {
+      blockOuts.OUT = orderedVals.reduce((acc, v) => acc !== Boolean(v), false);
+    } else if (op === 'NOT') {
+      blockOuts.OUT = !Boolean(orderedVals[0] ?? 0);
+    } else if (op === 'NAND') {
+      blockOuts.OUT = !(orderedVals.length > 0 && orderedVals.every((v) => Boolean(v)));
+    } else if (op === 'NOR') {
+      blockOuts.OUT = !orderedVals.some((v) => Boolean(v));
+    } else if (op === 'ADD') {
+      blockOuts.OUT = orderedVals.reduce((a, b) => a + b, 0);
+    } else if (op === 'SUB') {
+      blockOuts.OUT = (orderedVals[0] ?? 0) - (orderedVals[1] ?? 0);
+    } else if (op === 'MUL') {
+      blockOuts.OUT = orderedVals.reduce((a, b) => a * b, 1);
+    } else if (op === 'DIV') {
+      const d = orderedVals[1] ?? 0;
+      blockOuts.OUT = d !== 0 ? (orderedVals[0] ?? 0) / d : 0;
+    } else if (op === 'MOD') {
+      const d = orderedVals[1] ?? 0;
+      blockOuts.OUT = d !== 0 ? (orderedVals[0] ?? 0) % d : 0;
+    } else if (op === 'ABS') {
+      blockOuts.OUT = Math.abs(orderedVals[0] ?? 0);
+    } else if (op === 'SQRT') {
+      blockOuts.OUT = Math.sqrt(Math.max(0, orderedVals[0] ?? 0));
+    } else if (op === 'MIN') {
+      blockOuts.OUT = orderedVals.length ? Math.min(...orderedVals) : 0;
+    } else if (op === 'MAX') {
+      blockOuts.OUT = orderedVals.length ? Math.max(...orderedVals) : 0;
+    } else if (op === 'LIMIT') {
+      const mn = resolvedInputs.MN ?? orderedVals[0] ?? 0;
+      const x = resolvedInputs.IN ?? orderedVals[1] ?? 0;
+      const mx = resolvedInputs.MX ?? orderedVals[2] ?? 0;
+      blockOuts.OUT = Math.max(mn, Math.min(mx, x));
+    } else if (op === 'MOVE') {
+      blockOuts.OUT = orderedVals[0] ?? 0;
+    } else if (op === 'SEL') {
+      const g = resolvedInputs.G ?? orderedVals[0] ?? 0;
+      const in0 = resolvedInputs.IN0 ?? orderedVals[1] ?? 0;
+      const in1 = resolvedInputs.IN1 ?? orderedVals[2] ?? 0;
+      blockOuts.OUT = g ? in1 : in0;
+    } else if (op === 'MUX') {
+      const k = Math.trunc(resolvedInputs.K ?? orderedVals[0] ?? 0);
+      blockOuts.OUT = orderedVals[k + 1] ?? 0;
+    } else if (op === 'EQ') {
+      blockOuts.OUT = (orderedVals[0] ?? 0) === (orderedVals[1] ?? 0);
+    } else if (op === 'NE') {
+      blockOuts.OUT = (orderedVals[0] ?? 0) !== (orderedVals[1] ?? 0);
+    } else if (op === 'GT') {
+      blockOuts.OUT = (orderedVals[0] ?? 0) > (orderedVals[1] ?? 0);
+    } else if (op === 'GE') {
+      blockOuts.OUT = (orderedVals[0] ?? 0) >= (orderedVals[1] ?? 0);
+    } else if (op === 'LT') {
+      blockOuts.OUT = (orderedVals[0] ?? 0) < (orderedVals[1] ?? 0);
+    } else if (op === 'LE') {
+      blockOuts.OUT = (orderedVals[0] ?? 0) <= (orderedVals[1] ?? 0);
+    } else if (STANDARD_IEC_FBS.has(op)) {
+      const instKey = `${pou.name}:${block.instance || block.id}`;
+      Object.assign(blockOuts, executeStandardFb(sess, instKey, op, resolvedInputs));
+    } else {
+      const userPou = sess.pouPrograms.find((p) => p.name.toUpperCase() === op);
+      if (userPou) {
+        const argStrs = Object.entries(resolvedInputs).map(([k, v]) => `${k} := ${v}`);
+        blockOuts.OUT = invokeUserPouCall(sess, userPou, argStrs, new Map(), 1);
+      }
+    }
+
+    for (const [pin, val] of Object.entries(blockOuts)) {
+      const numVal = typeof val === 'boolean' ? (val ? 1 : 0) : Number(val);
+      const pinRef = `${block.id.toUpperCase()}.${pin.toUpperCase()}`;
+      pinValues.set(pinRef, numVal);
+      sess.words.set(`${pou.name.toUpperCase()}:${pinRef}`, numVal);
+    }
+
+    for (const [outPin, targetAddr] of Object.entries(block.outputs ?? {})) {
+      const val = blockOuts[outPin.toUpperCase()] ?? blockOuts[outPin] ?? blockOuts.OUT ?? 0;
+      const numVal = typeof val === 'boolean' ? (val ? 1 : 0) : Number(val);
+      assignStLhs(sess, targetAddr, numVal, outputsWritten);
+    }
+  }
+
+  return {
+    pou: pou.name,
+    blocks_evaluated: order.length,
+    outputs_written: outputsWritten,
+  };
+}
+
+function langCodeToSimLang(lang: string): 'LD' | 'ST' | 'IL' | 'SFC' | 'FBD' {
+  if (lang === '2') return 'ST';
+  if (lang === '3') return 'IL';
+  if (lang === '4') return 'SFC';
+  if (lang === '5') return 'FBD';
+  return 'LD';
+}
+
 function recordPouMetric(
   sess: SimulatorSession,
   pou: SimPouProgram,
@@ -2002,7 +3420,7 @@ function recordPouMetric(
     callDepthMax: number;
   },
 ): void {
-  const lang: 'LD' | 'ST' = pou.lang === '2' ? 'ST' : 'LD';
+  const lang = langCodeToSimLang(pou.lang);
   const existing = sess.diagnostics.pou_metrics.get(pou.name);
   if (existing) {
     existing.executions += 1;
@@ -2043,16 +3461,45 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
     sess.scan_count += 1;
     sess.elapsed_ms += sess.scan_interval_ms;
 
-    // Update special PLC clock/status relays
+    // Update special PLC clock/status relays (DVP + AS/AH)
+    const firstScan = sess.scan_count === 1;
+    const clk10 = Math.floor(sess.elapsed_ms / 10) % 2 === 1;
+    const clk100 = Math.floor(sess.elapsed_ms / 100) % 2 === 1;
+    const clk1000 = Math.floor(sess.elapsed_ms / 1000) % 2 === 1;
+    const clk60000 = Math.floor(sess.elapsed_ms / 60000) % 2 === 1;
     sess.bits.set('M1000', true);
     sess.bits.set('M1001', false);
-    sess.bits.set('M1002', sess.scan_count === 1);
-    sess.bits.set('M1003', sess.scan_count > 1);
-    sess.bits.set('M1012', Math.floor(sess.elapsed_ms / 100) % 2 === 1);
-    sess.bits.set('M1013', Math.floor(sess.elapsed_ms / 1000) % 2 === 1);
+    sess.bits.set('M1002', firstScan);
+    sess.bits.set('M1003', !firstScan);
+    sess.bits.set('M1011', clk10);
+    sess.bits.set('M1012', clk100);
+    sess.bits.set('M1013', clk1000);
+    sess.bits.set('M1014', clk60000);
+    // AS/AH special relays
+    sess.bits.set('SM0', true);
+    sess.bits.set('SM400', true);
+    sess.bits.set('SM401', false);
+    sess.bits.set('SM402', firstScan);
+    sess.bits.set('SM403', !firstScan);
+    sess.bits.set('SM411', clk10);
+    sess.bits.set('SM412', clk100);
+    sess.bits.set('SM413', clk1000);
+    sess.bits.set('SM414', clk60000);
+    // RTC & module count special registers
+    const now = new Date();
+    sess.words.set('D1013', now.getFullYear());
+    sess.words.set('D1014', now.getMonth() + 1);
+    sess.words.set('D1015', now.getDate());
+    sess.words.set('D1016', now.getHours());
+    sess.words.set('D1017', now.getMinutes());
+    sess.words.set('D1018', now.getSeconds());
+    sess.words.set('D1019', now.getDay());
+    sess.words.set('D1220', sess.hwConfig.modules.length);
 
     const trace: SimNetworkTrace[] = [];
     const stTrace: SimStTrace[] = [];
+    const sfcTrace: SimSfcTrace[] = [];
+    const fbdTrace: SimFbdTrace[] = [];
     const scanPouTimings: ScanSample['pou_timings'] = [];
 
     let orderedPous: SimPouProgram[];
@@ -2061,16 +3508,28 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
         .filter((t) => t.active)
         .sort((a, b) => a.priority - b.priority);
       const pouByName = new Map(sess.pouPrograms.map((p) => [p.name, p]));
-      orderedPous = activeTasks
-        .map((t) => pouByName.get(t.program))
-        .filter((p): p is SimPouProgram => Boolean(p && p.active));
+      orderedPous = [];
+      for (const t of activeTasks) {
+        if (t.type >= 2) {
+          // Interrupt / event tasks run via triggerSimulatorInterrupt
+          continue;
+        }
+        if (t.type === 1) {
+          const interval = Math.max(1, t.interval_ms || sess.scan_interval_ms);
+          const lastRun = sess.taskLastRunMs.get(t.name) ?? -interval;
+          if (sess.elapsed_ms - lastRun < interval) continue;
+          sess.taskLastRunMs.set(t.name, sess.elapsed_ms);
+        }
+        const pou = pouByName.get(t.program);
+        if (pou && pou.active) orderedPous.push(pou);
+      }
     } else {
       orderedPous = sess.pouPrograms.filter((p) => p.pouType === '0' && p.active);
     }
 
     for (const pou of orderedPous) {
       const pouT0 = process.hrtime.bigint();
-      if (pou.lang === '1') {
+      if (pou.lang === '1' || pou.lang === '3') {
         const ldStats: LdExecStats = {
           instructions: 0,
           jumpCapHits: 0,
@@ -2089,7 +3548,7 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
         });
         scanPouTimings.push({
           pou: pou.name,
-          lang: 'LD',
+          lang: langCodeToSimLang(pou.lang),
           duration_ms: Math.round(pouMs * 1000) / 1000,
           work_units: ldStats.instructions,
         });
@@ -2116,11 +3575,49 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
           duration_ms: Math.round(pouMs * 1000) / 1000,
           work_units: res.__count,
         });
+      } else if (pou.lang === '4' && pou.sfcChart) {
+        const sfcRes = executeSfcPou(sess, pou);
+        const pouMs = Number(process.hrtime.bigint() - pouT0) / 1_000_000;
+        sfcTrace.push(sfcRes);
+        recordPouMetric(sess, pou, pouMs, {
+          instructions: sfcRes.active_steps.length,
+          statements: sfcRes.transitions_fired.length,
+          loopIterations: 0,
+          loopCapHits: 0,
+          jumpCapHits: 0,
+          callDepthMax: 0,
+        });
+        scanPouTimings.push({
+          pou: pou.name,
+          lang: 'SFC',
+          duration_ms: Math.round(pouMs * 1000) / 1000,
+          work_units: sfcRes.active_steps.length,
+        });
+      } else if (pou.lang === '5' && pou.fbdDiagram) {
+        const fbdRes = executeFbdPou(sess, pou);
+        const pouMs = Number(process.hrtime.bigint() - pouT0) / 1_000_000;
+        fbdTrace.push(fbdRes);
+        recordPouMetric(sess, pou, pouMs, {
+          instructions: fbdRes.blocks_evaluated,
+          statements: 0,
+          loopIterations: 0,
+          loopCapHits: 0,
+          jumpCapHits: 0,
+          callDepthMax: 0,
+        });
+        scanPouTimings.push({
+          pou: pou.name,
+          lang: 'FBD',
+          duration_ms: Math.round(pouMs * 1000) / 1000,
+          work_units: fbdRes.blocks_evaluated,
+        });
       }
     }
 
     sess.lastRungTrace = trace;
     sess.lastStTrace = stTrace;
+    sess.lastSfcTrace = sfcTrace;
+    sess.lastFbdTrace = fbdTrace;
 
     // Snapshot prevBits for next scan edge detection
     const allBitKeys = new Set([
@@ -2137,9 +3634,9 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
     const watchAddrs = sess.watchLists.get('default') ?? [];
     const sampleValues: Record<string, boolean | number> = {};
     for (const addr of watchAddrs) {
-      if (/^(X|Y|M|S)\d+$/i.test(addr) || parseBitOfWord(addr)) {
+      if (/^(X|Y|M|S|SM)\d+$/i.test(addr) || parseBitOfWord(addr)) {
         sampleValues[addr] = readBit(sess, addr);
-      } else if (/^(T|C|D)\d+$/i.test(addr)) {
+      } else if (/^(T|C|D|SR)\d+$/i.test(addr)) {
         sampleValues[addr] = readWord(sess, addr);
       } else {
         const sym = resolveSymbol(sess, addr);
@@ -2171,6 +3668,17 @@ export function stepSimulator(sessionId: string, cycles = 1): SimulatorSession {
     if (scanDurationMs > diag.max_scan_ms) {
       diag.max_scan_ms = scanDurationMs;
     }
+    // Update Delta scan-time registers (0.1ms units)
+    const curTenthMs = Math.max(1, Math.round(scanDurationMs * 10));
+    const minTenthMs = Math.max(1, Math.round((diag.min_scan_ms ?? scanDurationMs) * 10));
+    const maxTenthMs = Math.max(1, Math.round(diag.max_scan_ms * 10));
+    sess.words.set('D1010', curTenthMs);
+    sess.words.set('D1011', minTenthMs);
+    sess.words.set('D1012', maxTenthMs);
+    sess.words.set('SR410', curTenthMs);
+    sess.words.set('SR411', minTenthMs);
+    sess.words.set('SR412', maxTenthMs);
+
     const overBudget = scanDurationMs > sess.scan_interval_ms;
     if (overBudget) {
       diag.overrun_count += 1;
@@ -2242,14 +3750,41 @@ export function controlSimulator(
     sess.elapsed_ms = 0;
     sess.prevBits.clear();
     sess.edgeStates.clear();
+    sess.sfcStates.clear();
+    sess.pidStates.clear();
+    sess.taskLastRunMs.clear();
+
+    // Enforce project RETAIN_RANGE latched memory rules on WARM_RESET:
+    // Keep retained M/S/T/C/D devices & forced I/O; clear non-retained memory.
+    for (const k of [...sess.bits.keys()]) {
+      if (!isDeviceRetained(k, sess.retainConfig)) {
+        sess.bits.delete(k);
+      }
+    }
+    for (const k of [...sess.words.keys()]) {
+      if (!isDeviceRetained(k, sess.retainConfig)) {
+        sess.words.delete(k);
+      }
+    }
+    for (const k of [...sess.timers.keys()]) {
+      if (!isDeviceRetained(k, sess.retainConfig)) {
+        sess.timers.delete(k);
+      }
+    }
+    for (const k of [...sess.counters.keys()]) {
+      if (!isDeviceRetained(k, sess.retainConfig)) {
+        sess.counters.delete(k);
+      }
+    }
+
     sess.bits.set('M1000', true);
     sess.bits.set('M1001', false);
     sess.bits.set('M1002', true);
     sess.bits.set('M1003', false);
-    // Preserve retentive words, forced I/O, and counters PV while resetting transient timers & trace
-    sess.timers.clear();
     sess.lastRungTrace = [];
     sess.lastStTrace = [];
+    sess.lastSfcTrace = [];
+    sess.lastFbdTrace = [];
     sess.lastBreakpointHit = null;
   } else if (command === 'RESET' || command === 'COLD_RESET') {
     clearRunTimer(sessionId);
@@ -2264,8 +3799,19 @@ export function controlSimulator(
     sess.counters.clear();
     sess.forcedBits.clear();
     sess.forcedWords.clear();
+    sess.sfcStates.clear();
+    sess.pidStates.clear();
+    sess.taskLastRunMs.clear();
+    for (const inst of sess.fbInstances.values()) {
+      inst.internal = {};
+      for (const k of Object.keys(inst.fields)) {
+        inst.fields[k] = typeof inst.fields[k] === 'boolean' ? false : 0;
+      }
+    }
     sess.lastRungTrace = [];
     sess.lastStTrace = [];
+    sess.lastSfcTrace = [];
+    sess.lastFbdTrace = [];
     sess.traceBuffer = [];
     sess.lastBreakpointHit = null;
     seedInitialSymbolMemory(sess);
@@ -2333,7 +3879,7 @@ export function monitorSimulator(sessionId: string, addresses?: string[], compac
     for (const addr of addresses) {
       const raw = addr.trim();
       const up = normAddr(raw);
-      if (/^(X|Y|M|S)\d+$/.test(up) || parseBitOfWord(up)) {
+      if (/^(X|Y|M|S|SM)\d+$/.test(up) || parseBitOfWord(up)) {
         queryValues[up] = { value: readBit(sess, up), forced: sess.forcedBits.has(up) };
       } else if (/^T\d+$/.test(up)) {
         queryValues[up] = sess.timers.get(up) ?? { pv: 0, sv: 0, done: false, accMs: 0, baseMs: timerTimebaseMs(up) };
@@ -2342,7 +3888,7 @@ export function monitorSimulator(sessionId: string, addresses?: string[], compac
       } else if (/^(T|C)\d+\.(Q|DONE|PV)$/.test(up)) {
         const isPv = up.endsWith('.PV');
         queryValues[up] = { value: isPv ? readWord(sess, up) : readBit(sess, up) };
-      } else if (/^D\d+$/.test(up)) {
+      } else if (/^(D|SR|V|Z|E)\d+$/.test(up)) {
         queryValues[up] = { value: readWord(sess, up), forced: sess.forcedWords.has(up) };
       } else {
         const sym = resolveSymbol(sess, raw);
@@ -2427,6 +3973,8 @@ export function monitorSimulator(sessionId: string, addresses?: string[], compac
     symbols: symbolValues,
     rung_power_flow: sess.lastRungTrace,
     st_trace: sess.lastStTrace,
+    sfc_trace: sess.lastSfcTrace,
+    fbd_trace: sess.lastFbdTrace,
   };
 }
 
@@ -2778,5 +4326,306 @@ export function profileSimulatorSession(sessionId: string, options: ProfileSimul
     ...report,
     benchmark_executed: benchmarkExecuted,
     recent_scans: options.include_recent_scans ? diag.scan_history.slice(-25) : undefined,
+  };
+}
+
+// ===========================================================================
+// Online Edit, Special Module BFM Simulation, Interrupt Trigger & Trace Analytics
+// ===========================================================================
+
+export function onlineEditSimulatorPou(
+  sessionId: string,
+  options: {
+    pouName: string;
+    ilCode?: string;
+    stCode?: string;
+    sfcChart?: SfcChart;
+    fbdDiagram?: FbdDiagram;
+    persistToDisk?: boolean;
+  },
+) {
+  const sess = getSession(sessionId);
+  const pou = sess.pouPrograms.find((p) => p.name.toUpperCase() === options.pouName.trim().toUpperCase());
+  if (!pou) {
+    throw new FileTransformError(`POU ${JSON.stringify(options.pouName)} not found in simulator session`);
+  }
+
+  let updatedKind = '';
+  if (typeof options.stCode === 'string') {
+    pou.lang = '2';
+    pou.stCode = options.stCode;
+    updatedKind = 'ST';
+  } else if (typeof options.ilCode === 'string') {
+    const nets = parseIlCodeToNetworks(options.ilCode);
+    if (!nets.length && options.ilCode.trim()) {
+      throw new FileTransformError('Online Edit failed: unable to parse IL code.');
+    }
+    pou.lang = pou.lang === '1' ? '1' : '3';
+    pou.networks = nets;
+    pou.stCode = options.ilCode;
+    updatedKind = pou.lang === '1' ? 'LD' : 'IL';
+  } else if (options.sfcChart) {
+    pou.lang = '4';
+    pou.sfcChart = options.sfcChart;
+    updatedKind = 'SFC';
+  } else if (options.fbdDiagram) {
+    pou.lang = '5';
+    pou.fbdDiagram = options.fbdDiagram;
+    updatedKind = 'FBD';
+  } else {
+    throw new FileTransformError('Online Edit requires one of ilCode, stCode, sfcChart, or fbdDiagram.');
+  }
+
+  let persisted = false;
+  if (options.persistToDisk) {
+    const c = decodeContainer(sess.raw_isp_bytes);
+    let nextBytes: Buffer;
+    if (updatedKind === 'ST' && typeof options.stCode === 'string') {
+      nextBytes = patchSt(c, pou.name, options.stCode, null);
+    } else {
+      let src = decodeCodepage(c.source, c.encoding);
+      if (updatedKind === 'LD' && typeof options.ilCode === 'string') {
+        const built = buildNetworksFromIl(options.ilCode, c.newline);
+        src = replaceLdPouNetworks(src, pou.name, built, c.newline);
+      } else if (updatedKind === 'IL' && typeof options.ilCode === 'string') {
+        src = patchIlPouInSource(src, pou.name, options.ilCode, c.newline);
+      } else if (updatedKind === 'SFC' && options.sfcChart) {
+        src = patchSfcPouInSource(src, pou.name, options.sfcChart, c.newline);
+      } else if (updatedKind === 'FBD' && options.fbdDiagram) {
+        src = patchFbdPouInSource(src, pou.name, options.fbdDiagram, c.newline);
+      }
+      nextBytes = c.rebuild(encodeCodepage(src, c.encoding));
+    }
+    writeFileBuffer(sess.project_path, nextBytes, true);
+    sess.raw_isp_bytes = nextBytes;
+    sess.project_hash = computeContentHash('isp', nextBytes);
+    persisted = true;
+  }
+
+  return {
+    success: true,
+    status: 'ONLINE_EDIT_APPLIED',
+    session_id: sess.session_id,
+    pou_name: pou.name,
+    language: updatedKind,
+    mode_preserved: sess.mode,
+    scan_count_preserved: sess.scan_count,
+    persisted_to_disk: persisted,
+    project_hash: sess.project_hash,
+  };
+}
+
+export function manageSimIoModules(
+  sessionId: string,
+  options: {
+    action: 'list' | 'read' | 'write';
+    slot?: number;
+    cr_values?: Record<string, number>;
+  },
+) {
+  const sess = getSession(sessionId);
+  if (options.action === 'write') {
+    if (typeof options.slot !== 'number' || !Number.isInteger(options.slot) || options.slot < 0) {
+      throw new FileTransformError('slot (integer >= 0) is required for write action');
+    }
+    let crMap = sess.moduleBfm.get(options.slot);
+    if (!crMap) {
+      crMap = new Map<number, number>();
+      sess.moduleBfm.set(options.slot, crMap);
+    }
+    for (const [k, v] of Object.entries(options.cr_values ?? {})) {
+      const crNum = Number(k);
+      if (!Number.isInteger(crNum) || crNum < 0) {
+        throw new FileTransformError(`Invalid CR index: ${k}`);
+      }
+      crMap.set(crNum, toInt16(Number(v)));
+    }
+  }
+
+  if (options.action === 'read' && typeof options.slot === 'number') {
+    const crMap = sess.moduleBfm.get(options.slot) ?? new Map<number, number>();
+    const cfg = sess.hwConfig.modules.find((m) => m.slot === options.slot);
+    return {
+      success: true,
+      session_id: sess.session_id,
+      slot: options.slot,
+      model: cfg?.model ?? 'UNCONFIGURED',
+      cr_values: Object.fromEntries([...crMap.entries()].sort((a, b) => a[0] - b[0]).map(([k, v]) => [String(k), v])),
+    };
+  }
+
+  const allSlots = new Set<number>([
+    ...sess.hwConfig.modules.map((m) => m.slot),
+    ...sess.moduleBfm.keys(),
+  ]);
+  const modules = [...allSlots]
+    .sort((a, b) => a - b)
+    .map((slot) => {
+      const cfg = sess.hwConfig.modules.find((m) => m.slot === slot);
+      const crMap = sess.moduleBfm.get(slot) ?? new Map<number, number>();
+      return {
+        slot,
+        model: cfg?.model ?? 'DYNAMIC',
+        description: cfg?.description ?? '',
+        x_start: cfg?.x_start ?? null,
+        y_start: cfg?.y_start ?? null,
+        cr_values: Object.fromEntries([...crMap.entries()].sort((a, b) => a[0] - b[0]).map(([k, v]) => [String(k), v])),
+      };
+    });
+
+  return {
+    success: true,
+    session_id: sess.session_id,
+    module_count: modules.length,
+    modules,
+  };
+}
+
+export function triggerSimulatorInterrupt(
+  sessionId: string,
+  options: {
+    taskName?: string;
+    pouName?: string;
+    label?: string;
+  },
+) {
+  const sess = getSession(sessionId);
+  if (!sess.interruptsEnabled) {
+    return {
+      success: false,
+      status: 'INTERRUPTS_DISABLED_BY_DI',
+      session_id: sess.session_id,
+    };
+  }
+
+  let targetPou: SimPouProgram | undefined;
+  let targetLabel = options.label?.trim();
+
+  if (options.taskName) {
+    const task = sess.tasks.find((t) => t.name.toUpperCase() === options.taskName!.trim().toUpperCase());
+    if (!task) throw new FileTransformError(`Interrupt task ${JSON.stringify(options.taskName)} not found`);
+    targetPou = sess.pouPrograms.find((p) => p.name.toUpperCase() === task.program.toUpperCase());
+  } else if (options.pouName) {
+    targetPou = sess.pouPrograms.find((p) => p.name.toUpperCase() === options.pouName!.trim().toUpperCase());
+  } else if (targetLabel) {
+    targetPou = sess.pouPrograms.find((p) =>
+      p.networks.some((n) => n.label.toUpperCase() === targetLabel!.toUpperCase()),
+    );
+  }
+
+  if (!targetPou) {
+    throw new FileTransformError('No matching interrupt POU/task/label found in simulator session');
+  }
+
+  const isrTrace: SimNetworkTrace[] = [];
+  let stOutputs: Record<string, boolean | number> = {};
+
+  if (targetPou.lang === '1' || targetPou.lang === '3') {
+    let startIdx = 0;
+    if (targetLabel) {
+      const found = targetPou.networks.findIndex((n) => n.label.toUpperCase() === targetLabel!.toUpperCase());
+      if (found < 0) throw new FileTransformError(`Interrupt label ${JSON.stringify(targetLabel)} not found in POU ${targetPou.name}`);
+      startIdx = found;
+    }
+    executeLdPou(sess, targetPou, isrTrace, startIdx, true, 0);
+  } else if (targetPou.lang === '2') {
+    const res = executeStBlock(targetPou.stCode, sess);
+    stOutputs = res.outputs;
+  } else if (targetPou.lang === '4' && targetPou.sfcChart) {
+    stOutputs = executeSfcPou(sess, targetPou).outputs_written;
+  } else if (targetPou.lang === '5' && targetPou.fbdDiagram) {
+    stOutputs = executeFbdPou(sess, targetPou).outputs_written;
+  }
+
+  return {
+    success: true,
+    status: 'INTERRUPT_EXECUTED',
+    session_id: sess.session_id,
+    pou: targetPou.name,
+    label: targetLabel ?? null,
+    rung_trace: isrTrace,
+    outputs_written: stOutputs,
+    snapshot: monitorSimulator(sessionId, undefined, true),
+  };
+}
+
+export function analyzeSimulatorTrace(
+  sessionId: string,
+  options: {
+    addresses?: string[];
+    format?: 'summary' | 'csv';
+  } = {},
+) {
+  const sess = getSession(sessionId);
+  const samples = sess.traceBuffer;
+  const targetAddrs =
+    options.addresses && options.addresses.length > 0
+      ? options.addresses
+      : [...new Set(samples.flatMap((s) => Object.keys(s.values)))];
+
+  const metrics: Record<string, Record<string, number | boolean | null>> = {};
+  for (const addr of targetAddrs) {
+    const vals = samples.map((s) => s.values[addr]).filter((v) => v !== undefined);
+    if (!vals.length) {
+      metrics[addr] = { sample_count: 0, min: null, max: null, avg: null, rising_edges: 0, falling_edges: 0, duty_cycle_pct: null };
+      continue;
+    }
+    let min = Infinity;
+    let max = -Infinity;
+    let sum = 0;
+    let highCount = 0;
+    let rising = 0;
+    let falling = 0;
+    let prevBool: boolean | null = null;
+    for (const v of vals) {
+      const n = typeof v === 'boolean' ? (v ? 1 : 0) : Number(v);
+      const b = Boolean(v);
+      if (n < min) min = n;
+      if (n > max) max = n;
+      sum += n;
+      if (b) highCount += 1;
+      if (prevBool !== null) {
+        if (b && !prevBool) rising += 1;
+        if (!b && prevBool) falling += 1;
+      }
+      prevBool = b;
+    }
+    metrics[addr] = {
+      sample_count: vals.length,
+      min,
+      max,
+      avg: Math.round((sum / vals.length) * 1000) / 1000,
+      last: vals[vals.length - 1],
+      rising_edges: rising,
+      falling_edges: falling,
+      duty_cycle_pct: Math.round((highCount / vals.length) * 10000) / 100,
+    };
+  }
+
+  let csv: string | undefined;
+  if (options.format === 'csv') {
+    const header = ['scan_count', 'elapsed_ms', ...targetAddrs].join(',');
+    const rows = samples.map((s) =>
+      [
+        s.scan_count,
+        s.elapsed_ms,
+        ...targetAddrs.map((a) => {
+          const v = s.values[a];
+          if (v === undefined) return '';
+          if (typeof v === 'boolean') return v ? '1' : '0';
+          return String(v);
+        }),
+      ].join(','),
+    );
+    csv = [header, ...rows].join('\n');
+  }
+
+  return {
+    success: true,
+    session_id: sess.session_id,
+    sample_count: samples.length,
+    addresses: targetAddrs,
+    metrics,
+    csv,
   };
 }
